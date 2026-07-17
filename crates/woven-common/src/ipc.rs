@@ -1,7 +1,7 @@
 //! IPC message types shared between woven daemon and woven-ctrl.
 
-use serde::{Deserialize, Serialize};
 use crate::types::{Theme, Workspace, WorkspaceMetrics};
+use serde::{Deserialize, Serialize};
 
 pub const SOCKET_PATH_ENV: &str = "WOVEN_SOCKET";
 
@@ -34,10 +34,10 @@ pub enum IpcResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
-    pub version:    String,
-    pub visible:    bool,
+    pub version: String,
+    pub visible: bool,
     pub compositor: String,
     pub workspaces: Vec<Workspace>,
-    pub metrics:    Vec<WorkspaceMetrics>,
-    pub theme:      Theme,
+    pub metrics: Vec<WorkspaceMetrics>,
+    pub theme: Theme,
 }

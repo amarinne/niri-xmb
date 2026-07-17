@@ -1,0 +1,73 @@
+# Replace these connector names with `niri msg --json outputs` results.
+[[bars]]
+output = "HDMI-A-1"
+edge = "top"
+align = "center"
+width = 1000
+height = 42
+margin = 56
+offset = 0
+allow_column_join = false
+show_workspace_labels = false
+hide_empty_workspaces = false
+show_capsule = true
+show_active_indicator = true
+scroll_to_switch = true
+scroll_wrap = true
+scroll_reverse = false
+
+# A portrait output can opt into the center join zone independently.
+[[bars]]
+output = "HDMI-A-2"
+edge = "top"
+align = "center"
+width = 1000
+height = 42
+margin = 56
+offset = 0
+allow_column_join = true
+show_workspace_labels = false
+hide_empty_workspaces = false
+show_capsule = true
+show_active_indicator = true
+scroll_to_switch = true
+scroll_wrap = true
+scroll_reverse = false
+
+[popup]
+outputs = "combined" # "focused", "all", or "combined"
+surface_mode = "follow_active" # "fixed", "follow_active", or "mirror"
+follow_delay_ms = 180
+position = "cursor" # "cursor", "center", or "fixed"
+width = 1600
+height = 850
+fixed_x = 80
+fixed_y = 80
+show_titles = false
+
+[behavior]
+drag_threshold = 7.0
+empty_drop_floats = false
+floating_drop_tiles = true
+focus_after_drop = false
+close_on_window_click = true
+close_on_workspace_click = false
+close_on_drop = false
+close_on_outside_click = true
+close_on_escape = true
+
+[style]
+background = "#f5111415"
+surface = "#661d2022"
+surface_hover = "#266ed2ff"
+border = "#ff40484c"
+border_soft = "#3340484c"
+accent = "#ff6ed2ff"
+selection_border = "#666ed2ff"
+text = "#ffe1e2e5"
+muted = "#ffc0c7cd"
+urgent = "#ffffb4ab"
+radius = 14.0
+border_width = 1.0
+icon_size = 28
+gap = 8.0

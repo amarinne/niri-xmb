@@ -1,267 +1,174 @@
-# woven
+# niri-xmb
 
-A Wayland workspace overview and control center for tiling compositors. Press a key, see everything, click to focus. Ships with a persistent bar, a full plugin system, and a graphical control panel.
+`niri-xmb` is a Niri-native workspace bar and icon-only workspace navigator. It
+runs independently of Noctalia, so Noctalia upgrades do not need to carry a
+custom widget patch.
 
-```
-Super+` → overlay appears → click a window → overlay closes, window focused
-```
+The project is adapted from Woven's native Smithay Client Toolkit/tiny-skia
+layer-shell implementation. It consumes Niri's event stream directly and uses
+Niri IPC actions for focusing and moving windows.
 
----
+## Current features
 
-## Features
+- One explicitly configured bar surface per output.
+- Dynamic workspace and window updates from Niri's event stream.
+- Shortcut-controlled popup for one output, separate output panels, or a combined multi-output map.
+- Centered, fixed, or cursor-relative popup positioning.
+- Icon-only tiling layout map with normalized floating-window positions.
+- Drag windows between workspaces, outputs, and left/right column positions.
+- Optional center drop zone to join a column, configured per output.
+- Drop on empty map space to make/reposition a floating window.
+- Keyboard navigation, focus restoration after drag, urgency, and app icons.
+- PNG icons natively, with optional SVG rendering through ImageMagick.
 
-- **Workspace overview** — live screencopy thumbnails of every window, animated grid layout
-- **Workspace strip** — horizontal strip at the top; click to preview, click again to switch
-- **Persistent bar** — docked sidebar showing workspaces, clock, date, now playing, and system stats
-- **Control center** — expand the bar for media controls, CPU/GPU temps, volume, power menu, and a cava audio visualizer
-- **Plugin system** — Lua-based plugins for bar widgets, panel widgets, and overlay widgets
-- **Plugin settings** — configure date colors, cava color themes, per-app accent colors, and launcher apps from the GUI
-- **Theme engine** — 5 built-in presets (Catppuccin Mocha, Dracula, Nord, Tokyo Night, Gruvbox) or fully custom
-- **AI workspace namer** — automatic workspace names based on open windows
-- **Multi-monitor** — one bar per connected output, automatic hotplug handling
-- **woven-ctrl** — graphical control panel with tabs for status, bar, theme, overview, plugins, and raw config editing
-- **First-time setup wizard** — compositor detection, theme selection, keybind injection
-- **Self-update** — `woven-ctrl --update` pulls the latest release and restarts
+The popup is implemented as independent transparent layer-shell surfaces. This
+is deliberate: Noctalia v5's plugin item API does not expose the pointer motion
+and release events needed for cross-workspace drag and drop.
 
----
+## Build
 
-## Supported compositors
-
-| Compositor | Status |
-|------------|--------|
-| Hyprland   | Full support |
-| Niri       | Full support |
-| Sway       | Full support |
-| River      | Basic support |
-
-GNOME is not supported (no `wlr-layer-shell`). KDE support is planned.
-
----
-
-## Install
-
-### One-liner
+Requirements are a recent Rust toolchain, Niri, and a compositor exposing
+`wlr-layer-shell`. ImageMagick's `magick` command is optional but recommended for
+SVG-only application icons.
 
 ```bash
-curl -fsSL https://viewerofall.pages.dev/install/woven/install.sh | sh
+cd /home/ez/Projects/niri-xmb
+cargo build --release -p niri-xmb
+install -Dm755 target/release/niri-xmb ~/.local/bin/niri-xmb
 ```
 
-### From source
+## Configure
+
+The default configuration path is `~/.config/niri-xmb/config.toml`. Start from
+the included example:
 
 ```bash
-git clone https://github.com/viewerofall/woven.git
-cd woven
-cargo build --release
+mkdir -p ~/.config/niri-xmb
+cp config/niri-xmb.toml.example ~/.config/niri-xmb/config.toml
+niri msg --json outputs
 ```
 
-Then copy manually:
+Set each `output` to the connector name reported by Niri. A bar is never moved
+to a different monitor automatically.
+
+Important behavior:
+
+- `allow_column_join = false`: every icon drop is split into left and right
+  halves. The window becomes its own column on the chosen side.
+- `allow_column_join = true`: the middle third joins the target column; the
+  outer thirds insert to its left or right.
+- `show_workspace_labels`: add numeric workspace labels beside the icons. The
+  default icon-only style keeps them hidden.
+- `hide_empty_workspaces`: omit empty, inactive workspaces from that bar.
+- `show_capsule` and `show_active_indicator`: independently control the group
+  background and the small focused-workspace dot.
+- `scroll_to_switch`, `scroll_wrap`, and `scroll_reverse`: control workspace
+  switching with the wheel over each bar.
+- `popup.outputs = "focused"`: show one popup on the focused monitor.
+- `popup.outputs = "all"`: show a separate local workspace map on every
+  monitor at the same time.
+- `popup.outputs = "combined"`: show one panel on the focused monitor with all
+  outputs side by side. Workspaces are rows from top to bottom, while each
+  workspace's Niri columns run left to right. The panel grows to the widest
+  strip and largest workspace count, up to the configured maximum size.
+- `popup.surface_mode = "fixed"`: keep the popup on the monitor where it was
+  opened.
+- `popup.surface_mode = "follow_active"`: move the popup after a different
+  monitor remains actively focused for `follow_delay_ms`. Active dragging and
+  Niri's temporary rearrangement focus are ignored.
+- `popup.surface_mode = "mirror"`: show the popup on every monitor. With
+  `outputs = "combined"`, every monitor receives the same combined organizer.
+- `popup.position`: `"cursor"`, `"center"`, or `"fixed"`.
+
+Popup lifetime is configurable under `[behavior]`. The shipped defaults use a
+hybrid mode: clicking a window focuses it and closes the popup, while workspace
+clicks and drag/drop keep it open for organizing several windows. Set
+`close_on_window_click = false` for a persistent organizer, or set
+`close_on_workspace_click = true` and `close_on_drop = true` for a fully
+transient alt-tab-style popup. Outside click and Escape have independent
+switches as well.
+
+Print every default setting with:
 
 ```bash
-cp target/release/woven target/release/woven-ctrl ~/.local/bin/
-mkdir -p ~/.config/woven
-cp config/woven.lua ~/.config/woven/
-cp -r runtime ~/.config/woven/
-cp -r plugins ~/.config/woven/
-cp woven.service ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable woven.service
+niri-xmb print-default-config
 ```
 
----
+## Run and bind in Niri
 
-## First-time setup
+For a quick foreground test:
 
-On first launch with no config, `woven` opens `woven-ctrl --setup` — a graphical wizard that handles compositor detection, color theme, and keybind injection. No terminal required.
-
----
-
-## Compositor setup
-
-### Hyprland
-
-```ini
-exec-once = woven
-bind = SUPER, grave, exec, woven-ctrl --toggle
+```bash
+niri-xmb daemon
 ```
 
-### Niri
+The control commands connect to the running daemon:
+
+```bash
+niri-xmb show
+niri-xmb hide
+niri-xmb toggle
+niri-xmb status
+niri-xmb quit
+```
+
+Add the following to the appropriate sections of the Niri config:
 
 ```kdl
-spawn-at-startup "woven"
+spawn-at-startup "niri-xmb" "daemon"
 
 binds {
-    Super+Grave { spawn "woven-ctrl" "--toggle"; }
+    Mod+F { spawn "niri-xmb" "toggle"; }
 }
 ```
 
-### Sway
-
-```
-exec woven
-bindsym Super+grave exec woven-ctrl --toggle
-```
-
-### River
-
-```sh
-riverctl spawn woven
-riverctl map normal Super grave spawn 'woven-ctrl --toggle'
-```
-
----
-
-## Usage
-
-### Overlay
-
-| Action | Result |
-|--------|--------|
-| Click a window card | Focus that window, close overlay |
-| Hover a window card | Show action buttons (focus, float, pin, fullscreen, close) |
-| Click a workspace card | Preview that workspace |
-| Right-click / any key | Close overlay |
-| Scroll | Page through workspaces |
-
-### Bar
-
-Collapsed (52px): workspace dots, clock, date, expand button. Click to expand into the full control center (300px) with media controls, system stats, cava visualizer, WiFi/BT toggles, and power menu.
-
----
-
-## Configuration
-
-Config lives at `~/.config/woven/woven.lua`. Edit through `woven-ctrl` or directly.
+Alternatively, install and enable the user service:
 
 ```bash
-woven-ctrl --reload   # reload config live
+install -Dm644 niri-xmb.service ~/.config/systemd/user/niri-xmb.service
+systemctl --user daemon-reload
+systemctl --user enable --now niri-xmb.service
 ```
 
-### Theme
+Do not use both `spawn-at-startup` and the systemd service.
 
-```lua
-woven.theme({
-    background    = "#1e1e2e",
-    border        = "#6c7086",
-    text          = "#cdd6f4",
-    accent        = "#cba6f7",
-    border_radius = 12,
-    font          = "JetBrainsMono Nerd Font",
-    font_size     = 13,
-    opacity       = 0.92,
-})
+## Controls
+
+| Input | Action |
+| --- | --- |
+| Click workspace | Focus workspace |
+| Click window | Focus window; popup closes |
+| Drag window | Move it to the target workspace/position |
+| Up / Down | Select previous/next workspace row |
+| Left / Right | Select previous/next window in the row |
+| Tab / Shift+Tab | Select the next/previous output in all-output mode |
+| Enter | Focus selection; popup closes |
+| Escape | Close popup |
+| Pointer scroll in popup | Select previous/next workspace |
+| Pointer scroll on bar | Focus previous/next workspace, subject to bar settings |
+
+Floating windows use their logical Niri workspace coordinates, normalized into
+the popup canvas. Empty-canvas drops preserve the source mode by default: tiled
+windows remain tiled and are inserted at the corresponding horizontal position,
+while floating windows remain floating and receive new logical coordinates.
+Set `empty_drop_floats = true` to opt into converting tiled windows to floating
+on empty-canvas drops. Dragging a floating window beside a tiled icon returns it
+to tiling.
+
+## Repository layout
+
+Only `crates/woven-common` and `crates/niri-xmb` are members of the active Cargo
+workspace. Other retained Woven source files are reference material from the
+fork and are not built.
+
+The separately cloned research projects live beside this repository at:
+
+```text
+/home/ez/Projects/niri-xmb-references/woven
+/home/ez/Projects/niri-xmb-references/niri-taskbar
+/home/ez/Projects/niri-xmb-references/niri-minimap
 ```
-
-### Bar
-
-```lua
-woven.bar({
-    enabled  = true,
-    position = "right",   -- "left" | "right" | "top" | "bottom"
-})
-```
-
-### Animations
-
-```lua
-woven.animations({
-    overlay_open  = { curve = "ease_out_cubic",    duration_ms = 180 },
-    overlay_close = { curve = "ease_in_cubic",     duration_ms = 120 },
-    scroll        = { curve = "ease_in_out_cubic", duration_ms = 200 },
-})
-```
-
-Curves: `linear` `ease_out_cubic` `ease_in_cubic` `ease_in_out_cubic` `spring`
-
----
-
-## Plugins
-
-Plugins are Lua scripts in `~/.config/woven/plugins/`. Enable them in `woven.lua`:
-
-```lua
-require("plugins.date").setup({ slot = "top", height = 58 })
-require("plugins.cava").setup({ slot = "panel", theme = "catppuccin" })
-require("plugins.app_rules").setup({ ["kitty"] = "#89b4fa" })
-require("plugins.nowplaying").setup({ slot = "bottom", height = 62 })
-require("plugins.greeting").setup({ slot = "overlay" })
-require("plugins.network").setup({ slot = "overlay", interval = 2 })
-require("plugins.launcher").setup({ slot = "overlay", label = "kitty", cmd = "kitty" })
-```
-
-### Included plugins
-
-| Plugin | Slot | Description |
-|--------|------|-------------|
-| `date` | bar | Compact date badge with configurable accent/text colors |
-| `clock` | bar | Simple clock widget |
-| `battery` | bar | Battery level indicator |
-| `nowplaying` | bar | Media now playing (requires playerctl) |
-| `cava` | panel | Audio spectrum visualizer with 5 color themes |
-| `app_rules` | - | Per-app accent color overrides |
-| `greeting` | overlay | Greeting message |
-| `network` | overlay | Live network usage (download/upload rates) |
-| `launcher` | overlay | App launcher tile |
-| `sysinfo` | overlay | System info widget |
-| `uptime` | overlay | System uptime |
-| `ws_logger` | - | Workspace/window event logger |
-
-### Plugin settings
-
-The Plugins tab in `woven-ctrl` lets you install, enable, disable, and configure plugins. Configurable plugins get a Settings button that opens a modal:
-
-- **date** — accent and text colors
-- **cava** — color theme (catppuccin, gruvbox, nord, tokyo_night, dracula)
-- **app_rules** — add/remove/edit class-to-color mappings
-- **launcher** — pick from installed apps
-
----
-
-## woven-ctrl
-
-```
-woven-ctrl              open the GUI control panel
-woven-ctrl --toggle     toggle the overlay
-woven-ctrl --show       show the overlay
-woven-ctrl --hide       hide the overlay
-woven-ctrl --reload     reload config (full daemon restart)
-woven-ctrl --setup      run the first-time setup wizard
-woven-ctrl --update     self-update to the latest release
-```
-
----
-
-## Dependencies
-
-Optional runtime dependencies — the bar and overlay degrade gracefully without them:
-
-| Package | Used for |
-|---------|----------|
-| `playerctl` | Media controls / now playing |
-| `nmcli` | WiFi toggle |
-| `bluetoothctl` | Bluetooth toggle |
-| `cava` | Audio spectrum visualizer plugin |
-
----
-
-## Architecture
-
-```
-woven (workspace)
-├── woven-sys        main daemon — Lua VM, IPC server, compositor backends, audio
-├── woven-render     render thread — Wayland surfaces, tiny-skia/wgpu painter
-├── woven-protocols  Wayland protocol extensions — screencopy, layer-shell
-├── woven-common     shared types and IPC protocol
-├── woven-plugin     plugin system crate
-└── woven-ctrl       iced GUI control panel + CLI
-
-Runtime:  ~/.config/woven/runtime/
-Plugins:  ~/.config/woven/plugins/
-Config:   ~/.config/woven/woven.lua
-IPC:      /run/user/$UID/woven.sock
-Service:  ~/.config/systemd/user/woven.service
-```
-
----
 
 ## License
 
-MIT
+GPL-3.0-only, inherited from Woven. See `LICENSE`.

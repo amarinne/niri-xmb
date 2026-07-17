@@ -1,0 +1,31 @@
+[package]
+name = "niri-xmb"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Niri-native per-output workspace bar and XMB navigator"
+
+[[bin]]
+name = "niri-xmb"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4.6", features = ["derive"] }
+crossbeam-channel = { workspace = true }
+fontdue = { workspace = true }
+libc = "0.2"
+niri-ipc = "26.4.0"
+png = "0.17"
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+smithay-client-toolkit = { workspace = true }
+tiny-skia = { workspace = true }
+toml = "0.8"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true }
+wayland-protocols-wlr = { workspace = true }
+woven-common = { path = "../woven-common" }

@@ -1,0 +1,270 @@
+use niri_ipc::{Output, Window, Workspace};
+use std::collections::{BTreeMap, HashMap};
+
+#[derive(Debug, Clone, Default)]
+pub struct Snapshot {
+    pub outputs: BTreeMap<String, OutputModel>,
+    pub focused_window: Option<u64>,
+    pub generation: u64,
+}
+
+impl Snapshot {
+    pub fn focused_output(&self) -> Option<&str> {
+        self.outputs
+            .values()
+            .find(|output| output.workspaces.iter().any(|workspace| workspace.focused))
+            .map(|output| output.name.as_str())
+    }
+
+    pub fn window(&self, id: u64) -> Option<&WindowModel> {
+        self.outputs
+            .values()
+            .flat_map(|output| &output.workspaces)
+            .flat_map(|workspace| workspace.windows())
+            .find(|window| window.id == id)
+    }
+
+    pub fn workspace(&self, id: u64) -> Option<&WorkspaceModel> {
+        self.outputs
+            .values()
+            .flat_map(|output| &output.workspaces)
+            .find(|workspace| workspace.id == id)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OutputModel {
+    pub name: String,
+    pub width: i32,
+    pub height: i32,
+    pub workspaces: Vec<WorkspaceModel>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceModel {
+    pub id: u64,
+    pub index: u8,
+    pub name: Option<String>,
+    pub active: bool,
+    pub focused: bool,
+    pub urgent: bool,
+    pub columns: BTreeMap<usize, BTreeMap<usize, WindowModel>>,
+    pub floating: Vec<WindowModel>,
+}
+
+impl WorkspaceModel {
+    pub fn windows(&self) -> impl Iterator<Item = &WindowModel> {
+        self.columns
+            .values()
+            .flat_map(|column| column.values())
+            .chain(self.floating.iter())
+    }
+
+    pub fn label(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.index.to_string())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowModel {
+    pub id: u64,
+    pub workspace_id: u64,
+    pub app_id: String,
+    pub title: String,
+    pub focused: bool,
+    pub urgent: bool,
+    pub floating: bool,
+    pub column: Option<usize>,
+    pub tile_width: f64,
+    pub tile_height: f64,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+}
+
+#[derive(Default)]
+pub struct NiriState {
+    outputs: HashMap<String, Output>,
+    workspaces: HashMap<u64, Workspace>,
+    windows: HashMap<u64, Window>,
+    generation: u64,
+}
+
+impl NiriState {
+    pub fn replace_outputs(&mut self, outputs: HashMap<String, Output>) {
+        self.outputs = outputs;
+        self.generation += 1;
+    }
+
+    pub fn replace_workspaces(&mut self, workspaces: Vec<Workspace>) {
+        self.workspaces = workspaces
+            .into_iter()
+            .map(|workspace| (workspace.id, workspace))
+            .collect();
+        self.generation += 1;
+    }
+
+    pub fn replace_windows(&mut self, windows: Vec<Window>) {
+        self.windows = windows
+            .into_iter()
+            .map(|window| (window.id, window))
+            .collect();
+        self.generation += 1;
+    }
+
+    pub fn workspace_mut(&mut self, id: u64) -> Option<&mut Workspace> {
+        self.workspaces.get_mut(&id)
+    }
+
+    pub fn activate_workspace(&mut self, id: u64, focused: bool) {
+        let Some(output) = self
+            .workspaces
+            .get(&id)
+            .and_then(|workspace| workspace.output.clone())
+        else {
+            return;
+        };
+
+        for workspace in self.workspaces.values_mut() {
+            if workspace.output.as_deref() == Some(output.as_str()) {
+                workspace.is_active = false;
+            }
+            if focused {
+                workspace.is_focused = false;
+            }
+        }
+        if let Some(workspace) = self.workspaces.get_mut(&id) {
+            workspace.is_active = true;
+            workspace.is_focused = focused;
+        }
+        self.generation += 1;
+    }
+
+    pub fn window_mut(&mut self, id: u64) -> Option<&mut Window> {
+        self.windows.get_mut(&id)
+    }
+
+    pub fn remove_window(&mut self, id: u64) {
+        self.windows.remove(&id);
+        self.generation += 1;
+    }
+
+    pub fn upsert_window(&mut self, window: Window) {
+        if window.is_focused {
+            for other in self.windows.values_mut() {
+                other.is_focused = false;
+            }
+        }
+        self.windows.insert(window.id, window);
+        self.generation += 1;
+    }
+
+    pub fn set_focused_window(&mut self, id: Option<u64>) {
+        for window in self.windows.values_mut() {
+            window.is_focused = Some(window.id) == id;
+        }
+        self.generation += 1;
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        let focused_window = self
+            .windows
+            .values()
+            .find(|window| window.is_focused)
+            .map(|window| window.id);
+        let mut outputs = BTreeMap::new();
+
+        for (name, output) in &self.outputs {
+            let logical = output.logical;
+            let (width, height) = logical
+                .map(|logical| (logical.width, logical.height))
+                .unwrap_or((1920, 1080));
+            outputs.insert(
+                name.clone(),
+                OutputModel {
+                    name: name.clone(),
+                    width: i32::try_from(width).unwrap_or(i32::MAX),
+                    height: i32::try_from(height).unwrap_or(i32::MAX),
+                    workspaces: Vec::new(),
+                },
+            );
+        }
+
+        let mut workspaces: Vec<_> = self.workspaces.values().cloned().collect();
+        workspaces.sort_by_key(|workspace| (workspace.output.clone(), workspace.idx));
+
+        for workspace in workspaces {
+            let Some(output_name) = workspace.output.clone() else {
+                continue;
+            };
+            let Some(output) = outputs.get_mut(&output_name) else {
+                continue;
+            };
+
+            let mut model = WorkspaceModel {
+                id: workspace.id,
+                index: workspace.idx,
+                name: workspace.name.clone(),
+                active: workspace.is_active,
+                focused: workspace.is_focused,
+                urgent: workspace.is_urgent,
+                columns: BTreeMap::new(),
+                floating: Vec::new(),
+            };
+
+            let mut workspace_windows: Vec<_> = self
+                .windows
+                .values()
+                .filter(|window| window.workspace_id == Some(workspace.id))
+                .cloned()
+                .collect();
+            workspace_windows.sort_by_key(|window| {
+                window
+                    .layout
+                    .pos_in_scrolling_layout
+                    .unwrap_or((usize::MAX, usize::MAX))
+            });
+
+            for window in workspace_windows {
+                let position = window.layout.pos_in_scrolling_layout;
+                let window_model = WindowModel {
+                    id: window.id,
+                    workspace_id: workspace.id,
+                    app_id: window.app_id.unwrap_or_default(),
+                    title: window.title.unwrap_or_default(),
+                    focused: window.is_focused,
+                    urgent: window.is_urgent,
+                    floating: window.is_floating,
+                    column: position.map(|position| position.0),
+                    tile_width: window.layout.tile_size.0,
+                    tile_height: window.layout.tile_size.1,
+                    x: window
+                        .layout
+                        .tile_pos_in_workspace_view
+                        .map(|position| position.0),
+                    y: window
+                        .layout
+                        .tile_pos_in_workspace_view
+                        .map(|position| position.1),
+                };
+
+                if window_model.floating || position.is_none() {
+                    model.floating.push(window_model);
+                } else if let Some((column, row)) = position {
+                    model
+                        .columns
+                        .entry(column)
+                        .or_default()
+                        .insert(row, window_model);
+                }
+            }
+
+            output.workspaces.push(model);
+        }
+
+        Snapshot {
+            outputs,
+            focused_window,
+            generation: self.generation,
+        }
+    }
+}
