@@ -17,6 +17,7 @@ pub enum NiriCommand {
         join: Option<JoinDirection>,
         source_joined: bool,
         restore_focus: Option<u64>,
+        restore_cursor: Option<(f64, f64)>,
     },
     MoveFloating {
         window_id: u64,
@@ -26,6 +27,7 @@ pub enum NiriCommand {
         y: f64,
         make_floating: bool,
         restore_focus: Option<u64>,
+        restore_cursor: Option<(f64, f64)>,
     },
 }
 
@@ -34,7 +36,11 @@ pub enum JoinDirection {
     Left,
 }
 
-pub fn spawn(snapshot_tx: Sender<Snapshot>, command_rx: Receiver<NiriCommand>) {
+pub fn spawn(
+    snapshot_tx: Sender<Snapshot>,
+    command_rx: Receiver<NiriCommand>,
+    cursor_restore_tx: Sender<(f64, f64)>,
+) {
     thread::Builder::new()
         .name("niri-xmb-events".into())
         .spawn(move || run_events(snapshot_tx))
@@ -43,8 +49,18 @@ pub fn spawn(snapshot_tx: Sender<Snapshot>, command_rx: Receiver<NiriCommand>) {
         .name("niri-xmb-actions".into())
         .spawn(move || {
             while let Ok(command) = command_rx.recv() {
-                if let Err(error) = dispatch(command) {
-                    tracing::warn!(%error, "Niri action failed");
+                let restore_cursor = match &command {
+                    NiriCommand::MoveTiled { restore_cursor, .. }
+                    | NiriCommand::MoveFloating { restore_cursor, .. } => *restore_cursor,
+                    _ => None,
+                };
+                match dispatch(command) {
+                    Ok(()) => {
+                        if let Some(position) = restore_cursor {
+                            let _ = cursor_restore_tx.send(position);
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "Niri action failed"),
                 }
             }
         })
@@ -203,6 +219,7 @@ fn dispatch(command: NiriCommand) -> anyhow::Result<()> {
             join,
             source_joined,
             restore_focus,
+            restore_cursor: _,
         } => {
             if source_joined {
                 send(Action::ConsumeOrExpelWindowLeft {
@@ -244,6 +261,7 @@ fn dispatch(command: NiriCommand) -> anyhow::Result<()> {
             y,
             make_floating,
             restore_focus,
+            restore_cursor: _,
         } => {
             if make_floating {
                 send(Action::MoveWindowToFloating {

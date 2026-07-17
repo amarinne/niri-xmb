@@ -52,6 +52,7 @@ drag_threshold = 7.0
 empty_drop_floats = false
 floating_drop_tiles = true
 focus_after_drop = false
+snap_cursor_after_drop = false
 close_on_window_click = true
 close_on_workspace_click = false
 close_on_drop = false

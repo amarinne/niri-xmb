@@ -58,6 +58,10 @@ enum Command {
         target_window_id: Option<u64>,
         #[arg(long, default_value_t = 0.5)]
         fraction: f32,
+        #[arg(long)]
+        cursor_x: Option<f64>,
+        #[arg(long)]
+        cursor_y: Option<f64>,
     },
     Quit,
     PrintDefaultConfig,
@@ -101,11 +105,15 @@ fn main() -> Result<()> {
             target_workspace_id,
             target_window_id,
             fraction,
+            cursor_x,
+            cursor_y,
         } => print_control(ControlCommand::Drop {
             source_window_id,
             target_workspace_id,
             target_window_id,
             fraction: fraction.clamp(0.0, 1.0),
+            cursor_x,
+            cursor_y,
         }),
         Command::Quit => print_control(ControlCommand::Quit),
         Command::PrintDefaultConfig => {
@@ -146,7 +154,8 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
 
     let (snapshot_tx, snapshot_rx) = unbounded();
     let (niri_command_tx, niri_command_rx) = unbounded();
-    spawn_niri(snapshot_tx, niri_command_rx);
+    let (cursor_restore_tx, cursor_restore_rx) = unbounded();
+    spawn_niri(snapshot_tx, niri_command_rx, cursor_restore_tx);
 
     let (ui_tx, ui_rx) = unbounded();
     let surface_bars = if config.bars_enabled {
@@ -179,6 +188,12 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     );
     while running {
         surfaces.dispatch()?;
+
+        while let Ok((x, y)) = cursor_restore_rx.try_recv() {
+            if !surfaces.restore_pointer(x, y) {
+                tracing::warn!("cursor restore requested but virtual-pointer is unavailable");
+            }
+        }
 
         while let Ok(next) = snapshot_rx.try_recv() {
             snapshot = next;
@@ -238,6 +253,8 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     target_workspace_id,
                     target_window_id,
                     fraction,
+                    cursor_x,
+                    cursor_y,
                 } => {
                     let output = snapshot.outputs.values().find(|output| {
                         output
@@ -282,6 +299,13 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                             &snapshot,
                             &config,
                             None,
+                            if config.behavior.snap_cursor_after_drop {
+                                None
+                            } else {
+                                cursor_x
+                                    .zip(cursor_y)
+                                    .filter(|(x, y)| x.is_finite() && y.is_finite())
+                            },
                             &niri_command_tx,
                         )
                     });
@@ -556,6 +580,11 @@ fn handle_ui_event(
                         } else {
                             popup_origin_focus
                         },
+                        if config.behavior.snap_cursor_after_drop {
+                            None
+                        } else {
+                            Some((released.current_x, released.current_y))
+                        },
                         niri_tx,
                     );
                     if dropped && config.behavior.close_on_drop && !popup_outputs.is_empty() {
@@ -668,6 +697,7 @@ fn dispatch_drop(
     snapshot: &Snapshot,
     config: &Config,
     preserved_focus: Option<u64>,
+    restore_cursor: Option<(f64, f64)>,
     niri_tx: &crossbeam_channel::Sender<NiriCommand>,
 ) -> bool {
     let Some(source_window) = snapshot.window(source_window_id) else {
@@ -710,6 +740,7 @@ fn dispatch_drop(
                         local_y,
                         snapshot,
                         restore_focus,
+                        restore_cursor,
                         niri_tx,
                     );
                 }
@@ -726,6 +757,7 @@ fn dispatch_drop(
                     *workspace_id,
                     snapshot,
                     restore_focus,
+                    restore_cursor,
                     niri_tx,
                 );
             }
@@ -758,6 +790,7 @@ fn dispatch_drop(
                     join,
                     source_joined,
                     restore_focus,
+                    restore_cursor,
                 })
                 .is_ok()
         }
@@ -774,6 +807,7 @@ fn dispatch_drop(
                 join: None,
                 source_joined,
                 restore_focus,
+                restore_cursor,
             })
             .is_ok(),
         HitTarget::Canvas {
@@ -789,6 +823,7 @@ fn dispatch_drop(
             local_y,
             snapshot,
             restore_focus,
+            restore_cursor,
             niri_tx,
         ),
         HitTarget::Canvas {
@@ -816,6 +851,7 @@ fn dispatch_drop(
                     join: None,
                     source_joined,
                     restore_focus,
+                    restore_cursor,
                 })
                 .is_ok()
         }
@@ -833,6 +869,7 @@ fn dispatch_floating_drop(
     local_y: f64,
     snapshot: &Snapshot,
     restore_focus: Option<u64>,
+    restore_cursor: Option<(f64, f64)>,
     niri_tx: &crossbeam_channel::Sender<NiriCommand>,
 ) -> bool {
     let Some(output_model) = snapshot.outputs.get(output) else {
@@ -860,6 +897,7 @@ fn dispatch_floating_drop(
             y,
             make_floating: true,
             restore_focus,
+            restore_cursor,
         })
         .is_ok()
 }
@@ -870,6 +908,7 @@ fn dispatch_preserved_floating_drop(
     workspace_id: u64,
     snapshot: &Snapshot,
     restore_focus: Option<u64>,
+    restore_cursor: Option<(f64, f64)>,
     niri_tx: &crossbeam_channel::Sender<NiriCommand>,
 ) -> bool {
     let Some(source) = snapshot.window(source_window_id) else {
@@ -906,6 +945,7 @@ fn dispatch_preserved_floating_drop(
             y,
             make_floating: false,
             restore_focus,
+            restore_cursor,
         })
         .is_ok()
 }

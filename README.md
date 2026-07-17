@@ -85,6 +85,8 @@ Important behavior:
 - `popup.surface_mode = "mirror"`: show the popup on every monitor. With
   `outputs = "combined"`, every monitor receives the same combined organizer.
 - `popup.position`: `"cursor"`, `"center"`, or `"fixed"`.
+- `behavior.snap_cursor_after_drop = false`: restore the pointer to its release
+  position after Niri's temporary focus step used for exact tiled placement.
 
 Popup lifetime is configurable under `[behavior]`. The shipped defaults use a
 hybrid mode: clicking a window focuses it and closes the popup, while workspace

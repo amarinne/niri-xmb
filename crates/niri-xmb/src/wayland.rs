@@ -25,10 +25,15 @@ use smithay_client_toolkit::{
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
 use std::collections::HashMap;
+use std::time::Instant;
 use wayland_client::{
     Connection, EventQueue, Proxy, QueueHandle,
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_surface},
+};
+use wayland_protocols_wlr::virtual_pointer::v1::client::{
+    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
+    zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +134,12 @@ impl SurfaceManager {
         let layer_shell = LayerShell::bind(&globals, &qh).context("wlr-layer-shell missing")?;
         let shm = Shm::bind(&globals, &qh).context("wl_shm missing")?;
         let seat_state = SeatState::new(&globals, &qh);
+        let virtual_pointer_manager = globals
+            .bind::<ZwlrVirtualPointerManagerV1, _, _>(&qh, 1..=2, ())
+            .ok();
+        let virtual_pointer = virtual_pointer_manager
+            .as_ref()
+            .map(|manager| manager.create_virtual_pointer(None, &qh, ()));
 
         let mut specs = Vec::new();
         for (index, config) in bars.iter().cloned().enumerate() {
@@ -161,6 +172,9 @@ impl SurfaceManager {
             pointer_x: 0.0,
             pointer_y: 0.0,
             pointer_surface: None,
+            _virtual_pointer_manager: virtual_pointer_manager,
+            virtual_pointer,
+            started_at: Instant::now(),
         };
 
         let mut manager = Self { queue, state };
@@ -273,6 +287,49 @@ impl SurfaceManager {
     pub fn hide_all_popups(&mut self) -> Result<()> {
         self.show_popups(&[])
     }
+
+    pub fn restore_pointer(&mut self, global_x: f64, global_y: f64) -> bool {
+        let Some(pointer) = &self.state.virtual_pointer else {
+            return false;
+        };
+        let Some(min_x) = self.state.outputs.values().map(|output| output.x).min() else {
+            return false;
+        };
+        let Some(min_y) = self.state.outputs.values().map(|output| output.y).min() else {
+            return false;
+        };
+        let Some(max_x) = self
+            .state
+            .outputs
+            .values()
+            .map(|output| output.x + output.width)
+            .max()
+        else {
+            return false;
+        };
+        let Some(max_y) = self
+            .state
+            .outputs
+            .values()
+            .map(|output| output.y + output.height)
+            .max()
+        else {
+            return false;
+        };
+        let width = (max_x - min_x).max(1) as u32;
+        let height = (max_y - min_y).max(1) as u32;
+        let x = (global_x - min_x as f64).round().clamp(0.0, width as f64) as u32;
+        let y = (global_y - min_y as f64).round().clamp(0.0, height as f64) as u32;
+        let time = self
+            .state
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u32::MAX as u128) as u32;
+        pointer.motion_absolute(time, x, y, width, height);
+        pointer.frame();
+        self.queue.flush().is_ok()
+    }
 }
 
 /// tiny-skia exposes premultiplied RGBA bytes. Wayland's ARGB8888 format is
@@ -338,6 +395,9 @@ struct WaylandState {
     pointer_x: f64,
     pointer_y: f64,
     pointer_surface: Option<usize>,
+    _virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
+    virtual_pointer: Option<ZwlrVirtualPointerV1>,
+    started_at: Instant,
 }
 
 impl WaylandState {
@@ -875,3 +935,5 @@ smithay_client_toolkit::delegate_pointer!(WaylandState);
 smithay_client_toolkit::delegate_layer!(WaylandState);
 smithay_client_toolkit::delegate_shm!(WaylandState);
 smithay_client_toolkit::delegate_registry!(WaylandState);
+wayland_client::delegate_noop!(WaylandState: ignore ZwlrVirtualPointerManagerV1);
+wayland_client::delegate_noop!(WaylandState: ignore ZwlrVirtualPointerV1);

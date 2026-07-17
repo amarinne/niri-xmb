@@ -17,6 +17,8 @@ pub enum ControlCommand {
         target_workspace_id: u64,
         target_window_id: Option<u64>,
         fraction: f32,
+        cursor_x: Option<f64>,
+        cursor_y: Option<f64>,
     },
     Quit,
 }
@@ -73,11 +75,17 @@ pub fn serve(request_tx: Sender<ControlRequest>) -> Result<()> {
                             let target_window_id =
                                 fields.get(3)?.parse::<u64>().ok().filter(|id| *id != 0);
                             let fraction = fields.get(4)?.parse::<f32>().ok()?.clamp(0.0, 1.0);
+                            let cursor_x =
+                                fields.get(5).and_then(|value| value.parse::<f64>().ok());
+                            let cursor_y =
+                                fields.get(6).and_then(|value| value.parse::<f64>().ok());
                             Some(ControlCommand::Drop {
                                 source_window_id,
                                 target_workspace_id,
                                 target_window_id,
                                 fraction,
+                                cursor_x,
+                                cursor_y,
                             })
                         })();
                         let Some(command) = parsed else {
@@ -125,10 +133,14 @@ pub fn send(command: ControlCommand) -> Result<String> {
             target_workspace_id,
             target_window_id,
             fraction,
+            cursor_x,
+            cursor_y,
         } => {
             let command = format!(
-                "drop {source_window_id} {target_workspace_id} {} {fraction}",
-                target_window_id.unwrap_or(0)
+                "drop {source_window_id} {target_workspace_id} {} {fraction} {} {}",
+                target_window_id.unwrap_or(0),
+                cursor_x.map_or_else(|| "nan".into(), |value| value.to_string()),
+                cursor_y.map_or_else(|| "nan".into(), |value| value.to_string())
             );
             stream.write_all(command.as_bytes())?;
             stream.shutdown(std::net::Shutdown::Write)?;

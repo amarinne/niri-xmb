@@ -80,7 +80,15 @@ Item {
         CompositorService.focusWindow(windowData);
     }
 
-    function dropWindow(sourceId, workspaceId, targetId, fraction) {
+    function globalPoint(item, x, y) {
+        const point = item.mapToItem(null, x, y);
+        return {
+            "x": (screen?.x ?? 0) + point.x,
+            "y": (screen?.y ?? 0) + point.y
+        };
+    }
+
+    function dropWindow(sourceId, workspaceId, targetId, fraction, cursorX, cursorY) {
         if (!allowDrag || !sourceId || !workspaceId) return;
         const args = [
             backendCommand,
@@ -90,6 +98,8 @@ Item {
             "--fraction", String(Math.max(0, Math.min(1, fraction)))
         ];
         if (targetId) args.push("--target-window-id", String(targetId));
+        if (Number.isFinite(cursorX) && Number.isFinite(cursorY))
+            args.push("--cursor-x", String(cursorX), "--cursor-y", String(cursorY));
         Quickshell.execDetached(args);
     }
 
@@ -184,12 +194,15 @@ Item {
                     onExited: workspaceGroup.dropHovered = false
                     onDropped: drop => {
                         workspaceGroup.dropHovered = false;
+                        const cursor = root.globalPoint(workspaceGroup, drop.x, drop.y);
                         root.dropWindow(drop.source?.windowData?.id,
                                         workspaceGroup.workspace.id,
                                         0,
                                         root.vertical
                                             ? drop.y / Math.max(1, height)
-                                            : drop.x / Math.max(1, width));
+                                            : drop.x / Math.max(1, width),
+                                        cursor.x,
+                                        cursor.y);
                     }
                 }
 
@@ -278,12 +291,15 @@ Item {
                                 onExited: taskItem.dropHovered = false
                                 onDropped: drop => {
                                     taskItem.dropHovered = false;
+                                    const cursor = root.globalPoint(taskItem, drop.x, drop.y);
                                     root.dropWindow(drop.source?.windowData?.id,
                                                     workspaceGroup.workspace.id,
                                                     taskItem.windowData?.id,
                                                     root.vertical
                                                         ? drop.y / Math.max(1, height)
-                                                        : drop.x / Math.max(1, width));
+                                                        : drop.x / Math.max(1, width),
+                                                    cursor.x,
+                                                    cursor.y);
                                 }
                             }
                         }
