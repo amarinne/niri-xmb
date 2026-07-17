@@ -6,11 +6,13 @@ per-output filtering, adaptive width, workspace capsules, active indicators,
 click-to-focus, and wheel workspace switching. The v5 port therefore uses a
 named `taskbar` instance instead of adding a second layer-shell surface.
 
-Copy the `[widget.niri-xmb]` table from `config.toml.example` into the active
-Noctalia v5 configuration. Add `"niri-xmb"` to the `start`, `center`, or `end`
-array of each desired `[bar.<name>]`. If an older v5 snapshot still uses a
-single `[bar]` table, keep that table and only copy the widget table plus the
-array entry.
+Copy the targeted widget tables from `config.toml.example` into the active
+Noctalia v5 configuration. `target_output` decouples the displayed workspace
+set from the monitor hosting the bar, so `niri-xmb-hdmi1` and
+`niri-xmb-hdmi2` can sit next to each other on one bar. Their order in the
+`start`, `center`, or `end` array determines left-to-right placement. If an
+older v5 snapshot still uses a single `[bar]` table, keep that table and copy
+the widget tables plus both array entries.
 
 Keep this in the standalone backend configuration:
 
@@ -28,4 +30,3 @@ Validate a current v5 configuration before restarting:
 ```bash
 noctalia config validate ~/.config/noctalia/config.toml
 ```
-

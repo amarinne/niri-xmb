@@ -1,14 +1,13 @@
 # Noctalia v5 native bar port for niri-xmb.
 #
-# Add "niri-xmb" to start/center/end on every bar that should display it.
-# The widget instance is created separately for each bar output; it does not
-# merge windows from the other monitor.
+# Two instances can live on one bar while targeting different outputs.
 
 [bar.main]
-start = ["niri-xmb"]
+start = ["niri-xmb-hdmi1", "niri-xmb-hdmi2"]
 
-[widget.niri-xmb]
+[widget.niri-xmb-hdmi1]
 type = "taskbar"
+target_output = "HDMI-A-1"
 show_all_outputs = false
 group_by_workspace = true
 only_active_workspace = false
@@ -25,3 +24,21 @@ focused_color = "primary"
 occupied_color = "secondary"
 empty_color = "tertiary"
 
+[widget.niri-xmb-hdmi2]
+type = "taskbar"
+target_output = "HDMI-A-2"
+show_all_outputs = false
+group_by_workspace = true
+only_active_workspace = false
+show_workspace_label = false
+workspace_label_placement = "corner"
+hide_empty_workspaces = false
+workspace_group_capsule = true
+focused_output_only = true
+group_single_icon_per_app = false
+show_active_indicator = true
+active_opacity = 1.0
+inactive_opacity = 0.95
+focused_color = "primary"
+occupied_color = "secondary"
+empty_color = "tertiary"

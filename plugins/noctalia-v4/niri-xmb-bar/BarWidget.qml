@@ -18,7 +18,15 @@ Item {
     property string targetOutput: ""
 
     readonly property string screenName: screen?.name ?? ""
-    readonly property string outputName: targetOutput || screenName
+    readonly property var widgetSettings: {
+        if (section && sectionWidgetIndex >= 0 && screenName) {
+            const sections = Settings.getBarWidgetsForScreen(screenName);
+            const widgets = sections ? sections[section] : null;
+            if (widgets && sectionWidgetIndex < widgets.length) return widgets[sectionWidgetIndex];
+        }
+        return {};
+    }
+    readonly property string outputName: widgetSettings.targetOutput || targetOutput || screenName
     readonly property string barPosition: Settings.getBarPositionForScreen(screenName)
     readonly property bool vertical: barPosition === "left" || barPosition === "right"
     readonly property real capsuleHeight: Style.getCapsuleHeightForScreen(screenName)

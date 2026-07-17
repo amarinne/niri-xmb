@@ -15,6 +15,7 @@
     "plugins": []
   },
   "metadata": {
+    "targetOutput": "",
     "defaultSettings": {
       "backendCommand": "/home/ez/.local/bin/niri-xmb",
       "hideEmptyWorkspaces": false,
