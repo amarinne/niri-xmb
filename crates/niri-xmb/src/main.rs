@@ -244,6 +244,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                         "outputs": popup_outputs,
                         "generation": snapshot.generation,
                         "socket": ipc::socket_path(),
+                        "cursor_restore": surfaces.cursor_restore_available(),
                     })
                     .to_string()
                         + "\n"

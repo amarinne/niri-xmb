@@ -288,6 +288,10 @@ impl SurfaceManager {
         self.show_popups(&[])
     }
 
+    pub fn cursor_restore_available(&self) -> bool {
+        self.state.virtual_pointer.is_some()
+    }
+
     pub fn restore_pointer(&mut self, global_x: f64, global_y: f64) -> bool {
         let Some(pointer) = &self.state.virtual_pointer else {
             return false;
