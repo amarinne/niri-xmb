@@ -49,6 +49,16 @@ enum Command {
     Hide,
     Toggle,
     Status,
+    Drop {
+        #[arg(long)]
+        source_window_id: u64,
+        #[arg(long)]
+        target_workspace_id: u64,
+        #[arg(long)]
+        target_window_id: Option<u64>,
+        #[arg(long, default_value_t = 0.5)]
+        fraction: f32,
+    },
     Quit,
     PrintDefaultConfig,
 }
@@ -86,6 +96,17 @@ fn main() -> Result<()> {
         Command::Hide => print_control(ControlCommand::Hide),
         Command::Toggle => print_control(ControlCommand::Toggle),
         Command::Status => print_control(ControlCommand::Status),
+        Command::Drop {
+            source_window_id,
+            target_workspace_id,
+            target_window_id,
+            fraction,
+        } => print_control(ControlCommand::Drop {
+            source_window_id,
+            target_workspace_id,
+            target_window_id,
+            fraction: fraction.clamp(0.0, 1.0),
+        }),
         Command::Quit => print_control(ControlCommand::Quit),
         Command::PrintDefaultConfig => {
             println!("{}", toml::to_string_pretty(&Config::default())?);
@@ -105,7 +126,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     if output_names.is_empty() {
         anyhow::bail!("Niri reported no connected outputs");
     }
-    if config.bars.is_empty() {
+    if config.bars_enabled && config.bars.is_empty() {
         config.bars = output_names
             .iter()
             .map(|output| BarConfig {
@@ -128,7 +149,12 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     spawn_niri(snapshot_tx, niri_command_rx);
 
     let (ui_tx, ui_rx) = unbounded();
-    let mut surfaces = SurfaceManager::new(&config.bars, &output_names, ui_tx)
+    let surface_bars = if config.bars_enabled {
+        config.bars.clone()
+    } else {
+        Vec::new()
+    };
+    let mut surfaces = SurfaceManager::new(&surface_bars, &output_names, ui_tx)
         .context("failed to initialize layer-shell surfaces")?;
     let mut renderer = Renderer::new();
 
@@ -206,6 +232,64 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     })
                     .to_string()
                         + "\n"
+                }
+                ControlCommand::Drop {
+                    source_window_id,
+                    target_workspace_id,
+                    target_window_id,
+                    fraction,
+                } => {
+                    let output = snapshot.outputs.values().find(|output| {
+                        output
+                            .workspaces
+                            .iter()
+                            .any(|workspace| workspace.id == target_workspace_id)
+                    });
+                    let target = output.map(|output| {
+                        target_window_id
+                            .and_then(|window_id| snapshot.window(window_id))
+                            .map(|window| HitTarget::Window {
+                                output: output.name.clone(),
+                                workspace_id: target_workspace_id,
+                                window_id: window.id,
+                                column: window.column,
+                                floating: window.floating,
+                                rect: render::Rect {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    width: 1.0,
+                                    height: 1.0,
+                                },
+                                canvas: None,
+                            })
+                            .unwrap_or_else(|| HitTarget::Canvas {
+                                output: output.name.clone(),
+                                workspace_id: target_workspace_id,
+                                rect: render::Rect {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    width: 1.0,
+                                    height: 1.0,
+                                },
+                            })
+                    });
+                    let dropped = target.is_some_and(|target| {
+                        dispatch_drop(
+                            source_window_id,
+                            &target,
+                            fraction as f64,
+                            0.5,
+                            &snapshot,
+                            &config,
+                            None,
+                            &niri_command_tx,
+                        )
+                    });
+                    if dropped {
+                        "ok\n".into()
+                    } else {
+                        "error: drop rejected\n".into()
+                    }
                 }
                 ControlCommand::Quit => {
                     running = false;
@@ -457,13 +541,12 @@ fn handle_ui_event(
             };
             if released.dragging {
                 let surface_infos = surfaces.surfaces();
-                if let Some((surface, target, local_x, local_y)) =
+                if let Some((_surface, target, local_x, local_y)) =
                     renderer.hit_test_global(&surface_infos, released.current_x, released.current_y)
                 {
                     let dropped = dispatch_drop(
                         released.window_id,
                         target,
-                        surface,
                         local_x,
                         local_y,
                         snapshot,
@@ -580,7 +663,6 @@ fn focus_adjacent_workspace(
 fn dispatch_drop(
     source_window_id: u64,
     target: &HitTarget,
-    surface: &wayland::SurfaceInfo,
     local_x: f64,
     local_y: f64,
     snapshot: &Snapshot,
@@ -603,7 +685,7 @@ fn dispatch_drop(
     } else {
         preserved_focus.or(snapshot.focused_window)
     };
-    let dropped = match target {
+    match target {
         HitTarget::Window {
             output,
             workspace_id,
@@ -738,9 +820,7 @@ fn dispatch_drop(
                 .is_ok()
         }
         HitTarget::Panel => false,
-    };
-    let _ = surface;
-    dropped
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1,0 +1,27 @@
+# Noctalia v5 native bar port for niri-xmb.
+#
+# Add "niri-xmb" to start/center/end on every bar that should display it.
+# The widget instance is created separately for each bar output; it does not
+# merge windows from the other monitor.
+
+[bar.main]
+start = ["niri-xmb"]
+
+[widget.niri-xmb]
+type = "taskbar"
+show_all_outputs = false
+group_by_workspace = true
+only_active_workspace = false
+show_workspace_label = false
+workspace_label_placement = "corner"
+hide_empty_workspaces = false
+workspace_group_capsule = true
+focused_output_only = true
+group_single_icon_per_app = false
+show_active_indicator = true
+active_opacity = 1.0
+inactive_opacity = 0.95
+focused_color = "primary"
+occupied_color = "secondary"
+empty_color = "tertiary"
+

@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub bars_enabled: bool,
     pub bars: Vec<BarConfig>,
     pub popup: PopupConfig,
     pub style: StyleConfig,
@@ -27,6 +28,18 @@ impl Config {
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
             .unwrap_or_else(|| PathBuf::from("."));
         base.join("niri-xmb/config.toml")
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bars_enabled: true,
+            bars: Vec::new(),
+            popup: PopupConfig::default(),
+            style: StyleConfig::default(),
+            behavior: BehaviorConfig::default(),
+        }
     }
 }
 

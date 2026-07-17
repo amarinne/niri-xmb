@@ -6,12 +6,18 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ControlCommand {
     Show,
     Hide,
     Toggle,
     Status,
+    Drop {
+        source_window_id: u64,
+        target_workspace_id: u64,
+        target_window_id: Option<u64>,
+        fraction: f32,
+    },
     Quit,
 }
 
@@ -52,12 +58,34 @@ pub fn serve(request_tx: Sender<ControlRequest>) -> Result<()> {
                 if stream.read_to_string(&mut command).is_err() {
                     continue;
                 }
-                let command = match command.trim() {
+                let input = command.trim();
+                let command = match input {
                     "show" => ControlCommand::Show,
                     "hide" => ControlCommand::Hide,
                     "toggle" => ControlCommand::Toggle,
                     "status" => ControlCommand::Status,
                     "quit" => ControlCommand::Quit,
+                    _ if input.starts_with("drop ") => {
+                        let fields = input.split_whitespace().collect::<Vec<_>>();
+                        let parsed = (|| {
+                            let source_window_id = fields.get(1)?.parse().ok()?;
+                            let target_workspace_id = fields.get(2)?.parse().ok()?;
+                            let target_window_id =
+                                fields.get(3)?.parse::<u64>().ok().filter(|id| *id != 0);
+                            let fraction = fields.get(4)?.parse::<f32>().ok()?.clamp(0.0, 1.0);
+                            Some(ControlCommand::Drop {
+                                source_window_id,
+                                target_workspace_id,
+                                target_window_id,
+                                fraction,
+                            })
+                        })();
+                        let Some(command) = parsed else {
+                            let _ = stream.write_all(b"error: invalid drop command\n");
+                            continue;
+                        };
+                        command
+                    }
                     _ => {
                         let _ = stream.write_all(b"error: unknown command\n");
                         continue;
@@ -92,6 +120,22 @@ pub fn send(command: ControlCommand) -> Result<String> {
         ControlCommand::Hide => "hide",
         ControlCommand::Toggle => "toggle",
         ControlCommand::Status => "status",
+        ControlCommand::Drop {
+            source_window_id,
+            target_workspace_id,
+            target_window_id,
+            fraction,
+        } => {
+            let command = format!(
+                "drop {source_window_id} {target_workspace_id} {} {fraction}",
+                target_window_id.unwrap_or(0)
+            );
+            stream.write_all(command.as_bytes())?;
+            stream.shutdown(std::net::Shutdown::Write)?;
+            let mut response = String::new();
+            stream.read_to_string(&mut response)?;
+            return Ok(response);
+        }
         ControlCommand::Quit => "quit",
     };
     stream.write_all(command.as_bytes())?;

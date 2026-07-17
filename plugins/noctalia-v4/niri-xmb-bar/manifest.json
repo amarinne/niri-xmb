@@ -1,0 +1,27 @@
+{
+  "id": "niri-xmb-bar",
+  "name": "Niri XMB Workspace Bar",
+  "version": "0.1.0",
+  "minNoctaliaVersion": "4.4.0",
+  "author": "orangenth",
+  "license": "GPL-3.0-only",
+  "description": "Per-output Niri workspace groups with app icons and XMB drag/drop integration.",
+  "tags": ["Bar", "Niri", "Workspace", "Taskbar"],
+  "entryPoints": {
+    "main": "Main.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "dependencies": {
+    "plugins": []
+  },
+  "metadata": {
+    "defaultSettings": {
+      "backendCommand": "/home/ez/.local/bin/niri-xmb",
+      "hideEmptyWorkspaces": false,
+      "allowDrag": true,
+      "showActiveIndicator": true,
+      "iconScale": 0.8,
+      "groupOpacity": 0.4
+    }
+  }
+}

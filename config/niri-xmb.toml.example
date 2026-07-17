@@ -1,3 +1,5 @@
+bars_enabled = true
+
 # Replace these connector names with `niri msg --json outputs` results.
 [[bars]]
 output = "HDMI-A-1"

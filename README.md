@@ -1,8 +1,9 @@
 # niri-xmb
 
-`niri-xmb` is a Niri-native workspace bar and icon-only workspace navigator. It
-runs independently of Noctalia, so Noctalia upgrades do not need to carry a
-custom widget patch.
+`niri-xmb` is a Niri-native icon-only workspace navigator with optional bar
+frontends. Its popup and Niri rearrangement backend run independently of
+Noctalia. The repository also ships an actual Quickshell/Noctalia v4 bar plugin
+and a native Noctalia v5 taskbar configuration.
 
 The project is adapted from Woven's native Smithay Client Toolkit/tiny-skia
 layer-shell implementation. It consumes Niri's event stream directly and uses
@@ -20,6 +21,9 @@ Niri IPC actions for focusing and moving windows.
 - Drop on empty map space to make/reposition a floating window.
 - Keyboard navigation, focus restoration after drag, urgency, and app icons.
 - PNG icons natively, with optional SVG rendering through ImageMagick.
+- A `drop` control command that lets shell widgets reuse the same tiled/floating
+  preserving Niri rearrangement logic.
+- Noctalia v4 and v5 bar ports that replace the standalone layer-shell bars.
 
 The popup is implemented as independent transparent layer-shell surfaces. This
 is deliberate: Noctalia v5's plugin item API does not expose the pointer motion
@@ -53,6 +57,8 @@ to a different monitor automatically.
 
 Important behavior:
 
+- `bars_enabled = false`: do not create standalone bar surfaces. Use this when
+  either Noctalia bar port is installed; the popup daemon remains active.
 - `allow_column_join = false`: every icon drop is split into left and right
   halves. The window becomes its own column on the chosen side.
 - `allow_column_join = true`: the middle third joins the target column; the
@@ -109,8 +115,26 @@ niri-xmb show
 niri-xmb hide
 niri-xmb toggle
 niri-xmb status
+niri-xmb drop --source-window-id 10 --target-workspace-id 4 \
+  --target-window-id 12 --fraction 0.8
 niri-xmb quit
 ```
+
+## Noctalia bar ports
+
+For Noctalia v4, enable the plugin in
+`~/.config/noctalia/plugins/niri-xmb-bar` and place
+`"plugin:niri-xmb-bar"` in the desired bar section. Noctalia creates one
+instance per screen, so each widget automatically follows its own bar output.
+The QML widget supports app icons, click focus, wheel workspace switching, and
+left/right drag/drop through the standalone backend. The maintained source is
+under `plugins/noctalia-v4/niri-xmb-bar`.
+
+For Noctalia v5, use the named native taskbar instance in
+`ports/noctalia-v5/config.toml.example`. V5 supplies its own per-output grouped
+taskbar rendering and sizing. Its native bar currently supports click and wheel
+but not Niri rearrangement, so drag/drop remains available in the standalone
+popup.
 
 Add the following to the appropriate sections of the Niri config:
 
