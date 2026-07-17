@@ -208,14 +208,14 @@ Item {
                             property bool dropHovered: false
                             width: root.iconSize
                             height: root.iconSize
-                            z: dragHandler.active ? 20 : 1
+                            z: dragMouse.drag.active ? 20 : 1
 
                             IconImage {
                                 anchors.fill: parent
                                 source: ThemeIcons.iconForAppId(taskItem.windowData?.appId?.toLowerCase())
                                 smooth: true
                                 asynchronous: true
-                                opacity: dragHandler.active ? 0.35 : 1.0
+                                opacity: dragMouse.drag.active ? 0.35 : 1.0
                             }
 
                             Rectangle {
@@ -229,20 +229,15 @@ Item {
                                 color: taskItem.windowData?.isFocused ? Color.mPrimary : Color.mHover
                             }
 
-                            TapHandler {
-                                acceptedButtons: Qt.LeftButton
-                                onTapped: root.focusWindow(taskItem.windowData)
-                            }
-
                             Item {
                                 id: dragProxy
                                 x: 0
                                 y: 0
                                 width: parent.width
                                 height: parent.height
-                                visible: dragHandler.active
+                                visible: dragMouse.drag.active
                                 z: 100
-                                Drag.active: dragHandler.active
+                                Drag.active: dragMouse.drag.active
                                 Drag.source: taskItem
                                 Drag.keys: ["niri-xmb-window"]
                                 Drag.hotSpot.x: width / 2
@@ -255,17 +250,25 @@ Item {
                                 }
                             }
 
-                            DragHandler {
-                                id: dragHandler
-                                enabled: root.allowDrag
-                                target: dragProxy
+                            MouseArea {
+                                id: dragMouse
+                                anchors.fill: parent
                                 acceptedButtons: Qt.LeftButton
-                                onActiveChanged: {
-                                    if (!active) {
+
+                                drag.target: root.allowDrag ? dragProxy : null
+                                drag.axis: Drag.XAndYAxis
+                                preventStealing: true
+
+                                onReleased: {
+                                    if (dragProxy.Drag.active)
+                                        dragProxy.Drag.drop();
+                                    Qt.callLater(() => {
                                         dragProxy.x = 0;
                                         dragProxy.y = 0;
-                                    }
+                                    });
                                 }
+
+                                onClicked: root.focusWindow(taskItem.windowData)
                             }
 
                             DropArea {

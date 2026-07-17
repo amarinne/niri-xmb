@@ -20,10 +20,12 @@ Keep this in the standalone backend configuration:
 bars_enabled = false
 ```
 
-The Rust daemon is still required for the `Mod+Z` organizer. Noctalia's native
-taskbar currently handles click and wheel interaction but does not expose Niri
-window rearrangement through its bar items. Use the popup for drag/drop on v5;
-the v4 QML port additionally routes bar-item drops to `niri-xmb drop`.
+The Rust daemon is still required for the `Mod+Z` organizer. Set
+`drag_drop_command = "niri-xmb"` on each targeted taskbar instance to route
+bar-item drops through that daemon. Dragging between two taskbar instances on
+the same bar moves the tiled window to the target workspace and left/right
+position without focusing the destination output. An empty command keeps
+native taskbar drag/drop disabled.
 
 Validate a current v5 configuration before restarting:
 
