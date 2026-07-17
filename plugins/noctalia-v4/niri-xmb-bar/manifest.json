@@ -1,7 +1,7 @@
 {
   "id": "niri-xmb-bar",
   "name": "Niri XMB Workspace Bar",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minNoctaliaVersion": "4.4.0",
   "author": "orangenth",
   "license": "GPL-3.0-only",

@@ -125,10 +125,12 @@ niri-xmb quit
 For Noctalia v4, enable the plugin in
 `~/.config/noctalia/plugins/niri-xmb-bar` and place
 `"plugin:niri-xmb-bar"` in the desired bar section. Noctalia creates one
-instance per screen, so each widget automatically follows its own bar output.
-The QML widget supports app icons, click focus, wheel workspace switching, and
-left/right drag/drop through the standalone backend. The maintained source is
-under `plugins/noctalia-v4/niri-xmb-bar`.
+instance per configured entry. By default an instance follows its host bar;
+set `"targetOutput": "HDMI-A-1"` on an entry to display a different output, or
+put two explicitly targeted instances on the same bar. The QML widget supports
+app icons, click focus, wheel workspace switching, and left/right drag/drop
+through the standalone backend. The maintained source is under
+`plugins/noctalia-v4/niri-xmb-bar`.
 
 For Noctalia v5, use the named native taskbar instance in
 `ports/noctalia-v5/config.toml.example`. V5 supplies its own per-output grouped

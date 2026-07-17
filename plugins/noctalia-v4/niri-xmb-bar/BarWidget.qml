@@ -15,8 +15,10 @@ Item {
     property string section: ""
     property int sectionWidgetIndex: -1
     property int sectionWidgetsCount: 0
+    property string targetOutput: ""
 
     readonly property string screenName: screen?.name ?? ""
+    readonly property string outputName: targetOutput || screenName
     readonly property string barPosition: Settings.getBarPositionForScreen(screenName)
     readonly property bool vertical: barPosition === "left" || barPosition === "right"
     readonly property real capsuleHeight: Style.getCapsuleHeightForScreen(screenName)
@@ -40,9 +42,9 @@ Item {
     }
 
     function refresh() {
-        if (!screenName) return;
+        if (!outputName) return;
         const wanted = [];
-        const target = screenName.toLowerCase();
+        const target = outputName.toLowerCase();
         for (let i = 0; i < CompositorService.workspaces.count; ++i) {
             const ws = CompositorService.workspaces.get(i);
             if (!ws.output || ws.output.toLowerCase() !== target) continue;
@@ -100,6 +102,7 @@ Item {
 
     Component.onCompleted: Qt.callLater(refresh)
     onScreenNameChanged: Qt.callLater(refresh)
+    onTargetOutputChanged: Qt.callLater(refresh)
     onHideEmptyChanged: Qt.callLater(refresh)
 
     Connections {
