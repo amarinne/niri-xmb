@@ -320,7 +320,7 @@ local function poll(force)
         return
     end
     state.polling = true
-    noctalia.runAsync(backend() .. " snapshot", function(result)
+    local started = noctalia.runAsync(backend() .. " snapshot", function(result)
         state.polling = false
         if result.exitCode ~= 0 then
             local message = tostring(result.stderr or result.stdout or "snapshot failed")
@@ -347,6 +347,12 @@ local function poll(force)
             render()
         end
     end)
+    if not started then
+        -- The first top-level poll can run before Noctalia has attached the
+        -- async result handler to a newly-created plugin host. Do not leave the
+        -- poll latch stuck: update() will retry after the host is ready.
+        state.polling = false
+    end
 end
 
 function update()
