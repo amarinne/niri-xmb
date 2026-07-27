@@ -49,6 +49,24 @@ enum Command {
     Hide,
     Toggle,
     Status,
+    Snapshot {
+        #[arg(long)]
+        output: Option<String>,
+    },
+    FocusWindow {
+        #[arg(long)]
+        window_id: u64,
+    },
+    FocusWorkspace {
+        #[arg(long)]
+        workspace_id: u64,
+    },
+    CycleWorkspace {
+        #[arg(long)]
+        output: String,
+        #[arg(long)]
+        delta: i32,
+    },
     Drop {
         #[arg(long)]
         source_window_id: u64,
@@ -100,6 +118,16 @@ fn main() -> Result<()> {
         Command::Hide => print_control(ControlCommand::Hide),
         Command::Toggle => print_control(ControlCommand::Toggle),
         Command::Status => print_control(ControlCommand::Status),
+        Command::Snapshot { output } => print_control(ControlCommand::Snapshot { output }),
+        Command::FocusWindow { window_id } => {
+            print_control(ControlCommand::FocusWindow { window_id })
+        }
+        Command::FocusWorkspace { workspace_id } => {
+            print_control(ControlCommand::FocusWorkspace { workspace_id })
+        }
+        Command::CycleWorkspace { output, delta } => {
+            print_control(ControlCommand::CycleWorkspace { output, delta })
+        }
         Command::Drop {
             source_window_id,
             target_workspace_id,
@@ -126,6 +154,88 @@ fn main() -> Result<()> {
 fn print_control(command: ControlCommand) -> Result<()> {
     print!("{}", ipc::send(command)?);
     Ok(())
+}
+
+fn snapshot_json(snapshot: &Snapshot, output_filter: Option<&str>) -> String {
+    let outputs = snapshot
+        .outputs
+        .values()
+        .filter(|output| output_filter.is_none_or(|name| output.name == name))
+        .map(|output| {
+            let workspaces = output
+                .workspaces
+                .iter()
+                .map(|workspace| {
+                    let windows = workspace
+                        .columns
+                        .iter()
+                        .flat_map(|(column, rows)| {
+                            rows.iter().map(move |(row, window)| {
+                                serde_json::json!({
+                                    "id": window.id,
+                                    "workspace_id": window.workspace_id,
+                                    "app_id": window.app_id,
+                                    "title": window.title,
+                                    "focused": window.focused,
+                                    "urgent": window.urgent,
+                                    "floating": false,
+                                    "column": column,
+                                    "row": row,
+                                    "tile_width": window.tile_width,
+                                    "tile_height": window.tile_height,
+                                    "x": window.x,
+                                    "y": window.y,
+                                })
+                            })
+                        })
+                        .chain(workspace.floating.iter().map(|window| {
+                            serde_json::json!({
+                                "id": window.id,
+                                "workspace_id": window.workspace_id,
+                                "app_id": window.app_id,
+                                "title": window.title,
+                                "focused": window.focused,
+                                "urgent": window.urgent,
+                                "floating": true,
+                                "column": null,
+                                "row": null,
+                                "tile_width": window.tile_width,
+                                "tile_height": window.tile_height,
+                                "x": window.x,
+                                "y": window.y,
+                            })
+                        }))
+                        .collect::<Vec<_>>();
+                    serde_json::json!({
+                        "id": workspace.id,
+                        "index": workspace.index,
+                        "name": workspace.name,
+                        "label": workspace.label(),
+                        "active": workspace.active,
+                        "focused": workspace.focused,
+                        "urgent": workspace.urgent,
+                        "windows": windows,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "name": output.name,
+                "x": output.x,
+                "y": output.y,
+                "width": output.width,
+                "height": output.height,
+                "workspaces": workspaces,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "generation": snapshot.generation,
+        "focused_window": snapshot.focused_window,
+        "outputs": outputs,
+    })
+    .to_string()
+        + "\n"
 }
 
 fn run_daemon(config_path: PathBuf) -> Result<()> {
@@ -248,6 +358,57 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     })
                     .to_string()
                         + "\n"
+                }
+                ControlCommand::Snapshot { output } => snapshot_json(&snapshot, output.as_deref()),
+                ControlCommand::FocusWindow { window_id } => {
+                    if snapshot.window(window_id).is_none() {
+                        "error: unknown window\n".into()
+                    } else if niri_command_tx
+                        .send(NiriCommand::FocusWindow(window_id))
+                        .is_ok()
+                    {
+                        "ok\n".into()
+                    } else {
+                        "error: Niri command worker unavailable\n".into()
+                    }
+                }
+                ControlCommand::FocusWorkspace { workspace_id } => {
+                    if snapshot.workspace(workspace_id).is_none() {
+                        "error: unknown workspace\n".into()
+                    } else if niri_command_tx
+                        .send(NiriCommand::FocusWorkspace(workspace_id))
+                        .is_ok()
+                    {
+                        "ok\n".into()
+                    } else {
+                        "error: Niri command worker unavailable\n".into()
+                    }
+                }
+                ControlCommand::CycleWorkspace { output, delta } => {
+                    let target = snapshot.outputs.get(&output).and_then(|model| {
+                        if model.workspaces.is_empty() {
+                            return None;
+                        }
+                        let current = model
+                            .workspaces
+                            .iter()
+                            .position(|workspace| workspace.active)
+                            .unwrap_or(0);
+                        let len = model.workspaces.len() as i64;
+                        let next = (current as i64 + i64::from(delta)).rem_euclid(len) as usize;
+                        Some(model.workspaces[next].id)
+                    });
+                    match target {
+                        Some(workspace_id)
+                            if niri_command_tx
+                                .send(NiriCommand::FocusWorkspace(workspace_id))
+                                .is_ok() =>
+                        {
+                            "ok\n".into()
+                        }
+                        Some(_) => "error: Niri command worker unavailable\n".into(),
+                        None => "error: unknown output or no workspaces\n".into(),
+                    }
                 }
                 ControlCommand::Drop {
                     source_window_id,

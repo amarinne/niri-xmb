@@ -12,6 +12,19 @@ pub enum ControlCommand {
     Hide,
     Toggle,
     Status,
+    Snapshot {
+        output: Option<String>,
+    },
+    FocusWindow {
+        window_id: u64,
+    },
+    FocusWorkspace {
+        workspace_id: u64,
+    },
+    CycleWorkspace {
+        output: String,
+        delta: i32,
+    },
     Drop {
         source_window_id: u64,
         target_workspace_id: u64,
@@ -66,6 +79,46 @@ pub fn serve(request_tx: Sender<ControlRequest>) -> Result<()> {
                     "hide" => ControlCommand::Hide,
                     "toggle" => ControlCommand::Toggle,
                     "status" => ControlCommand::Status,
+                    "snapshot" => ControlCommand::Snapshot { output: None },
+                    _ if input.starts_with("snapshot ") => {
+                        let output = input["snapshot ".len()..].trim();
+                        if output.is_empty() {
+                            let _ = stream.write_all(b"error: invalid snapshot command\n");
+                            continue;
+                        }
+                        ControlCommand::Snapshot {
+                            output: Some(output.to_string()),
+                        }
+                    }
+                    _ if input.starts_with("focus-window ") => {
+                        let Ok(window_id) = input["focus-window ".len()..].trim().parse() else {
+                            let _ = stream.write_all(b"error: invalid focus-window command\n");
+                            continue;
+                        };
+                        ControlCommand::FocusWindow { window_id }
+                    }
+                    _ if input.starts_with("focus-workspace ") => {
+                        let Ok(workspace_id) = input["focus-workspace ".len()..].trim().parse()
+                        else {
+                            let _ = stream.write_all(b"error: invalid focus-workspace command\n");
+                            continue;
+                        };
+                        ControlCommand::FocusWorkspace { workspace_id }
+                    }
+                    _ if input.starts_with("cycle-workspace ") => {
+                        let fields = input.split_whitespace().collect::<Vec<_>>();
+                        let parsed = (|| {
+                            Some(ControlCommand::CycleWorkspace {
+                                output: fields.get(1)?.to_string(),
+                                delta: fields.get(2)?.parse().ok()?,
+                            })
+                        })();
+                        let Some(command) = parsed else {
+                            let _ = stream.write_all(b"error: invalid cycle-workspace command\n");
+                            continue;
+                        };
+                        command
+                    }
                     "quit" => ControlCommand::Quit,
                     _ if input.starts_with("drop ") => {
                         let fields = input.split_whitespace().collect::<Vec<_>>();
@@ -123,11 +176,21 @@ pub fn send(command: ControlCommand) -> Result<String> {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path)
         .with_context(|| format!("niri-xmb daemon is not running ({})", path.display()))?;
-    let command = match command {
-        ControlCommand::Show => "show",
-        ControlCommand::Hide => "hide",
-        ControlCommand::Toggle => "toggle",
-        ControlCommand::Status => "status",
+    let command: String = match command {
+        ControlCommand::Show => "show".into(),
+        ControlCommand::Hide => "hide".into(),
+        ControlCommand::Toggle => "toggle".into(),
+        ControlCommand::Status => "status".into(),
+        ControlCommand::Snapshot { output } => {
+            output.map_or_else(|| "snapshot".into(), |name| format!("snapshot {name}"))
+        }
+        ControlCommand::FocusWindow { window_id } => format!("focus-window {window_id}"),
+        ControlCommand::FocusWorkspace { workspace_id } => {
+            format!("focus-workspace {workspace_id}")
+        }
+        ControlCommand::CycleWorkspace { output, delta } => {
+            format!("cycle-workspace {output} {delta}")
+        }
         ControlCommand::Drop {
             source_window_id,
             target_workspace_id,
@@ -135,20 +198,13 @@ pub fn send(command: ControlCommand) -> Result<String> {
             fraction,
             cursor_x,
             cursor_y,
-        } => {
-            let command = format!(
-                "drop {source_window_id} {target_workspace_id} {} {fraction} {} {}",
-                target_window_id.unwrap_or(0),
-                cursor_x.map_or_else(|| "nan".into(), |value| value.to_string()),
-                cursor_y.map_or_else(|| "nan".into(), |value| value.to_string())
-            );
-            stream.write_all(command.as_bytes())?;
-            stream.shutdown(std::net::Shutdown::Write)?;
-            let mut response = String::new();
-            stream.read_to_string(&mut response)?;
-            return Ok(response);
-        }
-        ControlCommand::Quit => "quit",
+        } => format!(
+            "drop {source_window_id} {target_workspace_id} {} {fraction} {} {}",
+            target_window_id.unwrap_or(0),
+            cursor_x.map_or_else(|| "nan".into(), |value| value.to_string()),
+            cursor_y.map_or_else(|| "nan".into(), |value| value.to_string())
+        ),
+        ControlCommand::Quit => "quit".into(),
     };
     stream.write_all(command.as_bytes())?;
     stream.shutdown(std::net::Shutdown::Write)?;

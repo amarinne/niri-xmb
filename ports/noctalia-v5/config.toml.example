@@ -1,46 +1,40 @@
-# Noctalia v5 native bar port for niri-xmb.
+# Noctalia v5 plugin port for niri-xmb.
 #
-# Two instances can live on one bar while targeting different outputs.
+# Point the path source at this repository on the target machine.
+
+[plugins]
+enabled = ["amarinne/niri-xmb"]
+
+[[plugins.source]]
+name = "niri-xmb-local"
+kind = "path"
+location = "/home/eza/Projects/niri-xmb/ports/noctalia-v5/plugins"
 
 [bar.main]
 start = ["niri-xmb-hdmi1", "niri-xmb-hdmi2"]
 
 [widget.niri-xmb-hdmi1]
-type = "taskbar"
+type = "amarinne/niri-xmb:workspace-strip"
 target_output = "HDMI-A-1"
-drag_drop_command = "niri-xmb"
-show_all_outputs = false
-group_by_workspace = true
-only_active_workspace = false
-show_workspace_label = false
-workspace_label_placement = "corner"
+backend_command = "/home/eza/.local/bin/niri-xmb"
+poll_interval_ms = 250
 hide_empty_workspaces = false
-workspace_group_capsule = true
-focused_output_only = true
-group_single_icon_per_app = false
+allow_drag = true
+allow_column_join = false
+preserve_cursor_after_drag = true
 show_active_indicator = true
-active_opacity = 1.0
-inactive_opacity = 0.95
-focused_color = "primary"
-occupied_color = "secondary"
-empty_color = "tertiary"
+icon_size = 22
+group_opacity = 0.72
 
 [widget.niri-xmb-hdmi2]
-type = "taskbar"
+type = "amarinne/niri-xmb:workspace-strip"
 target_output = "HDMI-A-2"
-drag_drop_command = "niri-xmb"
-show_all_outputs = false
-group_by_workspace = true
-only_active_workspace = false
-show_workspace_label = false
-workspace_label_placement = "corner"
+backend_command = "/home/eza/.local/bin/niri-xmb"
+poll_interval_ms = 250
 hide_empty_workspaces = false
-workspace_group_capsule = true
-focused_output_only = true
-group_single_icon_per_app = false
+allow_drag = true
+allow_column_join = false
+preserve_cursor_after_drag = true
 show_active_indicator = true
-active_opacity = 1.0
-inactive_opacity = 0.95
-focused_color = "primary"
-occupied_color = "secondary"
-empty_color = "tertiary"
+icon_size = 22
+group_opacity = 0.72

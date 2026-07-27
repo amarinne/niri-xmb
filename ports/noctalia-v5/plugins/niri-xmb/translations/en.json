@@ -1,0 +1,44 @@
+{
+  "settings": {
+    "target_output": {
+      "label": "Target output",
+      "description": "Niri output whose workspaces this widget displays. Empty uses the bar output."
+    },
+    "backend_command": {
+      "label": "Backend command",
+      "description": "niri-xmb executable or command prefix used for snapshots and actions."
+    },
+    "poll_interval_ms": {
+      "label": "Refresh interval",
+      "description": "Milliseconds between XMB snapshot requests."
+    },
+    "hide_empty_workspaces": {
+      "label": "Hide empty workspaces",
+      "description": "Keep active workspaces visible while hiding other empty workspaces."
+    },
+    "allow_drag": {
+      "label": "Enable drag and drop",
+      "description": "Allow tiled windows to be rearranged and moved between workspaces."
+    },
+    "allow_column_join": {
+      "label": "Join columns on icon drop",
+      "description": "Treat drops nearest a window as column joins instead of left/right insertion."
+    },
+    "preserve_cursor_after_drag": {
+      "label": "Preserve cursor after drag",
+      "description": "Restore the pointer after niri-xmb temporarily focuses a moved window."
+    },
+    "show_active_indicator": {
+      "label": "Active indicator",
+      "description": "Show a primary-color line under the active workspace."
+    },
+    "icon_size": {
+      "label": "Icon size",
+      "description": "Application icon size in logical pixels."
+    },
+    "group_opacity": {
+      "label": "Inactive opacity",
+      "description": "Opacity used for inactive workspace groups."
+    }
+  }
+}

@@ -35,6 +35,8 @@ impl Snapshot {
 #[derive(Debug, Clone)]
 pub struct OutputModel {
     pub name: String,
+    pub x: i32,
+    pub y: i32,
     pub width: i32,
     pub height: i32,
     pub workspaces: Vec<WorkspaceModel>,
@@ -175,12 +177,14 @@ impl NiriState {
 
         for (name, output) in &self.outputs {
             let logical = output.logical;
-            let (width, height) = logical
-                .map(|logical| (logical.width, logical.height))
-                .unwrap_or((1920, 1080));
+            let (x, y, width, height) = logical
+                .map(|logical| (logical.x, logical.y, logical.width, logical.height))
+                .unwrap_or((0, 0, 1920, 1080));
             outputs.insert(
                 name.clone(),
                 OutputModel {
+                    x,
+                    y,
                     name: name.clone(),
                     width: i32::try_from(width).unwrap_or(i32::MAX),
                     height: i32::try_from(height).unwrap_or(i32::MAX),

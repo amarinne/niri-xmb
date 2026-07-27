@@ -1,0 +1,90 @@
+id = "amarinne/niri-xmb"
+name = "Niri XMB"
+version = "0.2.0"
+description = "Per-output Niri workspace and window strip backed by niri-xmb."
+icon = "layout-grid"
+plugin_api = 16
+license = "GPL-3.0-only"
+
+[[widget]]
+id = "workspace-strip"
+entry = "bar.luau"
+
+[[widget.setting]]
+key = "target_output"
+type = "string"
+label_key = "settings.target_output.label"
+description_key = "settings.target_output.description"
+default = ""
+
+[[widget.setting]]
+key = "backend_command"
+type = "string"
+label_key = "settings.backend_command.label"
+description_key = "settings.backend_command.description"
+default = "niri-xmb"
+
+[[widget.setting]]
+key = "poll_interval_ms"
+type = "int"
+label_key = "settings.poll_interval_ms.label"
+description_key = "settings.poll_interval_ms.description"
+default = 250
+min = 100
+max = 2000
+step = 50
+
+[[widget.setting]]
+key = "hide_empty_workspaces"
+type = "bool"
+label_key = "settings.hide_empty_workspaces.label"
+description_key = "settings.hide_empty_workspaces.description"
+default = false
+
+[[widget.setting]]
+key = "allow_drag"
+type = "bool"
+label_key = "settings.allow_drag.label"
+description_key = "settings.allow_drag.description"
+default = true
+
+[[widget.setting]]
+key = "allow_column_join"
+type = "bool"
+label_key = "settings.allow_column_join.label"
+description_key = "settings.allow_column_join.description"
+default = false
+
+[[widget.setting]]
+key = "preserve_cursor_after_drag"
+type = "bool"
+label_key = "settings.preserve_cursor_after_drag.label"
+description_key = "settings.preserve_cursor_after_drag.description"
+default = true
+
+[[widget.setting]]
+key = "show_active_indicator"
+type = "bool"
+label_key = "settings.show_active_indicator.label"
+description_key = "settings.show_active_indicator.description"
+default = true
+
+[[widget.setting]]
+key = "icon_size"
+type = "int"
+label_key = "settings.icon_size.label"
+description_key = "settings.icon_size.description"
+default = 22
+min = 14
+max = 42
+step = 1
+
+[[widget.setting]]
+key = "group_opacity"
+type = "double"
+label_key = "settings.group_opacity.label"
+description_key = "settings.group_opacity.description"
+default = 0.72
+min = 0.2
+max = 1.0
+step = 0.05
