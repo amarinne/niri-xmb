@@ -4,8 +4,6 @@ local state = {
     lastGeneration = -1,
     lastError = nil,
     icons = {},
-    debugLoggedStart = false,
-    debugLoggedCallback = false,
 }
 
 local function config(key, fallback)
@@ -324,10 +322,6 @@ local function poll(force)
     state.polling = true
     local started = noctalia.runAsync(backend() .. " snapshot", function(result)
         state.polling = false
-        if not state.debugLoggedCallback then
-            noctalia.log("niri-xmb debug: snapshot callback exit=" .. tostring(result.exitCode))
-            state.debugLoggedCallback = true
-        end
         if result.exitCode ~= 0 then
             local message = tostring(result.stderr or result.stdout or "snapshot failed")
             if state.lastError ~= message then
@@ -353,10 +347,6 @@ local function poll(force)
             render()
         end
     end)
-    if not state.debugLoggedStart then
-        noctalia.log("niri-xmb debug: snapshot launch started=" .. tostring(started))
-        state.debugLoggedStart = true
-    end
     if not started then
         -- The first top-level poll can run before Noctalia has attached the
         -- async result handler to a newly-created plugin host. Do not leave the
