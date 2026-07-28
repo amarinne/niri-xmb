@@ -1,4 +1,5 @@
 use crate::model::{NiriState, Snapshot};
+use crate::wayland::WakeHandle;
 use crossbeam_channel::{Receiver, Sender};
 use niri_ipc::socket::Socket;
 use niri_ipc::{Action, Event, Request, Response, WorkspaceReferenceArg};
@@ -40,10 +41,12 @@ pub fn spawn(
     snapshot_tx: Sender<Snapshot>,
     command_rx: Receiver<NiriCommand>,
     cursor_restore_tx: Sender<(f64, f64)>,
+    wake: WakeHandle,
 ) {
+    let event_wake = wake.clone();
     thread::Builder::new()
         .name("niri-xmb-events".into())
-        .spawn(move || run_events(snapshot_tx))
+        .spawn(move || run_events(snapshot_tx, event_wake))
         .expect("failed to spawn niri IPC thread");
     thread::Builder::new()
         .name("niri-xmb-actions".into())
@@ -56,8 +59,10 @@ pub fn spawn(
                 };
                 match dispatch(command) {
                     Ok(()) => {
-                        if let Some(position) = restore_cursor {
-                            let _ = cursor_restore_tx.send(position);
+                        if let Some(position) = restore_cursor
+                            && cursor_restore_tx.send(position).is_ok()
+                        {
+                            wake.wake();
                         }
                     }
                     Err(error) => tracing::warn!(%error, "Niri action failed"),
@@ -67,7 +72,7 @@ pub fn spawn(
         .expect("failed to spawn niri action thread");
 }
 
-fn run_events(snapshot_tx: Sender<Snapshot>) {
+fn run_events(snapshot_tx: Sender<Snapshot>, wake: WakeHandle) {
     loop {
         let mut state = NiriState::default();
         refresh_outputs(&mut state);
@@ -106,8 +111,8 @@ fn run_events(snapshot_tx: Sender<Snapshot>) {
                 }
             };
             let refresh = apply_event(&mut state, event);
-            if refresh {
-                let _ = snapshot_tx.try_send(state.snapshot());
+            if refresh && snapshot_tx.try_send(state.snapshot()).is_ok() {
+                wake.wake();
             }
         }
         thread::sleep(Duration::from_millis(500));
@@ -159,10 +164,7 @@ fn apply_event(state: &mut NiriState, event: Event) -> bool {
             state.replace_windows(windows);
             true
         }
-        Event::WindowOpenedOrChanged { window } => {
-            state.upsert_window(window);
-            true
-        }
+        Event::WindowOpenedOrChanged { window } => state.upsert_window(window),
         Event::WindowClosed { id } => {
             state.remove_window(id);
             true

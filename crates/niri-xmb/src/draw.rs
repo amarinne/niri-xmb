@@ -26,11 +26,6 @@ pub fn hex_color(s: &str) -> Color {
     }
 }
 
-/// Fill the entire pixmap with a solid color.
-pub fn clear(pixmap: &mut Pixmap, color: Color) {
-    pixmap.fill(color);
-}
-
 /// Fill a solid rectangle.
 pub fn fill_rect(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, color: Color) {
     if w <= 0.0 || h <= 0.0 {

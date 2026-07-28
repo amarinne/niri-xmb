@@ -1,3 +1,4 @@
+use crate::wayland::WakeHandle;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Sender, bounded};
 use std::io::{Read, Write};
@@ -57,7 +58,7 @@ pub fn cleanup() {
     }
 }
 
-pub fn serve(request_tx: Sender<ControlRequest>) -> Result<()> {
+pub fn serve(request_tx: Sender<ControlRequest>, wake: WakeHandle) -> Result<()> {
     let path = socket_path();
     cleanup();
     let listener =
@@ -163,6 +164,7 @@ pub fn serve(request_tx: Sender<ControlRequest>) -> Result<()> {
                     let _ = stream.write_all(b"error: daemon unavailable\n");
                     continue;
                 }
+                wake.wake();
                 let response = reply_rx
                     .recv_timeout(Duration::from_secs(2))
                     .unwrap_or_else(|_| "error: daemon timeout\n".into());

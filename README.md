@@ -148,7 +148,16 @@ Highlights:
 Opening the panel, changing the selection, and closing are all animated.
 Animation adds redraws only while something is actually moving; once every
 track settles, the daemon falls back to its normal idle behaviour rather than
-holding a frame loop open.
+holding a frame loop open. Rendering is paced by compositor frame callbacks,
+and only the panel/shadow/drag regions are cleared, converted, and damaged.
+The opening scale pass also uses a panel-sized layer instead of a monitor-sized
+transparent canvas.
+
+The daemon is intended to start once with the session. `show`, `hide`, and
+`toggle` are lightweight control-socket clients: they do not initialize
+Wayland, rescan Niri state, or start another renderer. Settled state blocks on
+Wayland or producer wakeups, so keeping the daemon resident does not require a
+polling CPU loop.
 
 #### Importing a theme
 
@@ -287,7 +296,7 @@ Add the following to the appropriate sections of the Niri config:
 spawn-at-startup "niri-xmb" "daemon"
 
 binds {
-    Mod+F { spawn "niri-xmb" "toggle"; }
+    Mod+Z { spawn "niri-xmb" "toggle"; }
 }
 ```
 

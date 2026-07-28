@@ -1,15 +1,15 @@
 use crate::anim::{Animator, Timing, lerp};
 use crate::config::{AnchorX, AnchorY, BarConfig, Config, Edge, PopupOutputs, PopupPosition};
 use crate::draw::{
-    blit_icon_alpha, clear, fill_circle, fill_gradient_rounded_rect, fill_rect, fill_rounded_rect,
+    blit_icon_alpha, fill_circle, fill_gradient_rounded_rect, fill_rect, fill_rounded_rect,
     hex_color, stroke_rounded_rect,
 };
 use crate::icons::IconCache;
 use crate::model::{OutputModel, Snapshot, WindowModel, WindowSlot, WorkspaceModel};
 use crate::text::TextRenderer;
-use crate::wayland::{SurfaceInfo, SurfaceKind};
+use crate::wayland::{DamageRect, SurfaceInfo, SurfaceKind};
 use std::collections::HashMap;
-use tiny_skia::{Color, FilterQuality, Pixmap, PixmapPaint, Transform};
+use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
 
 /// Icon sizing derived from the style config, shared by every popup layout.
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +153,52 @@ impl Rect {
     }
 }
 
+fn damage_for_rect(rect: Rect, padding: f32, width: u32, height: u32) -> Option<DamageRect> {
+    let x0 = (rect.x - padding).floor().max(0.0) as u32;
+    let y0 = (rect.y - padding).floor().max(0.0) as u32;
+    let x1 = (rect.x + rect.width + padding)
+        .ceil()
+        .clamp(0.0, width as f32) as u32;
+    let y1 = (rect.y + rect.height + padding)
+        .ceil()
+        .clamp(0.0, height as f32) as u32;
+    (x1 > x0 && y1 > y0).then_some(DamageRect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    })
+}
+
+fn clear_damage(pixmap: &mut Pixmap, damage: DamageRect) {
+    let width = pixmap.width() as usize;
+    let x0 = damage.x.min(pixmap.width()) as usize * 4;
+    let x1 = damage.x.saturating_add(damage.width).min(pixmap.width()) as usize * 4;
+    let y0 = damage.y.min(pixmap.height()) as usize;
+    let y1 = damage.y.saturating_add(damage.height).min(pixmap.height()) as usize;
+    let stride = width * 4;
+    for y in y0..y1 {
+        pixmap.data_mut()[y * stride + x0..y * stride + x1].fill(0);
+    }
+}
+fn copy_damage(source: &Pixmap, destination: &mut Pixmap, damage: DamageRect) {
+    let source_stride = source.width() as usize * 4;
+    let destination_stride = destination.width() as usize * 4;
+    let x = damage.x as usize * 4;
+    let width = damage.width as usize * 4;
+    for row in 0..damage.height as usize {
+        let source_start = (damage.y as usize + row) * source_stride + x;
+        let destination_start = row * destination_stride;
+        destination.data_mut()[destination_start..destination_start + width]
+            .copy_from_slice(&source.data()[source_start..source_start + width]);
+    }
+}
+
+pub struct RenderedFrame<'a> {
+    pub pixels: &'a [u8],
+    pub damage: Option<DamageRect>,
+}
+
 #[derive(Debug, Clone)]
 pub enum HitTarget {
     Panel,
@@ -237,6 +283,7 @@ pub struct Renderer {
     /// so reallocating these per frame is the dominant cost of animating.
     canvas: Option<Pixmap>,
     layer: Option<Pixmap>,
+    canvas_damage: Option<DamageRect>,
     /// Surfaces already presented blank, so they can be skipped.
     blanked: std::collections::HashSet<usize>,
 }
@@ -254,6 +301,7 @@ impl Renderer {
             anim: Animator::new(),
             canvas: None,
             layer: None,
+            canvas_damage: None,
             blanked: std::collections::HashSet::new(),
         }
     }
@@ -429,7 +477,7 @@ impl Renderer {
         config: &Config,
         drag: Option<&DragVisual>,
         selection: Option<&SelectionVisual>,
-    ) -> Option<&[u8]> {
+    ) -> Option<RenderedFrame<'_>> {
         let (width, height) = (surface.width.max(1), surface.height.max(1));
         let progress = match surface.kind {
             SurfaceKind::Bar(_) => 1.0,
@@ -450,11 +498,15 @@ impl Renderer {
             .is_some_and(|pixmap| pixmap.width() == width && pixmap.height() == height);
         if !reusable {
             self.canvas = Pixmap::new(width, height);
+            self.canvas_damage = None;
         }
         let mut pixmap = self.canvas.take()?;
-        clear(&mut pixmap, Color::TRANSPARENT);
+        if let Some(previous) = self.canvas_damage.take() {
+            clear_damage(&mut pixmap, previous);
+        }
         self.render_surface = Some(surface.id);
         let mut zones = Vec::new();
+        let mut damage = None;
 
         match surface.kind {
             SurfaceKind::Bar(index) => {
@@ -463,11 +515,17 @@ impl Renderer {
                     snapshot.outputs.get(&surface.output),
                 ) {
                     self.render_bar(&mut pixmap, output, bar, config, &mut zones);
+                    damage = Some(DamageRect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    });
                 }
             }
             SurfaceKind::Popup => {
                 if progress > 0.004 {
-                    self.render_popup_layer(
+                    let panel = self.render_popup_layer(
                         &mut pixmap,
                         &surface.output,
                         snapshot,
@@ -476,16 +534,28 @@ impl Renderer {
                         progress,
                         &mut zones,
                     );
+                    damage = panel.and_then(|panel| {
+                        let padding =
+                            config.style.shadow_spread + config.style.shadow_offset.abs() + 4.0;
+                        damage_for_rect(panel, padding, width, height)
+                    });
                 }
             }
         }
 
-        if let Some(drag) = drag {
-            self.render_drag_ghost(&mut pixmap, surface, drag, config);
+        if let Some(drag) = drag
+            && let Some(rect) = self.render_drag_ghost(&mut pixmap, surface, drag, config)
+            && let Some(ghost) = damage_for_rect(rect, 6.0, width, height)
+        {
+            damage = Some(damage.map_or(ghost, |current| current.union(ghost)));
         }
         self.hit_zones.insert(surface.id, zones);
+        self.canvas_damage = damage;
         self.canvas = Some(pixmap);
-        self.canvas.as_ref().map(|pixmap| pixmap.data())
+        self.canvas.as_ref().map(|pixmap| RenderedFrame {
+            pixels: pixmap.data(),
+            damage,
+        })
     }
 
     fn render_bar(
@@ -654,27 +724,26 @@ impl Renderer {
         selection: Option<&SelectionVisual>,
         progress: f32,
         zones: &mut Vec<HitZone>,
-    ) {
+    ) -> Option<Rect> {
         if progress >= 0.996 {
-            self.render_popup(pixmap, host_output, snapshot, config, selection, zones);
-            return;
+            return self.render_popup(pixmap, host_output, snapshot, config, selection, zones);
         }
+        // Draw once into the reusable surface canvas, then copy only the
+        // panel-sized region into the animation layer. Scaling a full-monitor
+        // transparent pixmap was the dominant opening-frame cost.
+        let panel = self.render_popup(pixmap, host_output, snapshot, config, selection, zones)?;
+        let padding = config.style.shadow_spread + config.style.shadow_offset.abs() + 4.0;
+        let damage = damage_for_rect(panel, padding, pixmap.width(), pixmap.height())?;
         let reusable = self
             .layer
             .as_ref()
-            .is_some_and(|l| l.width() == pixmap.width() && l.height() == pixmap.height());
+            .is_some_and(|layer| layer.width() == damage.width && layer.height() == damage.height);
         if !reusable {
-            self.layer = Pixmap::new(pixmap.width(), pixmap.height());
+            self.layer = Pixmap::new(damage.width, damage.height);
         }
-        let Some(mut layer) = self.layer.take() else {
-            return;
-        };
-        clear(&mut layer, Color::TRANSPARENT);
-        let panel = self.render_popup(&mut layer, host_output, snapshot, config, selection, zones);
-        let Some(panel) = panel else {
-            self.layer = Some(layer);
-            return;
-        };
+        let mut layer = self.layer.take()?;
+        copy_damage(pixmap, &mut layer, damage);
+        clear_damage(pixmap, damage);
         // Grow into place from slightly small, pivoting on the panel centre.
         let scale = lerp(config.animation.open_scale, 1.0, progress);
         let pivot_x = panel.x + panel.width * 0.5;
@@ -687,8 +756,16 @@ impl Renderer {
             quality: FilterQuality::Bilinear,
             ..PixmapPaint::default()
         };
-        pixmap.draw_pixmap(0, 0, layer.as_ref(), &paint, transform, None);
+        pixmap.draw_pixmap(
+            damage.x as i32,
+            damage.y as i32,
+            layer.as_ref(),
+            &paint,
+            transform,
+            None,
+        );
         self.layer = Some(layer);
+        Some(panel)
     }
 
     /// Lay out one canvas per output, side by side, and return the panel rect.
@@ -1219,7 +1296,7 @@ impl Renderer {
         surface: &SurfaceInfo,
         drag: &DragVisual,
         config: &Config,
-    ) {
+    ) -> Option<Rect> {
         let x = drag.global_x - surface.global_x;
         let y = drag.global_y - surface.global_y;
         if x < -48.0
@@ -1227,7 +1304,7 @@ impl Renderer {
             || x > surface.width as f64 + 48.0
             || y > surface.height as f64 + 48.0
         {
-            return;
+            return None;
         }
         let size = config.style.icon_size.max(28) as f32;
         let rect = Rect {
@@ -1260,6 +1337,12 @@ impl Renderer {
             y: None,
         };
         self.draw_window_icon(pixmap, rect, &ghost_window, config, 0.0, 1.0);
+        Some(Rect {
+            x: rect.x - 5.0,
+            y: rect.y - 5.0,
+            width: rect.width + 10.0,
+            height: rect.height + 10.0,
+        })
     }
 }
 

@@ -228,14 +228,32 @@ impl NiriState {
         self.generation += 1;
     }
 
-    pub fn upsert_window(&mut self, window: Window) {
+    /// Store the latest window metadata and report whether anything represented
+    /// by the XMB changed. Titles, PIDs, and focus timestamps can update many
+    /// times per second without changing the workspace map, so they must not
+    /// drive snapshots and redraws.
+    pub fn upsert_window(&mut self, window: Window) -> bool {
+        let mut changed = self.windows.get(&window.id).is_none_or(|previous| {
+            previous.app_id != window.app_id
+                || previous.workspace_id != window.workspace_id
+                || previous.is_focused != window.is_focused
+                || previous.is_floating != window.is_floating
+                || previous.is_urgent != window.is_urgent
+                || previous.layout != window.layout
+        });
         if window.is_focused {
             for other in self.windows.values_mut() {
-                other.is_focused = false;
+                if other.id != window.id && other.is_focused {
+                    other.is_focused = false;
+                    changed = true;
+                }
             }
         }
         self.windows.insert(window.id, window);
-        self.generation += 1;
+        if changed {
+            self.generation += 1;
+        }
+        changed
     }
 
     pub fn set_overview_open(&mut self, open: bool) {
@@ -370,6 +388,76 @@ impl NiriState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_window() -> Window {
+        Window {
+            id: 10,
+            title: Some("first title".into()),
+            app_id: Some("org.example.App".into()),
+            pid: Some(1000),
+            workspace_id: Some(1),
+            is_focused: true,
+            is_floating: false,
+            is_urgent: false,
+            layout: niri_ipc::WindowLayout {
+                pos_in_scrolling_layout: Some((1, 1)),
+                tile_size: (800.0, 600.0),
+                window_size: (780, 580),
+                tile_pos_in_workspace_view: Some((0.0, 0.0)),
+                window_offset_in_tile: (10.0, 10.0),
+            },
+            focus_timestamp: None,
+        }
+    }
+
+    #[test]
+    fn title_only_window_update_does_not_bump_generation() {
+        let mut state = NiriState::default();
+        assert!(state.upsert_window(test_window()));
+        let generation = state.snapshot().generation;
+
+        let mut update = test_window();
+        update.title = Some("spinner changed".into());
+        update.pid = Some(2000);
+        assert!(!state.upsert_window(update));
+
+        assert_eq!(state.snapshot().generation, generation);
+        assert_eq!(
+            state
+                .windows
+                .get(&10)
+                .and_then(|window| window.title.as_deref()),
+            Some("spinner changed")
+        );
+        assert_eq!(
+            state.windows.get(&10).and_then(|window| window.pid),
+            Some(2000)
+        );
+    }
+
+    #[test]
+    fn visually_relevant_window_updates_bump_generation() {
+        let mut state = NiriState::default();
+        assert!(state.upsert_window(test_window()));
+
+        let mut app_update = test_window();
+        app_update.app_id = Some("org.example.Other".into());
+        let before = state.snapshot().generation;
+        assert!(state.upsert_window(app_update.clone()));
+        assert_eq!(state.snapshot().generation, before + 1);
+
+        let mut workspace_update = app_update.clone();
+        workspace_update.workspace_id = Some(2);
+        let before = state.snapshot().generation;
+        assert!(state.upsert_window(workspace_update.clone()));
+        assert_eq!(state.snapshot().generation, before + 1);
+
+        let mut layout_update = workspace_update;
+        layout_update.layout.pos_in_scrolling_layout = Some((2, 1));
+        let before = state.snapshot().generation;
+        assert!(state.upsert_window(layout_update));
+        assert_eq!(state.snapshot().generation, before + 1);
+    }
 
     #[test]
     fn overview_active_window_change_bumps_generation() {

@@ -51,6 +51,15 @@ navigation, and a passive workspace-change peek overlay.
   `themes/noctalia.toml`; the deployed config uses the dank theme.
 - Reused rendering pixmaps and skipped already-blank popup surfaces to reduce
   allocation/upload stalls.
+- Kept the daemon and its per-output surfaces resident; `show`/`toggle` are
+  control-socket requests and no longer wait for a compositor roundtrip.
+- Added compositor frame-callback backpressure, reusable preallocated SHM
+  buffers, renderer-provided regional damage, and region-only RGBA conversion.
+- Cropped the opening animation layer to the panel/shadow bounds instead of
+  scaling a full-monitor transparent pixmap.
+- Replaced the fixed polling loop with Wayland-or-producer wakeups and
+  deadline-based waits; settled visible and hidden CPU measured 0.00%.
+- Deduplicated metadata-only window updates so title spinners do not redraw.
 - Removed all wave configuration/rendering and all focal/selection glow code.
 - Added backward-compatible percentage strings for popup caps, canvas sizes,
   fixed coordinates, and per-output margins. Numeric values remain logical
@@ -82,11 +91,18 @@ navigation, and a passive workspace-change peek overlay.
 Verified on 2026-07-28:
 
 - `cargo fmt --all`
-- `cargo test --workspace` — 44 passed
+- `cargo test --workspace` — 48 passed
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo build --release -p niri-xmb`
 - `git diff --check`
 - Search confirmed no compiled wave or glow configuration remains.
+- Local desktop deployment: restart 0.08 s; `status` and `toggle` below the
+  timer's 0.01 s resolution; warm opening peaked near 29% of one core.
+- Six-second settled samples measured 0.00% CPU both visible and hidden, with
+  approximately 43 MB RSS after the popup buffers were exercised.
+- Noctalia v4 was restarted cleanly and loaded `niri-xmb-bar` without QML
+  errors. Pointer interaction still needs one manual widget/dock confirmation.
+
 
 ## Deployment state
 

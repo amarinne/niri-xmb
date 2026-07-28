@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
-use wayland::{SurfaceKind, SurfaceManager, UiEvent, UiEventKind};
+use wayland::{SurfaceKind, SurfaceManager, UiEvent, UiEventKind, WakePipe};
 
 /// How long after niri-xmb moves focus itself that the resulting snapshot is
 /// treated as our own echo rather than as external navigation.
@@ -409,7 +409,13 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     let (snapshot_tx, snapshot_rx) = unbounded();
     let (niri_command_tx, niri_command_rx) = unbounded();
     let (cursor_restore_tx, cursor_restore_rx) = unbounded();
-    spawn_niri(snapshot_tx, niri_command_rx, cursor_restore_tx);
+    let wake = WakePipe::new()?;
+    spawn_niri(
+        snapshot_tx,
+        niri_command_rx,
+        cursor_restore_tx,
+        wake.handle(),
+    );
 
     let (ui_tx, ui_rx) = unbounded();
     let surface_bars = if config.bars_enabled {
@@ -422,7 +428,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut renderer = Renderer::new();
 
     let (control_tx, control_rx) = unbounded::<ControlRequest>();
-    ipc::serve(control_tx)?;
+    ipc::serve(control_tx, wake.handle())?;
 
     let mut snapshot = wait_for_snapshot(&snapshot_rx).unwrap_or_default();
     let mut popup_outputs = HashSet::new();
@@ -444,8 +450,8 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut pending_focus_since: Option<Instant> = None;
     let mut running = true;
     let mut dirty = true;
-    let mut last_redraw = Instant::now() - Duration::from_secs(1);
 
+    let mut wait_timeout = Duration::ZERO;
     tracing::info!(
         config = %config_path.display(),
         background = %config.style.background,
@@ -453,7 +459,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         "niri-xmb daemon started"
     );
     while running {
-        surfaces.dispatch()?;
+        surfaces.dispatch(&wake, wait_timeout)?;
 
         while let Ok((x, y)) = cursor_restore_rx.try_recv() {
             if !surfaces.restore_pointer(x, y) {
@@ -808,39 +814,57 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         );
         dirty |= animating;
 
-        if dirty || last_redraw.elapsed() >= Duration::from_millis(250) {
+        if dirty {
             let surface_infos = surfaces.surfaces();
-            let drag = press
-                .as_ref()
-                .filter(|press| press.dragging)
-                .map(|press| DragVisual {
-                    window_id: press.window_id,
-                    app_id: press.app_id.clone(),
-                    global_x: press.current_x,
-                    global_y: press.current_y,
-                });
-            for surface in &surface_infos {
-                if !surface.configured {
-                    continue;
+            let all_ready = surface_infos
+                .iter()
+                .all(|surface| surface.configured && surface.frame_ready);
+            if all_ready {
+                let drag = press
+                    .as_ref()
+                    .filter(|press| press.dragging)
+                    .map(|press| DragVisual {
+                        window_id: press.window_id,
+                        app_id: press.app_id.clone(),
+                        global_x: press.current_x,
+                        global_y: press.current_y,
+                    });
+                for surface in &surface_infos {
+                    // A None result means the surface is already blank.
+                    if let Some(frame) = renderer.render(
+                        surface,
+                        &snapshot,
+                        &config,
+                        drag.as_ref(),
+                        selection_visual.as_ref(),
+                    ) {
+                        surfaces.present(surface.id, frame.pixels, frame.damage)?;
+                    }
                 }
-                // `None` means the surface is blank and already was: skip the
-                // full-screen upload entirely.
-                if let Some(pixels) = renderer.render(
-                    surface,
-                    &snapshot,
-                    &config,
-                    drag.as_ref(),
-                    selection_visual.as_ref(),
-                ) {
-                    surfaces.present(surface.id, pixels)?;
-                }
+                dirty = false;
             }
-            dirty = false;
-            last_redraw = Instant::now();
         }
-        // Poll tighter while animating so the easing is not quantised by the
-        // loop period, and back off when idle.
-        std::thread::sleep(Duration::from_millis(if animating { 3 } else { 8 }));
+        // Wayland frame callbacks and producer wakeups drive the loop. Timers
+        // only provide deadlines for animation/focus/peek state and a safety
+        // fallback; settled input does not burn CPU in a fixed sleep loop.
+        let now = Instant::now();
+        wait_timeout = if animating || dirty {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(250)
+        };
+        if let Some(since) = pending_focus_since {
+            wait_timeout =
+                wait_timeout.min(FOCUS_SETTLE.saturating_sub(now.saturating_duration_since(since)));
+        }
+        if let Some(deadline) = peek_deadline {
+            wait_timeout = wait_timeout.min(deadline.saturating_duration_since(now));
+        }
+        if let Some((_, since)) = &follow_candidate {
+            let delay = Duration::from_millis(config.popup.follow_delay_ms);
+            wait_timeout =
+                wait_timeout.min(delay.saturating_sub(now.saturating_duration_since(*since)));
+        }
     }
 
     let result = surfaces.hide_all_popups();

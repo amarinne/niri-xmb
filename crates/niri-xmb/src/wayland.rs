@@ -22,10 +22,16 @@ use smithay_client_toolkit::{
             LayerSurface as SctLayerSurface, LayerSurfaceConfigure,
         },
     },
-    shm::{Shm, ShmHandler, slot::SlotPool},
+    shm::{
+        Shm, ShmHandler,
+        slot::{Buffer, SlotPool},
+    },
 };
 use std::collections::HashMap;
-use std::time::Instant;
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use wayland_client::{
     Connection, EventQueue, Proxy, QueueHandle,
     globals::registry_queue_init,
@@ -52,6 +58,43 @@ pub struct SurfaceInfo {
     pub width: u32,
     pub height: u32,
     pub configured: bool,
+    pub frame_ready: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl DamageRect {
+    fn right(self) -> u32 {
+        self.x + self.width
+    }
+
+    fn bottom(self) -> u32 {
+        self.y + self.height
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = self.right().max(other.right());
+        let bottom = self.bottom().max(other.bottom());
+        Self {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        }
+    }
+}
+
+struct SurfaceBuffer {
+    buffer: Buffer,
+    content: Option<DamageRect>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +118,56 @@ pub struct UiEvent {
     pub global_x: f64,
     pub global_y: f64,
     pub event: UiEventKind,
+}
+
+#[derive(Clone)]
+pub struct WakeHandle {
+    writer: Arc<UnixStream>,
+}
+
+impl WakeHandle {
+    pub fn wake(&self) {
+        let mut writer = &*self.writer;
+        match writer.write(&[1]) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) => tracing::debug!(%error, "event-loop wake failed"),
+        }
+    }
+}
+
+pub struct WakePipe {
+    reader: UnixStream,
+    handle: WakeHandle,
+}
+
+impl WakePipe {
+    pub fn new() -> Result<Self> {
+        let (reader, writer) =
+            UnixStream::pair().context("failed to create event-loop wake pipe")?;
+        reader
+            .set_nonblocking(true)
+            .context("failed to configure wake reader")?;
+        writer
+            .set_nonblocking(true)
+            .context("failed to configure wake writer")?;
+        Ok(Self {
+            reader,
+            handle: WakeHandle {
+                writer: Arc::new(writer),
+            },
+        })
+    }
+
+    pub fn handle(&self) -> WakeHandle {
+        self.handle.clone()
+    }
+
+    fn drain(&self) {
+        let mut reader = &self.reader;
+        let mut bytes = [0; 64];
+        while reader.read(&mut bytes).is_ok() {}
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +205,9 @@ struct SurfaceEntry {
     height: u32,
     configured: bool,
     visible: bool,
+    frame_ready: bool,
+    buffers: Vec<SurfaceBuffer>,
+    last_damage: Option<DamageRect>,
 }
 
 pub struct SurfaceManager {
@@ -182,11 +278,28 @@ impl SurfaceManager {
         manager.queue.roundtrip(&mut manager.state)?;
         manager.state.sync_surfaces(&manager.queue.handle());
         manager.queue.roundtrip(&mut manager.state)?;
+        manager.prime_popup_buffers()?;
         manager.hide_all_popups()?;
         Ok(manager)
     }
 
-    pub fn dispatch(&mut self) -> Result<()> {
+    /// Allocate the two buffers needed by compositor frame pacing before the
+    /// first hotkey press. The SHM pages remain untouched until rendered, so
+    /// this reserves buffer objects without eagerly faulting full outputs into
+    /// resident memory.
+    fn prime_popup_buffers(&mut self) -> Result<()> {
+        for surface in &mut self.state.surfaces {
+            if surface.kind != SurfaceKind::Popup || !surface.configured {
+                continue;
+            }
+            while surface.buffers.len() < 2 {
+                allocate_surface_buffer(surface)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn dispatch(&mut self, wake: &WakePipe, timeout: Duration) -> Result<()> {
         if let Err(error) = self.queue.flush() {
             tracing::debug!(%error, "Wayland flush failed");
         }
@@ -197,15 +310,22 @@ impl SurfaceManager {
             use std::os::fd::AsRawFd;
             let raw = self.queue.as_fd().as_raw_fd();
             let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
-            let mut fd = PollFd::new(&borrowed, PollFlags::IN);
+            let mut fds = [
+                PollFd::new(&borrowed, PollFlags::IN),
+                PollFd::new(&wake.reader, PollFlags::IN),
+            ];
             let timeout = Timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
+                tv_sec: timeout.as_secs().try_into().unwrap_or(i64::MAX),
+                tv_nsec: timeout.subsec_nanos().into(),
             };
-            if poll(std::slice::from_mut(&mut fd), Some(&timeout)).unwrap_or(0) > 0 {
+            let _ = poll(&mut fds, Some(&timeout));
+            if fds[0].revents().contains(PollFlags::IN) {
                 let _ = guard.read();
             } else {
                 drop(guard);
+            }
+            if fds[1].revents().contains(PollFlags::IN) {
+                wake.drain();
             }
         }
         self.queue.dispatch_pending(&mut self.state)?;
@@ -228,41 +348,89 @@ impl SurfaceManager {
                     width: surface.width,
                     height: surface.height,
                     configured: surface.configured,
+                    frame_ready: surface.frame_ready,
                 }
             })
             .collect()
     }
 
-    pub fn present(&mut self, surface_id: usize, pixels: &[u8]) -> Result<()> {
+    pub fn present(
+        &mut self,
+        surface_id: usize,
+        pixels: &[u8],
+        current_damage: Option<DamageRect>,
+    ) -> Result<bool> {
         let Some(surface) = self
             .state
             .surfaces
             .iter_mut()
             .find(|surface| surface.id == surface_id)
         else {
-            return Ok(());
+            return Ok(false);
         };
-        if !surface.configured || surface.width == 0 || surface.height == 0 {
-            return Ok(());
+        if !surface.configured || !surface.frame_ready || surface.width == 0 || surface.height == 0
+        {
+            return Ok(false);
         }
-        let stride = surface.width * 4;
-        let (buffer, canvas) = surface
-            .pool
-            .create_buffer(
-                surface.width as i32,
-                surface.height as i32,
-                stride as i32,
-                wl_shm::Format::Argb8888,
-            )
-            .context("failed to create SHM buffer")?;
-        copy_rgba_to_argb8888(canvas, pixels);
+
+        let display_damage = match (surface.last_damage, current_damage) {
+            (Some(previous), Some(current)) => previous.union(current),
+            (Some(previous), None) => previous,
+            (None, Some(current)) => current,
+            (None, None) => return Ok(false),
+        };
+
+        let mut available = None;
+        for index in 0..surface.buffers.len() {
+            if surface
+                .pool
+                .canvas(&surface.buffers[index].buffer)
+                .is_some()
+            {
+                available = Some(index);
+                break;
+            }
+        }
+
+        let (buffer_index, submitted_damage) = if let Some(index) = available {
+            let submitted_damage = surface.buffers[index]
+                .content
+                .map_or(display_damage, |content| content.union(display_damage));
+            let canvas = surface
+                .pool
+                .canvas(&surface.buffers[index].buffer)
+                .context("reusable SHM buffer became unavailable")?;
+            copy_rgba_to_argb8888_region(canvas, pixels, surface.width, submitted_damage);
+            surface.buffers[index].content = current_damage;
+            (index, submitted_damage)
+        } else {
+            allocate_surface_buffer(surface)?;
+            let index = surface.buffers.len() - 1;
+            let canvas = surface
+                .pool
+                .canvas(&surface.buffers[index].buffer)
+                .context("new SHM buffer became unavailable")?;
+            copy_rgba_to_argb8888_region(canvas, pixels, surface.width, display_damage);
+            surface.buffers[index].content = current_damage;
+            (index, display_damage)
+        };
+
         let wl_surface = surface.layer_surface.wl_surface();
-        buffer
+        wl_surface.frame(&self.queue.handle(), wl_surface.clone());
+        surface.buffers[buffer_index]
+            .buffer
             .attach_to(wl_surface)
             .context("failed to attach SHM buffer")?;
-        wl_surface.damage_buffer(0, 0, surface.width as i32, surface.height as i32);
+        wl_surface.damage_buffer(
+            submitted_damage.x as i32,
+            submitted_damage.y as i32,
+            submitted_damage.width as i32,
+            submitted_damage.height as i32,
+        );
+        surface.last_damage = current_damage;
+        surface.frame_ready = false;
         surface.layer_surface.commit();
-        Ok(())
+        Ok(true)
     }
 
     pub fn show_popups(&mut self, outputs: &[String]) -> Result<()> {
@@ -297,7 +465,14 @@ impl SurfaceManager {
                 });
             surface.layer_surface.commit();
         }
-        self.queue.roundtrip(&mut self.state)?;
+        // Popup surfaces are created and configured when the daemon starts.
+        // Showing one only changes input/keyboard state, so waiting for a full
+        // compositor roundtrip here adds latency to every hotkey press without
+        // making the following buffer commit any safer. Flush the requests and
+        // let the normal event-driven dispatch collect acknowledgements.
+        self.queue
+            .flush()
+            .context("failed to flush popup state to Wayland")?;
         Ok(())
     }
 
@@ -353,21 +528,104 @@ impl SurfaceManager {
     }
 }
 
-/// tiny-skia exposes premultiplied RGBA bytes. Wayland's ARGB8888 format is
-/// stored as BGRA bytes on little-endian systems, so red and blue must swap at
-/// the SHM boundary.
-fn copy_rgba_to_argb8888(destination: &mut [u8], source: &[u8]) {
-    for (dst, src) in destination.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
-        dst[0] = src[2];
-        dst[1] = src[1];
-        dst[2] = src[0];
-        dst[3] = src[3];
+fn allocate_surface_buffer(surface: &mut SurfaceEntry) -> Result<()> {
+    let stride = surface.width * 4;
+    let (buffer, _) = surface
+        .pool
+        .create_buffer(
+            surface.width as i32,
+            surface.height as i32,
+            stride as i32,
+            wl_shm::Format::Argb8888,
+        )
+        .context("failed to create SHM buffer")?;
+    surface.buffers.push(SurfaceBuffer {
+        buffer,
+        content: None,
+    });
+    Ok(())
+}
+
+/// Find the nontransparent bounds of a premultiplied RGBA frame.
+#[cfg(test)]
+fn alpha_bounds(source: &[u8], width: u32, height: u32) -> Option<DamageRect> {
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut found = false;
+
+    for y in 0..height {
+        let row = y as usize * width as usize * 4;
+        for x in 0..width {
+            let alpha = source.get(row + x as usize * 4 + 3).copied().unwrap_or(0);
+            if alpha == 0 {
+                continue;
+            }
+            found = true;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x + 1);
+            max_y = max_y.max(y + 1);
+        }
+    }
+
+    found.then_some(DamageRect {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x,
+        height: max_y - min_y,
+    })
+}
+
+/// tiny-skia exposes premultiplied RGBA bytes. Wayland ARGB8888 is BGRA in
+/// little-endian memory, so red and blue swap only inside the damaged rows.
+fn copy_rgba_to_argb8888_region(
+    destination: &mut [u8],
+    source: &[u8],
+    surface_width: u32,
+    damage: DamageRect,
+) {
+    let stride = surface_width as usize * 4;
+    let x0 = damage.x as usize * 4;
+    let x1 = damage.right() as usize * 4;
+    for y in damage.y as usize..damage.bottom() as usize {
+        let start = y * stride + x0;
+        let end = y * stride + x1;
+        let Some(dst_row) = destination.get_mut(start..end) else {
+            continue;
+        };
+        let Some(src_row) = source.get(start..end) else {
+            continue;
+        };
+        for (dst, src) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = src[3];
+        }
     }
 }
 
 #[cfg(test)]
+fn copy_rgba_to_argb8888(destination: &mut [u8], source: &[u8]) {
+    let pixels = (source.len() / 4) as u32;
+    copy_rgba_to_argb8888_region(
+        destination,
+        source,
+        pixels,
+        DamageRect {
+            x: 0,
+            y: 0,
+            width: pixels,
+            height: 1,
+        },
+    );
+}
+
+#[cfg(test)]
 mod tests {
-    use super::copy_rgba_to_argb8888;
+    use super::{DamageRect, alpha_bounds, copy_rgba_to_argb8888, copy_rgba_to_argb8888_region};
 
     #[test]
     fn converts_tiny_skia_rgba_to_wayland_argb8888_memory_order() {
@@ -378,6 +636,44 @@ mod tests {
             destination,
             [0x33, 0x22, 0x11, 0x44, 0xcc, 0xbb, 0xaa, 0xdd]
         );
+    }
+
+    #[test]
+    fn finds_only_nontransparent_pixel_bounds() {
+        let mut source = vec![0; 3 * 2 * 4];
+        source[7] = 0xff;
+        source[23] = 0x40;
+
+        assert_eq!(
+            alpha_bounds(&source, 3, 2),
+            Some(DamageRect {
+                x: 1,
+                y: 0,
+                width: 2,
+                height: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn regional_conversion_leaves_undamaged_pixels_untouched() {
+        let source = [1, 2, 3, 4, 10, 20, 30, 40, 5, 6, 7, 8, 50, 60, 70, 80];
+        let mut destination = [0xaa; 16];
+        copy_rgba_to_argb8888_region(
+            &mut destination,
+            &source,
+            2,
+            DamageRect {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+        );
+
+        assert_eq!(&destination[..4], &[0xaa; 4]);
+        assert_eq!(&destination[4..8], &[30, 20, 10, 40]);
+        assert_eq!(&destination[8..], &[0xaa; 8]);
     }
 }
 
@@ -518,6 +814,9 @@ impl WaylandState {
                 height: 0,
                 configured: false,
                 visible: kind != SurfaceKind::Popup,
+                frame_ready: true,
+                buffers: Vec::new(),
+                last_damage: None,
             });
         }
     }
@@ -641,7 +940,21 @@ impl CompositorHandler for WaylandState {
         _: wl_output::Transform,
     ) {
     }
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        wl_surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        if let Some(surface) = self
+            .surfaces
+            .iter_mut()
+            .find(|surface| surface.layer_surface.wl_surface() == wl_surface)
+        {
+            surface.frame_ready = true;
+        }
+    }
     fn surface_enter(
         &mut self,
         _: &Connection,
