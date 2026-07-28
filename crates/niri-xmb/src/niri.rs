@@ -144,9 +144,7 @@ fn apply_event(state: &mut NiriState, event: Event) -> bool {
             workspace_id,
             active_window_id,
         } => {
-            if let Some(workspace) = state.workspace_mut(workspace_id) {
-                workspace.active_window_id = active_window_id;
-            }
+            state.set_workspace_active_window(workspace_id, active_window_id);
             true
         }
         Event::WindowsChanged { windows } => {

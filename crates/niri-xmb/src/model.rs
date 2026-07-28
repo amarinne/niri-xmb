@@ -117,6 +117,16 @@ impl NiriState {
         self.workspaces.get_mut(&id)
     }
 
+    pub fn set_workspace_active_window(&mut self, id: u64, active_window_id: Option<u64>) {
+        let Some(workspace) = self.workspaces.get_mut(&id) else {
+            return;
+        };
+        if workspace.active_window_id != active_window_id {
+            workspace.active_window_id = active_window_id;
+            self.generation += 1;
+        }
+    }
+
     pub fn activate_workspace(&mut self, id: u64, focused: bool) {
         let Some(output) = self
             .workspaces
@@ -277,5 +287,42 @@ impl NiriState {
             focused_window,
             generation: self.generation,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overview_active_window_change_bumps_generation() {
+        let mut state = NiriState::default();
+        state.replace_workspaces(vec![Workspace {
+            id: 1,
+            idx: 1,
+            name: None,
+            output: Some("eDP-1".into()),
+            is_urgent: false,
+            is_active: true,
+            is_focused: true,
+            active_window_id: Some(10),
+        }]);
+        let before = state.snapshot().generation;
+
+        state.set_workspace_active_window(1, Some(11));
+        let after = state.snapshot().generation;
+
+        assert_eq!(after, before + 1);
+        assert_eq!(
+            state
+                .workspaces
+                .get(&1)
+                .and_then(|workspace| workspace.active_window_id),
+            Some(11)
+        );
+
+        let stable = state.snapshot().generation;
+        state.set_workspace_active_window(1, Some(11));
+        assert_eq!(state.snapshot().generation, stable);
     }
 }
