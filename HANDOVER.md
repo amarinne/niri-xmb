@@ -53,10 +53,9 @@ navigation, and a passive workspace-change peek overlay.
   centre point.
 - Selection is indicated only by centre position, larger icon size, brightness,
   and motion. There is no selection or focal glow.
-- Popup placement is anchored per output. The deployed config places
-  `HDMI-A-1` on the right and `HDMI-A-2` on the left, both vertically centred,
-  so the two panels face inward.
-- The deployed config places Sunshine's `Virtual-1` panel at the top centre of
+- The deployed config uses one combined panel with all output maps. The panel
+  follows the active output and stays at the top centre of that output.
+- The same top-centre placement applies to Sunshine's `Virtual-1` output in
   the Moonlight view.
 - The animated wave background was rejected for this panel and is not compiled.
   Its CPU prototype is retained at `reference/xmb_wave.rs` for possible reuse in
