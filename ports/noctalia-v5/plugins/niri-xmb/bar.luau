@@ -126,6 +126,27 @@ local function marker(workspaceId, targetWindowId, fraction, key, height, slop)
     })
 end
 
+local function workspaceWidth(windowCount, iconSize, allowDrag)
+    local workspacePadding = 3 * 2
+    if windowCount == 0 then
+        return 10 + workspacePadding
+    end
+
+    local rowGap = 1
+    local itemWidth = iconSize + 6
+    local childCount = windowCount
+    local contentWidth = windowCount * itemWidth
+    if allowDrag then
+        -- One marker before every window plus one trailing marker.
+        childCount = windowCount * 2 + 1
+        contentWidth = contentWidth + windowCount + 1
+    end
+    if childCount > 1 then
+        contentWidth = contentWidth + (childCount - 1) * rowGap
+    end
+    return contentWidth + workspacePadding
+end
+
 local function windowVisual(window, iconSize)
     local path = iconPath(window.app_id, iconSize)
     local children = {}
@@ -244,12 +265,13 @@ local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, showIndi
 
     local props = {
         key = "workspace-" .. idString(workspace.id),
+        width = workspaceWidth(#windows, iconSize, allowDrag),
         direction = "column",
         align = "stretch",
         gap = 1,
         paddingH = 3,
         paddingV = 2,
-        radius = 9,
+        radius = 18,
         fill = workspace.active and "primary/0.10" or "surface_variant/0.20",
         border = workspace.urgent and "error/0.9" or (workspace.active and "primary/0.42" or "outline/0.18"),
         borderWidth = 1,

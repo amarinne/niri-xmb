@@ -26,6 +26,7 @@ start = ["niri-xmb-laptop"]
 [widget.niri-xmb-laptop]
 type = "amarinne/niri-xmb:workspace-strip"
 target_output = "eDP-1"
+capsule = false
 backend_command = "/home/eza/.local/bin/niri-xmb"
 allow_drag = true
 allow_column_join = false
@@ -36,6 +37,10 @@ icon_size = 22
 group_opacity = 0.72
 poll_interval_ms = 250
 ```
+
+Set `capsule = false` on the Noctalia widget instance. The plugin draws and
+resizes one capsule per Niri workspace; a bar-level capsule would wrap the
+entire strip.
 
 Keep `bars_enabled = false` in the standalone XMB configuration. The daemon
 must be running for snapshots, clicks, wheel switching, drops, and the
