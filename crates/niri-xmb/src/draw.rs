@@ -1,4 +1,4 @@
-//! Shared tiny-skia drawing primitives for woven-shell.
+//! Tiny-skia drawing primitives for niri-xmb.
 
 use tiny_skia::{
     Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, PathBuilder, Pixmap,
@@ -176,17 +176,45 @@ pub fn fill_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, color: Color) 
     }
 }
 
-/// Blit pre-decoded RGBA icon pixels into the pixmap at (x, y), scaled to `size×size`.
-pub fn blit_icon(
-    pixmap: &mut Pixmap,
-    x: i32,
-    y: i32,
-    size: u32,
-    rgba: &[u8],
-    src_w: u32,
-    src_h: u32,
-) {
-    blit_icon_alpha(pixmap, x, y, size, rgba, src_w, src_h, 1.0);
+fn sample_bilinear_rgba(rgba: &[u8], src_w: u32, src_h: u32, x: f32, y: f32) -> [u8; 4] {
+    let x = x.clamp(0.0, src_w.saturating_sub(1) as f32);
+    let y = y.clamp(0.0, src_h.saturating_sub(1) as f32);
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(src_w - 1);
+    let y1 = (y0 + 1).min(src_h - 1);
+    let tx = x - x0 as f32;
+    let ty = y - y0 as f32;
+    let samples = [
+        (x0, y0, (1.0 - tx) * (1.0 - ty)),
+        (x1, y0, tx * (1.0 - ty)),
+        (x0, y1, (1.0 - tx) * ty),
+        (x1, y1, tx * ty),
+    ];
+
+    let mut alpha = 0.0;
+    let mut premultiplied = [0.0; 3];
+    for (sx, sy, weight) in samples {
+        let index = ((sy * src_w + sx) * 4) as usize;
+        if index + 3 >= rgba.len() {
+            continue;
+        }
+        let sample_alpha = rgba[index + 3] as f32 / 255.0;
+        alpha += sample_alpha * weight;
+        for channel in 0..3 {
+            premultiplied[channel] += rgba[index + channel] as f32 / 255.0 * sample_alpha * weight;
+        }
+    }
+
+    if alpha <= f32::EPSILON {
+        return [0, 0, 0, 0];
+    }
+    [
+        (premultiplied[0] / alpha * 255.0).round() as u8,
+        (premultiplied[1] / alpha * 255.0).round() as u8,
+        (premultiplied[2] / alpha * 255.0).round() as u8,
+        (alpha * 255.0).round() as u8,
+    ]
 }
 
 /// Blit an icon with its alpha scaled by `alpha` (0.0..=1.0).
@@ -221,17 +249,9 @@ pub fn blit_icon_alpha(
                 continue;
             }
 
-            let sx = (dx as f32 / size as f32 * src_w as f32) as usize;
-            let sy = (dy as f32 / size as f32 * src_h as f32) as usize;
-            let si = (sy * src_w as usize + sx) * 4;
-            if si + 3 >= rgba.len() {
-                continue;
-            }
-
-            let sr = rgba[si];
-            let sg = rgba[si + 1];
-            let sb = rgba[si + 2];
-            let sa = rgba[si + 3];
+            let source_x = (dx as f32 + 0.5) * src_w as f32 / size as f32 - 0.5;
+            let source_y = (dy as f32 + 0.5) * src_h as f32 / size as f32 - 0.5;
+            let [sr, sg, sb, sa] = sample_bilinear_rgba(rgba, src_w, src_h, source_x, source_y);
             if sa == 0 {
                 continue;
             }
@@ -242,41 +262,6 @@ pub fn blit_icon_alpha(
             if src_a == 0 {
                 continue;
             }
-            let inv_a = 255u16 - src_a;
-            let dr = ((sr as u16 * src_a + dst.red() as u16 * inv_a) / 255) as u8;
-            let dg = ((sg as u16 * src_a + dst.green() as u16 * inv_a) / 255) as u8;
-            let db = ((sb as u16 * src_a + dst.blue() as u16 * inv_a) / 255) as u8;
-            let da = src_a.saturating_add(dst.alpha() as u16 * inv_a / 255) as u8;
-            *dst = tiny_skia::PremultipliedColorU8::from_rgba(dr, dg, db, da).unwrap_or(*dst);
-        }
-    }
-}
-
-/// Blit RGBA pixels at (x,y) without scaling, clipped to `clip_h` rows.
-pub fn blit_thumb(pixmap: &mut Pixmap, x: i32, y: i32, w: u32, h: u32, rgba: &[u8], clip_h: u32) {
-    let pw = pixmap.width() as i32;
-    let ph = pixmap.height() as i32;
-    let pixels = pixmap.pixels_mut();
-    let rows = clip_h.min(h) as i32;
-
-    for dy in 0..rows {
-        for dx in 0..w as i32 {
-            let px = x + dx;
-            let py = y + dy;
-            if px < 0 || py < 0 || px >= pw || py >= ph {
-                continue;
-            }
-            let si = (dy as usize * w as usize + dx as usize) * 4;
-            if si + 3 >= rgba.len() {
-                continue;
-            }
-            let (sr, sg, sb, sa) = (rgba[si], rgba[si + 1], rgba[si + 2], rgba[si + 3]);
-            if sa == 0 {
-                continue;
-            }
-            let idx = (py * pw + px) as usize;
-            let dst = &mut pixels[idx];
-            let src_a = sa as u16;
             let inv_a = 255u16 - src_a;
             let dr = ((sr as u16 * src_a + dst.red() as u16 * inv_a) / 255) as u8;
             let dg = ((sg as u16 * src_a + dst.green() as u16 * inv_a) / 255) as u8;
@@ -300,4 +285,21 @@ fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia
     pb.quad_to(x, y, x + r, y);
     pb.close();
     pb.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bilinear_sampling_blends_high_resolution_pixels() {
+        let rgba = [255, 0, 0, 255, 0, 0, 255, 255];
+
+        let [red, green, blue, alpha] = sample_bilinear_rgba(&rgba, 2, 1, 0.5, 0.0);
+
+        assert!((127..=128).contains(&red));
+        assert_eq!(green, 0);
+        assert!((127..=128).contains(&blue));
+        assert_eq!(alpha, 255);
+    }
 }

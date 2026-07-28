@@ -14,8 +14,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::debug;
 
-/// Decoded icon: (width, height, RGBA bytes).  Always square after loading.
+/// Decoded icon: (width, height, RGBA bytes).
 pub type IconData = (u32, u32, Vec<u8>);
+
+#[derive(Debug, Clone)]
+struct DesktopApp {
+    icon: String,
+    name: String,
+}
 
 pub struct IconCache {
     /// app_id (lowercase) → pixel data (None = confirmed not found)
@@ -23,7 +29,7 @@ pub struct IconCache {
     /// icon_name → pixel data (shared across multiple apps that use the same icon)
     file_cache: HashMap<String, Option<IconData>>,
     /// Keys that map to icon names: wm_class, exec_basename, desktop_name, etc.
-    desktop_map: HashMap<String, String>,
+    desktop_map: HashMap<String, DesktopApp>,
     desktop_scanned: bool,
     icon_size: u32,
     /// Plugin-registered overrides: class (lowercase) → absolute file path.
@@ -42,7 +48,7 @@ impl Default for IconCache {
             file_cache: HashMap::new(),
             desktop_map: HashMap::new(),
             desktop_scanned: false,
-            icon_size: 48,
+            icon_size: 128,
             overrides: HashMap::new(),
             override_default: None,
             override_cache: HashMap::new(),
@@ -103,11 +109,7 @@ impl IconCache {
         }
 
         // 2. XDG scan.
-        if !self.desktop_scanned {
-            self.desktop_map = scan_desktop_files();
-            self.desktop_scanned = true;
-            debug!("icons: scanned {} desktop entries", self.desktop_map.len());
-        }
+        self.ensure_desktop_scanned();
         let icon_name = self.resolve_icon_name(&key);
         let data = if let Some(ref name) = icon_name {
             self.load_icon(name)
@@ -126,34 +128,32 @@ impl IconCache {
         self.cache.get(&key).and_then(|v| v.as_ref())
     }
 
+    /// Human-readable application name from the matching desktop entry.
+    pub fn app_label(&mut self, app_id: &str) -> Option<String> {
+        self.ensure_desktop_scanned();
+        self.resolve_desktop_app(&app_id.to_lowercase())
+            .map(|app| app.name.clone())
+    }
+
+    fn ensure_desktop_scanned(&mut self) {
+        if self.desktop_scanned {
+            return;
+        }
+        self.desktop_map = scan_desktop_files();
+        self.desktop_scanned = true;
+        debug!("icons: scanned {} desktop entries", self.desktop_map.len());
+    }
+
+    fn resolve_desktop_app(&self, app_id: &str) -> Option<&DesktopApp> {
+        app_id_candidates(app_id)
+            .into_iter()
+            .find_map(|candidate| self.desktop_map.get(&candidate))
+    }
+
     fn resolve_icon_name(&self, app_id: &str) -> Option<String> {
-        // 1. Direct match
-        if let Some(n) = self.desktop_map.get(app_id) {
-            return Some(n.clone());
-        }
-
-        // 2. Strip common reverse-DNS prefix (org.gnome.Files → files → gnome-files)
-        if app_id.contains('.') {
-            let parts: Vec<&str> = app_id.split('.').collect();
-            // Last segment (e.g. "Files")
-            if let Some(last) = parts.last() {
-                let low = last.to_lowercase();
-                if let Some(n) = self.desktop_map.get(low.as_str()) {
-                    return Some(n.clone());
-                }
-            }
-            // Second-to-last + last (e.g. "gnome-files")
-            if parts.len() >= 2 {
-                let joined =
-                    format!("{}-{}", parts[parts.len() - 2], parts[parts.len() - 1]).to_lowercase();
-                if let Some(n) = self.desktop_map.get(joined.as_str()) {
-                    return Some(n.clone());
-                }
-            }
-        }
-
-        // 3. Try app_id itself as the icon name (many apps match directly)
-        Some(app_id.to_string())
+        self.resolve_desktop_app(app_id)
+            .map(|app| app.icon.clone())
+            .or_else(|| Some(app_id.to_string()))
     }
 
     fn load_icon(&mut self, icon_name: &str) -> Option<IconData> {
@@ -171,10 +171,42 @@ impl IconCache {
     }
 }
 
+fn app_id_candidates(app_id: &str) -> Vec<String> {
+    let app_id = app_id.to_lowercase();
+    let mut candidates = vec![app_id.clone()];
+    let mut push = |candidate: String| {
+        if !candidate.is_empty() && !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    };
+
+    for suffix in ["-terminal", "_terminal", ".terminal", "-window", "_window"] {
+        if let Some(base) = app_id.strip_suffix(suffix) {
+            push(base.to_string());
+        }
+    }
+
+    if app_id.contains('.') {
+        let parts: Vec<&str> = app_id.split('.').collect();
+        if let Some(last) = parts.last() {
+            push((*last).to_string());
+        }
+        if parts.len() >= 2 {
+            push(format!(
+                "{}-{}",
+                parts[parts.len() - 2],
+                parts[parts.len() - 1]
+            ));
+        }
+    }
+
+    candidates
+}
+
 // ── .desktop file scanning ─────────────────────────────────────────────────────
 
-fn scan_desktop_files() -> HashMap<String, String> {
-    let mut map: HashMap<String, String> = HashMap::new();
+fn scan_desktop_files() -> HashMap<String, DesktopApp> {
+    let mut map: HashMap<String, DesktopApp> = HashMap::new();
 
     let home = home_dir();
     let mut search_dirs = vec![format!("{home}/.local/share/applications")];
@@ -203,13 +235,14 @@ fn scan_desktop_files() -> HashMap<String, String> {
     map
 }
 
-fn parse_desktop_file(path: &Path, map: &mut HashMap<String, String>) {
+fn parse_desktop_file(path: &Path, map: &mut HashMap<String, DesktopApp>) {
     let Ok(content) = std::fs::read_to_string(path) else {
         return;
     };
 
     let mut in_entry = false;
     let mut icon_name: Option<String> = None;
+    let mut display_name: Option<String> = None;
     let mut keys: Vec<String> = Vec::new();
 
     for line in content.lines() {
@@ -232,6 +265,7 @@ fn parse_desktop_file(path: &Path, map: &mut HashMap<String, String>) {
                 icon_name = Some(v.to_string());
             }
             "Name" => {
+                display_name = Some(v.to_string());
                 keys.push(v.to_lowercase());
             }
             "StartupWMClass" => {
@@ -262,9 +296,13 @@ fn parse_desktop_file(path: &Path, map: &mut HashMap<String, String>) {
     }
 
     if let Some(icon) = icon_name {
+        let app = DesktopApp {
+            name: display_name.unwrap_or_else(|| icon.clone()),
+            icon,
+        };
         for key in keys {
             if !key.is_empty() {
-                map.entry(key).or_insert_with(|| icon.clone());
+                map.entry(key).or_insert_with(|| app.clone());
             }
         }
     }
@@ -283,8 +321,8 @@ fn find_icon_file(icon_name: &str) -> Option<PathBuf> {
     // Preferred sizes in order. Scalable icons are rendered through ImageMagick
     // when it is available, while PNG remains a dependency-free fast path.
     let sizes = [
-        "48x48", "64x64", "32x32", "128x128", "256x256", "512x512", "24x24", "22x22", "16x16",
-        "scalable", "0x0",
+        "128x128", "256x256", "512x512", "96x96", "64x64", "scalable", "48x48", "32x32", "24x24",
+        "22x22", "16x16", "0x0",
     ];
     let mut themes = Vec::new();
     if let Some(theme) = gtk_icon_theme() {
@@ -389,11 +427,7 @@ fn home_dir() -> String {
 
 fn load_icon_rgba(path: &Path, icon_size: u32) -> Option<IconData> {
     match path.extension().and_then(|extension| extension.to_str()) {
-        Some(extension) if extension.eq_ignore_ascii_case("png") => {
-            load_png_rgba(path).map(|(width, height, pixels)| {
-                scale_rgba(width, height, &pixels, icon_size, icon_size)
-            })
-        }
+        Some(extension) if extension.eq_ignore_ascii_case("png") => load_png_rgba(path),
         Some(extension) if extension.eq_ignore_ascii_case("svg") => load_svg_rgba(path, icon_size),
         _ => None,
     }
@@ -472,23 +506,28 @@ fn load_png_rgba(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
     Some((w, h, rgba))
 }
 
-// ── scaling ───────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn scale_rgba(src_w: u32, src_h: u32, src: &[u8], dst_w: u32, dst_h: u32) -> IconData {
-    if src_w == dst_w && src_h == dst_h {
-        return (dst_w, dst_h, src.to_vec());
+    #[test]
+    fn terminal_class_resolves_desktop_icon_and_label() {
+        let mut cache = IconCache {
+            desktop_scanned: true,
+            ..IconCache::default()
+        };
+        cache.desktop_map.insert(
+            "btop".into(),
+            DesktopApp {
+                icon: "btop".into(),
+                name: "btop++".into(),
+            },
+        );
+
+        assert_eq!(
+            cache.resolve_icon_name("btop-terminal").as_deref(),
+            Some("btop")
+        );
+        assert_eq!(cache.app_label("btop-terminal").as_deref(), Some("btop++"));
     }
-    let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
-    for dy in 0..dst_h as usize {
-        for dx in 0..dst_w as usize {
-            let sx = (dx as f32 / dst_w as f32 * src_w as f32) as usize;
-            let sy = (dy as f32 / dst_h as f32 * src_h as f32) as usize;
-            let si = (sy * src_w as usize + sx) * 4;
-            let di = (dy * dst_w as usize + dx) * 4;
-            if si + 3 < src.len() && di + 3 < out.len() {
-                out[di..di + 4].copy_from_slice(&src[si..si + 4]);
-            }
-        }
-    }
-    (dst_w, dst_h, out)
 }

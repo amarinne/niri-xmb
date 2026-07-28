@@ -1,8 +1,5 @@
 [workspace]
-members = [
-    "crates/woven-common",
-    "crates/niri-xmb",
-]
+members = ["crates/niri-xmb"]
 resolver = "2"
 
 [workspace.dependencies]

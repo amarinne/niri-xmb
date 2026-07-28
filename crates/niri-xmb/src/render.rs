@@ -1,17 +1,15 @@
 use crate::anim::{Animator, Timing, lerp};
 use crate::config::{AnchorX, AnchorY, BarConfig, Config, Edge, PopupOutputs, PopupPosition};
+use crate::draw::{
+    blit_icon_alpha, clear, fill_circle, fill_gradient_rounded_rect, fill_rect, fill_rounded_rect,
+    hex_color, stroke_rounded_rect,
+};
 use crate::icons::IconCache;
 use crate::model::{OutputModel, Snapshot, WindowModel, WindowSlot, WorkspaceModel};
+use crate::text::TextRenderer;
 use crate::wayland::{SurfaceInfo, SurfaceKind};
 use std::collections::HashMap;
 use tiny_skia::{Color, FilterQuality, Pixmap, PixmapPaint, Transform};
-use woven_common::{
-    draw::{
-        blit_icon_alpha, clear, fill_circle, fill_gradient_rounded_rect, fill_rect,
-        fill_rounded_rect, hex_color, stroke_rounded_rect,
-    },
-    text::TextRenderer,
-};
 
 /// Icon sizing derived from the style config, shared by every popup layout.
 #[derive(Debug, Clone, Copy)]
@@ -1023,7 +1021,11 @@ impl Renderer {
             });
         }
         if config.popup.show_titles && selected_window == Some(window.id) {
-            let title = truncate_label(&window.title, 18);
+            let label = self
+                .icons
+                .app_label(&window.app_id)
+                .unwrap_or_else(|| window.title.clone());
+            let title = truncate_label(&label, 18);
             let size = config.style.title_font_size;
             let width = self.text.measure(&title, size);
             let mut color = hex_color(&config.style.text);

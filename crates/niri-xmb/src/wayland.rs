@@ -1,4 +1,4 @@
-//! Multi-output wlr-layer-shell surfaces adapted from Woven's standalone bar and overlay.
+//! Multi-output wlr-layer-shell surfaces for the niri-xmb bar and popup.
 
 use crate::config::{Align, BarConfig, Edge};
 use anyhow::{Context, Result};

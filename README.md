@@ -5,8 +5,9 @@ frontends. Its popup and Niri rearrangement backend run independently of
 Noctalia. The repository also ships an actual Quickshell/Noctalia v4 bar plugin
 and a native Noctalia v5 taskbar configuration.
 
-The project is adapted from Woven's native Smithay Client Toolkit/tiny-skia
-layer-shell implementation. It consumes Niri's event stream directly and uses
+The project began from Woven's Smithay Client Toolkit/tiny-skia layer-shell
+implementation, but the maintained code is now standalone and contains no Woven
+crate or runtime dependency. It consumes Niri's event stream directly and uses
 Niri IPC actions for focusing and moving windows.
 
 ## Current features
@@ -110,8 +111,9 @@ land on. Icons fade out toward the canvas edge instead of being clipped.
 - `popup.canvas_width` / `popup.canvas_height`: size of one monitor's canvas.
   `popup.width` and `popup.height` only cap the overall panel.
 - `popup.show_labels = true`: add workspace and output names. Off by default.
-- `popup.show_titles = true`: add the title of the *selected* window only,
-  rather than a caption under every icon.
+- `popup.show_titles = true`: add the selected application's desktop name below
+  its icon, falling back to the window title when no desktop entry matches.
+  Other icons remain caption-free.
 ### Theming
 
 The popup's palette and primary proportions—icon sizes, cross spacing, panel
@@ -306,9 +308,9 @@ to tiling.
 
 ## Repository layout
 
-Only `crates/woven-common` and `crates/niri-xmb` are members of the active Cargo
-workspace. Other retained Woven source files are reference material from the
-fork and are not built.
+`crates/niri-xmb` is the sole Cargo workspace member. Drawing, text, icons,
+Wayland surfaces, Niri state, and interaction logic all live within that crate.
+The original Woven source remains only in the separate research clone below.
 
 The separately cloned research projects live beside this repository at:
 

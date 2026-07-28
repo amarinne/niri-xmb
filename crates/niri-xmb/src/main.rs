@@ -1,13 +1,13 @@
 mod anim;
 mod config;
+mod draw;
+mod icons;
 mod ipc;
 mod model;
 mod niri;
 mod render;
+mod text;
 mod wayland;
-
-#[path = "../../woven-bar/src/icons.rs"]
-mod icons;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

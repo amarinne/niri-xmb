@@ -64,7 +64,8 @@ navigation, and a passive workspace-change peek overlay.
   style, and theme loading.
 - `crates/niri-xmb/src/model.rs`, `niri.rs`: active-window and overview state.
 - `crates/niri-xmb/src/wayland.rs`: passive versus interactive popup input.
-- `crates/woven-common/src/draw.rs`: gradient fill and alpha icon blit helpers.
+- `crates/niri-xmb/src/draw.rs`, `text.rs`, `icons.rs`: standalone rendering,
+  font, system icon-theme, and desktop-entry resolution.
 - `config/niri-xmb.toml.example`, `README.md`: public configuration/docs.
 - `themes/`: shipped theme examples.
 - `reference/xmb_wave.rs`: archived, non-compiled wave prototype.
