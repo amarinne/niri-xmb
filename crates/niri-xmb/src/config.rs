@@ -564,7 +564,7 @@ impl Default for BehaviorConfig {
             close_on_window_click: true,
             close_on_workspace_click: false,
             close_on_drop: false,
-            close_on_outside_click: true,
+            close_on_outside_click: false,
             close_on_escape: true,
         }
     }

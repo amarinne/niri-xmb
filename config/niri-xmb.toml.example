@@ -93,7 +93,7 @@ snap_cursor_after_drop = false # keep pointer at release point after a drop
 close_on_window_click = true # close after activating a window
 close_on_workspace_click = false # close after activating a workspace
 close_on_drop = false        # close after a successful drag-and-drop
-close_on_outside_click = true # close when clicking outside every popup
+close_on_outside_click = false # true captures the full monitor; false lets outside clicks pass through
 close_on_escape = true       # Escape closes the popup
 
 [animation]

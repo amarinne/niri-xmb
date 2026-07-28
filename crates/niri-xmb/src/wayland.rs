@@ -205,6 +205,9 @@ struct SurfaceEntry {
     height: u32,
     configured: bool,
     visible: bool,
+    interactive: bool,
+    capture_outside: bool,
+    input_rect: Option<DamageRect>,
     frame_ready: bool,
     buffers: Vec<SurfaceBuffer>,
     last_damage: Option<DamageRect>,
@@ -337,6 +340,7 @@ impl SurfaceManager {
         self.state
             .surfaces
             .iter()
+            .filter(|surface| surface.kind != SurfaceKind::Popup || surface.visible)
             .map(|surface| {
                 let origin = surface_origin(surface, &self.state.specs);
                 SurfaceInfo {
@@ -368,7 +372,11 @@ impl SurfaceManager {
         else {
             return Ok(false);
         };
-        if !surface.configured || !surface.frame_ready || surface.width == 0 || surface.height == 0
+        if !surface.visible
+            || !surface.configured
+            || !surface.frame_ready
+            || surface.width == 0
+            || surface.height == 0
         {
             return Ok(false);
         }
@@ -433,8 +441,8 @@ impl SurfaceManager {
         Ok(true)
     }
 
-    pub fn show_popups(&mut self, outputs: &[String]) -> Result<()> {
-        self.show_popups_with(outputs, true)
+    pub fn show_popups(&mut self, outputs: &[String], capture_outside: bool) -> Result<()> {
+        self.show_popups_with(outputs, true, capture_outside)
     }
 
     /// Show the popup on `outputs`.
@@ -443,41 +451,89 @@ impl SurfaceManager {
     /// input: that is what makes the peek overlay a passive readout, letting
     /// the compositor keybinds the user is pressing continue to reach Niri and
     /// clicks pass through to whatever is underneath.
-    pub fn show_popups_with(&mut self, outputs: &[String], interactive: bool) -> Result<()> {
+    pub fn show_popups_with(
+        &mut self,
+        outputs: &[String],
+        interactive: bool,
+        capture_outside: bool,
+    ) -> Result<()> {
         for surface in &mut self.state.surfaces {
             if surface.kind != SurfaceKind::Popup {
                 continue;
             }
             let show = outputs.iter().any(|output| output == &surface.output);
-            surface.visible = show;
-            set_input_region(
-                &self.queue.handle(),
-                &self.state.compositor,
-                surface,
-                show && interactive,
-            );
-            surface
-                .layer_surface
-                .set_keyboard_interactivity(if show && interactive {
-                    KeyboardInteractivity::Exclusive
-                } else {
-                    KeyboardInteractivity::None
-                });
-            surface.layer_surface.commit();
+            if show {
+                let remap = !surface.visible;
+                surface.visible = true;
+                surface.interactive = interactive;
+                surface.capture_outside = capture_outside;
+                if remap {
+                    // A null-buffer commit unmaps a layer surface. Request a
+                    // fresh configure before attaching the cached SHM buffer.
+                    surface.configured = false;
+                    surface.frame_ready = true;
+                    surface.last_damage = None;
+                }
+                apply_input_region(&self.queue.handle(), &self.state.compositor, surface);
+                surface
+                    .layer_surface
+                    .set_keyboard_interactivity(if interactive {
+                        KeyboardInteractivity::Exclusive
+                    } else {
+                        KeyboardInteractivity::None
+                    });
+                surface.layer_surface.commit();
+            } else if surface.visible || surface.configured {
+                surface.visible = false;
+                surface.interactive = false;
+                surface.capture_outside = false;
+                surface.input_rect = None;
+                surface.configured = false;
+                surface.frame_ready = true;
+                surface.last_damage = None;
+                apply_input_region(&self.queue.handle(), &self.state.compositor, surface);
+                surface
+                    .layer_surface
+                    .set_keyboard_interactivity(KeyboardInteractivity::None);
+                surface.layer_surface.wl_surface().attach(None, 0, 0);
+                surface.layer_surface.commit();
+            }
         }
-        // Popup surfaces are created and configured when the daemon starts.
-        // Showing one only changes input/keyboard state, so waiting for a full
-        // compositor roundtrip here adds latency to every hotkey press without
-        // making the following buffer commit any safer. Flush the requests and
-        // let the normal event-driven dispatch collect acknowledgements.
+        // Keep the daemon and its buffer pools alive, but fully unmap hidden
+        // popup surfaces. This prevents an invisible overlay from receiving
+        // pointer input. Remapping is asynchronous; the event loop renders
+        // after the compositor sends a fresh configure.
         self.queue
             .flush()
             .context("failed to flush popup state to Wayland")?;
         Ok(())
     }
 
+    pub fn set_popup_input_rect(&mut self, surface_id: usize, rect: DamageRect) -> Result<()> {
+        let Some(surface) = self
+            .state
+            .surfaces
+            .iter_mut()
+            .find(|surface| surface.id == surface_id && surface.kind == SurfaceKind::Popup)
+        else {
+            return Ok(());
+        };
+        if surface.input_rect == Some(rect) {
+            return Ok(());
+        }
+        surface.input_rect = Some(rect);
+        if surface.visible && surface.interactive && !surface.capture_outside {
+            apply_input_region(&self.queue.handle(), &self.state.compositor, surface);
+            surface.layer_surface.commit();
+            self.queue
+                .flush()
+                .context("failed to flush popup panel input region")?;
+        }
+        Ok(())
+    }
+
     pub fn hide_all_popups(&mut self) -> Result<()> {
-        self.show_popups(&[])
+        self.show_popups_with(&[], false, false)
     }
 
     pub fn cursor_restore_available(&self) -> bool {
@@ -677,17 +733,27 @@ mod tests {
     }
 }
 
-fn set_input_region(
+fn apply_input_region(
     qh: &QueueHandle<WaylandState>,
     compositor: &CompositorState,
     surface: &SurfaceEntry,
-    enabled: bool,
 ) {
-    if enabled {
+    if surface.visible && surface.interactive && surface.capture_outside {
         surface.layer_surface.wl_surface().set_input_region(None);
         return;
     }
     let region = compositor.wl_compositor().create_region(qh, ());
+    if surface.visible
+        && surface.interactive
+        && let Some(rect) = surface.input_rect
+    {
+        region.add(
+            rect.x as i32,
+            rect.y as i32,
+            rect.width as i32,
+            rect.height as i32,
+        );
+    }
     surface
         .layer_surface
         .wl_surface()
@@ -814,6 +880,9 @@ impl WaylandState {
                 height: 0,
                 configured: false,
                 visible: kind != SurfaceKind::Popup,
+                interactive: false,
+                capture_outside: false,
+                input_rect: None,
                 frame_ready: true,
                 buffers: Vec::new(),
                 last_damage: None,

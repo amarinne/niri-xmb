@@ -398,6 +398,19 @@ impl Renderer {
             .find(|zone| zone.rect.contains(x, y))
             .map(|zone| &zone.target)
     }
+    pub fn panel_input_rect(
+        &self,
+        surface_id: usize,
+        width: u32,
+        height: u32,
+    ) -> Option<DamageRect> {
+        let panel = self
+            .hit_zones
+            .get(&surface_id)?
+            .iter()
+            .find_map(|zone| matches!(zone.target, HitTarget::Panel).then_some(zone.rect))?;
+        damage_for_rect(panel, 0.0, width, height)
+    }
 
     pub fn update_hover(&mut self, surface_id: usize, x: f64, y: f64) -> bool {
         let target = self

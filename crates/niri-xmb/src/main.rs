@@ -840,6 +840,14 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     ) {
                         surfaces.present(surface.id, frame.pixels, frame.damage)?;
                     }
+                    if surface.kind == SurfaceKind::Popup
+                        && popup_mode == PopupMode::Manual
+                        && !config.behavior.close_on_outside_click
+                        && let Some(rect) =
+                            renderer.panel_input_rect(surface.id, surface.width, surface.height)
+                    {
+                        surfaces.set_popup_input_rect(surface.id, rect)?;
+                    }
                 }
                 dirty = false;
             }
@@ -1003,7 +1011,11 @@ fn show_popup(
     interactive: bool,
 ) -> Result<()> {
     let outputs = popup_output_targets(snapshot, config);
-    surfaces.show_popups_with(&outputs, interactive)?;
+    surfaces.show_popups_with(
+        &outputs,
+        interactive,
+        config.behavior.close_on_outside_click,
+    )?;
     visible.clear();
     visible.extend(outputs);
     Ok(())
@@ -1054,7 +1066,10 @@ fn update_following_popup(
         .take()
         .map(|(output, _)| output)
         .unwrap_or(active_output);
-    surfaces.show_popups(std::slice::from_ref(&active_output))?;
+    surfaces.show_popups(
+        std::slice::from_ref(&active_output),
+        config.behavior.close_on_outside_click,
+    )?;
     visible.clear();
     visible.insert(active_output.clone());
     selection.output = active_output;

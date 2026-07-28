@@ -6,6 +6,42 @@ Turn the Mod+Z popup into a compact XMB-style navigator: one small canvas per
 monitor, fixed focal point, icon-only presentation, smooth staged or live
 navigation, and a passive workspace-change peek overlay.
 
+## Current work queue
+
+- [x] Restore the custom Niri smart workspace move on `Mod+Shift+Up` and
+  `Mod+Shift+Down`. The regression was in the active bind file. Both Niri
+  branches still contain commit `62cfdc3f`. Keep this commit during upstream
+  merges. The action moves inside a column first. At a column edge, the action
+  inserts a new workspace above or below and moves the window to it.
+- [ ] Make the shell `niri` command use the deployed custom binary. The stock
+  CLI reports a version mismatch and does not list the custom smart actions.
+- [ ] Recover or replace the damaged Niri worktree before the next build. The
+  worktree currently reports 4,901 changed paths, mostly tracked deletions.
+  Preserve the current worktree until the deletion source is known.
+- [ ] Finish the hidden popup surface lifecycle. Destroy hidden popup surfaces
+  if null-buffer unmap does not remove the layer object and input state.
+- [ ] Commit and push the pending niri-xmb popup input and hidden-surface fixes.
+- [ ] Merge current Noctalia upstream `main` into the Noctalia fork. Preserve the
+   custom taskbar output target, icon, drag source, and drop routing changes.
+- [ ] Run the Noctalia v5 test suite and build the desktop package. Do not build
+   Noctalia on the laptop.
+- [ ] Build a portable Noctalia v5 package. Bundle `libtomlplusplus.so.3` or
+  remove the build-host RPATH dependency.
+- [ ] Back up the desktop Noctalia v4 configuration. Keep the backup as the only
+   v4 rollback path. Do not add more v4 features.
+- [ ] Create the desktop Noctalia v5 configuration. Add one taskbar widget for
+   `HDMI-A-1` and one taskbar widget for `HDMI-A-2`. Configure both widgets to
+   use `niri-xmb` for drag and drop.
+- [ ] Remove v4-only plugin entries from the v5 configuration. Replace necessary
+   functions with built-in widgets or command widgets.
+- [ ] Disable Neowall autostart. Use the native Noctalia v5 wallpaper function.
+- [ ] Replace the desktop v4 startup command with the native Noctalia v5 startup
+  command.
+- [ ] Validate both bars, dock input, taskbar input, XMB drag and reorder,
+  `Mod+Z`, tray, audio, network, notifications, lock, and wallpaper.
+- [ ] Push a Noctalia fork checkpoint after the desktop v5 cutover passes all
+  checks.
+
 ## Current product decisions
 
 - The popup is compact, not fullscreen; Niri's overview remains the fullscreen

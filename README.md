@@ -234,6 +234,11 @@ clicks and drag/drop keep it open for organizing several windows. Set
 transient alt-tab-style popup. Outside click and Escape have independent
 switches as well.
 
+When `close_on_outside_click = false`, the popup advertises only its visible
+panel as a pointer-input region, so bars, docks, and windows remain clickable
+around it. Enabling outside-click close intentionally captures the full host
+monitor while the interactive popup is open.
+
 Print the complete commented configuration template with:
 
 ```bash
