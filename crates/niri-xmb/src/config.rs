@@ -182,6 +182,81 @@ pub enum Align {
     End,
 }
 
+/// A popup spatial value expressed either in logical pixels or as a percentage
+/// of the host output's corresponding logical dimension.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConfigLength {
+    Pixels(f32),
+    Percent(f32),
+}
+
+impl ConfigLength {
+    pub const fn pixels(value: f32) -> Self {
+        Self::Pixels(value)
+    }
+
+    pub fn resolve(self, total: f32) -> f32 {
+        match self {
+            Self::Pixels(value) => value,
+            Self::Percent(value) => total * value / 100.0,
+        }
+    }
+}
+
+impl Serialize for ConfigLength {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Pixels(value)
+                if value.fract() == 0.0
+                    && *value >= i64::MIN as f32
+                    && *value <= i64::MAX as f32 =>
+            {
+                serializer.serialize_i64(*value as i64)
+            }
+            Self::Pixels(value) => serializer.serialize_f32(*value),
+            Self::Percent(value) => serializer.serialize_str(&format!("{value}%")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigLength {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            Integer(i64),
+            Float(f64),
+            Text(String),
+        }
+
+        match Input::deserialize(deserializer)? {
+            Input::Integer(value) => Ok(Self::Pixels(value as f32)),
+            Input::Float(value) if value.is_finite() => Ok(Self::Pixels(value as f32)),
+            Input::Float(_) => Err(serde::de::Error::custom("length must be finite")),
+            Input::Text(value) => {
+                let Some(percent) = value.trim().strip_suffix('%') else {
+                    return Err(serde::de::Error::custom(
+                        "length strings must be percentages such as \"25%\"",
+                    ));
+                };
+                let percent = percent.trim().parse::<f32>().map_err(|_| {
+                    serde::de::Error::custom("invalid percentage length; expected e.g. \"25%\"")
+                })?;
+                if !percent.is_finite() {
+                    return Err(serde::de::Error::custom("length must be finite"));
+                }
+                Ok(Self::Percent(percent))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PopupConfig {
@@ -189,17 +264,17 @@ pub struct PopupConfig {
     pub surface_mode: PopupSurfaceMode,
     pub follow_delay_ms: u64,
     pub position: PopupPosition,
-    pub width: u32,
-    pub height: u32,
-    pub fixed_x: i32,
-    pub fixed_y: i32,
+    pub width: ConfigLength,
+    pub height: ConfigLength,
+    pub fixed_x: ConfigLength,
+    pub fixed_y: ConfigLength,
     /// Per-output anchors, used when `position = "anchored"`. Outputs without an
     /// entry fall back to centred.
     pub placements: Vec<PopupPlacement>,
     /// Size of one monitor's canvas. Each output gets its own canvas and they
     /// are laid out side by side inside the panel.
-    pub canvas_width: u32,
-    pub canvas_height: u32,
+    pub canvas_width: ConfigLength,
+    pub canvas_height: ConfigLength,
     /// Draw workspace and output names. Off by default for the icon-only look.
     pub show_labels: bool,
     pub show_titles: bool,
@@ -212,13 +287,13 @@ impl Default for PopupConfig {
             surface_mode: PopupSurfaceMode::FollowActive,
             follow_delay_ms: 180,
             position: PopupPosition::Cursor,
-            width: 920,
-            height: 250,
-            fixed_x: 80,
-            fixed_y: 80,
+            width: ConfigLength::pixels(920.0),
+            height: ConfigLength::pixels(250.0),
+            fixed_x: ConfigLength::pixels(80.0),
+            fixed_y: ConfigLength::pixels(80.0),
             placements: Vec::new(),
-            canvas_width: 300,
-            canvas_height: 190,
+            canvas_width: ConfigLength::pixels(300.0),
+            canvas_height: ConfigLength::pixels(190.0),
             show_labels: false,
             show_titles: false,
         }
@@ -272,8 +347,7 @@ pub enum AnchorY {
 
 /// Where the panel sits on one particular monitor.
 ///
-/// The combined panel moves between monitors as focus does, so the useful unit
-/// is per output rather than one screen position.
+/// Each popup surface resolves its placement against its own host output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PopupPlacement {
@@ -282,7 +356,8 @@ pub struct PopupPlacement {
     pub x: AnchorX,
     pub y: AnchorY,
     /// Gap kept between the panel and the edges it is anchored to.
-    pub margin: f32,
+    /// Percentage values resolve against width for X and height for Y.
+    pub margin: ConfigLength,
 }
 
 impl Default for PopupPlacement {
@@ -291,7 +366,7 @@ impl Default for PopupPlacement {
             output: String::new(),
             x: AnchorX::default(),
             y: AnchorY::default(),
-            margin: 48.0,
+            margin: ConfigLength::pixels(48.0),
         }
     }
 }
@@ -512,6 +587,47 @@ mod tests {
         assert_eq!(config.bars.len(), 2);
         assert!(!config.bars[0].allow_column_join);
         assert!(config.bars[1].allow_column_join);
+    }
+
+    #[test]
+    fn popup_lengths_accept_pixels_and_percentages() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [popup]
+            width = "80%"
+            height = 720
+            fixed_x = "12.5%"
+            fixed_y = -24
+            canvas_width = "18%"
+            canvas_height = 190.5
+
+            [[popup.placements]]
+            output = "HDMI-A-1"
+            margin = "3%"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.popup.width.resolve(1000.0), 800.0);
+        assert_eq!(config.popup.height.resolve(1000.0), 720.0);
+        assert_eq!(config.popup.fixed_x.resolve(800.0), 100.0);
+        assert_eq!(config.popup.fixed_y.resolve(800.0), -24.0);
+        assert_eq!(config.popup.canvas_width.resolve(1000.0), 180.0);
+        assert_eq!(config.popup.canvas_height.resolve(1000.0), 190.5);
+        assert_eq!(config.popup.placements[0].margin.resolve(1000.0), 30.0);
+    }
+
+    #[test]
+    fn invalid_popup_percentage_is_rejected() {
+        let error = toml::from_str::<Config>(
+            r#"
+            [popup]
+            width = "mostly"
+            "#,
+        )
+        .expect_err("non-percentage length string should fail");
+
+        assert!(error.to_string().contains("percentage"));
     }
 
     #[test]

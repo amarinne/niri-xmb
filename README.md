@@ -90,6 +90,12 @@ Important behavior:
   output with `[[popup.placements]]`.
 - `popup.width` and `popup.height` are maximums, not fixed sizes. The panel
   measures its icons and shrinks to fit.
+- Popup spatial fields accept either logical-pixel numbers or percentage
+  strings such as `"80%"`. This applies to `width`, `height`, `fixed_x`,
+  `fixed_y`, `canvas_width`, `canvas_height`, and placement `margin`.
+  Horizontal percentages resolve against the host output's logical width;
+  vertical percentages resolve against its logical height. A percentage
+  `margin` resolves independently on each axis.
 - `behavior.snap_cursor_after_drop = false`: restore the pointer to its release
   position after Niri's temporary focus step used for exact tiled placement.
 
@@ -118,9 +124,9 @@ land on. Icons fade out toward the canvas edge instead of being clipped.
 
 The popup's palette and primary proportions—icon sizes, cross spacing, panel
 padding/radius, shadow, and transition timing—come from config. Small internal
-safety bounds and text insets remain implementation details. Start from the
-current defaults with `niri-xmb print-default-config`, which always reflects the
-running build.
+safety bounds and text insets remain implementation details. Print the
+maintained commented template with `niri-xmb print-default-config`; every
+parameter includes its accepted values or effect.
 
 Highlights:
 
@@ -219,7 +225,7 @@ clicks and drag/drop keep it open for organizing several windows. Set
 transient alt-tab-style popup. Outside click and Escape have independent
 switches as well.
 
-Print every default setting with:
+Print the complete commented configuration template with:
 
 ```bash
 niri-xmb print-default-config

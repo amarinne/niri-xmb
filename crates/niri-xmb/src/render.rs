@@ -714,17 +714,27 @@ impl Renderer {
             0.0
         };
         let count = outputs.len() as f32;
+        let output_width = pixmap.width() as f32;
+        let output_height = pixmap.height() as f32;
         // Canvases keep their configured size; `popup.width`/`height` only cap
         // how much of the panel can be shown on a small screen.
-        let canvas_width = (config.popup.canvas_width.max(120) as f32)
+        let canvas_width = config
+            .popup
+            .canvas_width
+            .resolve(output_width)
+            .max(120.0)
             .min((pixmap.width().saturating_sub(64) as f32 / count).max(120.0));
-        let canvas_height = (config.popup.canvas_height.max(90) as f32)
+        let canvas_height = config
+            .popup
+            .canvas_height
+            .resolve(output_height)
+            .max(90.0)
             .min(pixmap.height().saturating_sub(64) as f32);
         let panel_width = (padding * 2.0 + canvas_width * count + gap * (count - 1.0))
-            .min(config.popup.width as f32)
+            .min(config.popup.width.resolve(output_width))
             .min(pixmap.width().saturating_sub(24) as f32);
         let panel_height = (padding * 2.0 + header + canvas_height)
-            .min(config.popup.height as f32)
+            .min(config.popup.height.resolve(output_height))
             .min(pixmap.height().saturating_sub(24) as f32);
 
         let (mut panel_x, mut panel_y) = match config.popup.position {
@@ -732,7 +742,10 @@ impl Renderer {
                 (pixmap.width() as f32 - panel_width) * 0.5,
                 (pixmap.height() as f32 - panel_height) * 0.5,
             ),
-            PopupPosition::Fixed => (config.popup.fixed_x as f32, config.popup.fixed_y as f32),
+            PopupPosition::Fixed => (
+                config.popup.fixed_x.resolve(output_width),
+                config.popup.fixed_y.resolve(output_height),
+            ),
             PopupPosition::Cursor => self
                 .popup_origins
                 .get(host_output)
@@ -743,16 +756,18 @@ impl Renderer {
                 let placement = config.popup.placement(host_output);
                 let free_x = pixmap.width() as f32 - panel_width;
                 let free_y = pixmap.height() as f32 - panel_height;
+                let margin_x = placement.margin.resolve(output_width);
+                let margin_y = placement.margin.resolve(output_height);
                 (
                     match placement.x {
-                        AnchorX::Left => placement.margin,
+                        AnchorX::Left => margin_x,
                         AnchorX::Center => free_x * 0.5,
-                        AnchorX::Right => free_x - placement.margin,
+                        AnchorX::Right => free_x - margin_x,
                     },
                     match placement.y {
-                        AnchorY::Top => placement.margin,
+                        AnchorY::Top => margin_y,
                         AnchorY::Center => free_y * 0.5,
-                        AnchorY::Bottom => free_y - placement.margin,
+                        AnchorY::Bottom => free_y - margin_y,
                     },
                 )
             }

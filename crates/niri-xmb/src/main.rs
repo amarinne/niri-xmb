@@ -105,6 +105,7 @@ enum Command {
         cursor_y: Option<f64>,
     },
     Quit,
+    /// Print the fully commented configuration template.
     PrintDefaultConfig,
 }
 
@@ -209,7 +210,7 @@ fn main() -> Result<()> {
         }),
         Command::Quit => print_control(ControlCommand::Quit),
         Command::PrintDefaultConfig => {
-            println!("{}", toml::to_string_pretty(&Config::default())?);
+            print!("{}", include_str!("../../../config/niri-xmb.toml.example"));
             Ok(())
         }
     }

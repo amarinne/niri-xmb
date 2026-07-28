@@ -2,27 +2,28 @@
 # themes/dank.toml and themes/noctalia.toml for examples.
 # theme = "~/.config/niri-xmb/themes/dank.toml"
 
-bars_enabled = true
+bars_enabled = true # false runs only the popup/peek daemon
 
 # Replace these connector names with `niri msg --json outputs` results.
 [[bars]]
-output = "HDMI-A-1"
-edge = "top"
-align = "center"
-width = 1000
-height = 42
-margin = 56
-offset = 0
-allow_column_join = false
-show_workspace_labels = false
-hide_empty_workspaces = false
-show_capsule = true
-show_active_indicator = true
-scroll_to_switch = true
-scroll_wrap = true
-scroll_reverse = false
+output = "HDMI-A-1"          # exact Niri connector name
+edge = "top"                 # "top", "bottom", "left", or "right"
+align = "center"             # "start", "center", or "end" along that edge
+width = 1000                 # bar length in logical pixels
+height = 42                  # bar thickness in logical pixels
+margin = 56                  # distance from the selected output edge
+offset = 0                   # shift along the edge from the aligned position
+allow_column_join = false    # center drops join a Niri column when true
+show_workspace_labels = false # show workspace names/numbers beside icons
+hide_empty_workspaces = false # omit empty workspaces when true
+show_capsule = true          # draw each workspace as its own pill
+show_active_indicator = true # mark the active window in each workspace
+scroll_to_switch = true      # mouse wheel changes workspace
+scroll_wrap = true           # wheel navigation wraps at the ends
+scroll_reverse = false       # reverse the wheel direction
 
-# A portrait output can opt into the center join zone independently.
+# Additional bars use the same parameters and can differ per monitor. A
+# portrait output can opt into the center join zone independently.
 [[bars]]
 output = "HDMI-A-2"
 edge = "top"
@@ -43,28 +44,30 @@ scroll_reverse = false
 [popup]
 outputs = "combined" # "focused", "all", or "combined"
 surface_mode = "follow_active" # "fixed", "follow_active", or "mirror"
-follow_delay_ms = 180
+follow_delay_ms = 180 # delay before follow_active moves to another output
 position = "anchored" # "anchored", "cursor", "center", or "fixed"
-width = 1600
-height = 850
-fixed_x = 80
-fixed_y = 80
+# Popup spatial values accept logical-pixel numbers or percentage strings.
+# Percentages resolve against each host monitor's logical width or height.
+width = 1600       # maximum panel width; for example "80%"
+height = 850       # maximum panel height; for example "70%"
+fixed_x = 80       # X origin for position = "fixed"; for example "10%"
+fixed_y = 80       # Y origin for position = "fixed"; for example "5%"
 # width/height cap the panel; each monitor gets a canvas of the size below and
 # they are laid out side by side.
-canvas_width = 300
-canvas_height = 190
+canvas_width = 300  # width per output map; for example "20%"
+canvas_height = 190 # height per output map; for example "24%"
 show_labels = false # workspace and output names
-show_titles = false # title of the selected window only
+show_titles = false # selected app name, with window-title fallback
 
 # Where the panel sits on each monitor, for position = "anchored". The combined
 # panel follows focus between monitors, so the anchor is per output. These stay
 # last in [popup]: once a [[popup.placements]] table opens, any bare key after
 # it belongs to that table rather than to [popup].
 [[popup.placements]]
-output = "HDMI-A-1"
+output = "HDMI-A-1" # exact Niri connector name
 x = "right"  # "left", "center", "right"
 y = "center" # "top", "center", "bottom"
-margin = 48.0
+margin = 48.0 # edge gap in logical pixels, or e.g. "3%"
 
 [[popup.placements]]
 output = "HDMI-A-2"
@@ -74,27 +77,27 @@ margin = 48.0
 
 # Passive overlay while navigating Niri with its own keybinds. Takes no input.
 [peek]
-enabled = false
-duration_ms = 1200    # restarts on every focus change, so it stays while moving
+enabled = false         # automatically show on matching Niri focus changes
+duration_ms = 1200      # linger time; restarts while navigation continues
 on_window_focus = false # workspace switches only; ignores dialogs and pointer focus
 
 [behavior]
 # "deferred": arrows stage a selection, Enter or a click applies it.
 # "live":     arrows move Niri's focus immediately, alt-tab style.
 navigation = "deferred"
-drag_threshold = 7.0
-empty_drop_floats = false
-floating_drop_tiles = true
-focus_after_drop = false
-snap_cursor_after_drop = false
-close_on_window_click = true
-close_on_workspace_click = false
-close_on_drop = false
-close_on_outside_click = true
-close_on_escape = true
+drag_threshold = 7.0         # pointer travel before a press becomes a drag
+empty_drop_floats = false    # drop on empty map space creates floating windows
+floating_drop_tiles = true   # dropping a floating window on icons tiles it
+focus_after_drop = false     # focus the moved window after rearranging
+snap_cursor_after_drop = false # keep pointer at release point after a drop
+close_on_window_click = true # close after activating a window
+close_on_workspace_click = false # close after activating a workspace
+close_on_drop = false        # close after a successful drag-and-drop
+close_on_outside_click = true # close when clicking outside every popup
+close_on_escape = true       # Escape closes the popup
 
 [animation]
-enabled = true
+enabled = true        # false applies every visual change immediately
 panel_ms = 140.0    # panel open and close
 emphasis_ms = 180.0 # selection and hover emphasis
 scroll_ms = 165.0   # canvas scrolling under the focal point
@@ -104,22 +107,22 @@ open_scale = 0.94   # scale the panel grows from; 1.0 disables the scale
 [style]
 background = "#f21b2530"       # popup gradient, top stop
 background_end = "#f20d1117"   # popup gradient, bottom stop
-surface = "#661d2022"
-surface_hover = "#266ed2ff"
-border = "#5c8aa5c0"
+surface = "#661d2022"           # secondary surface/floating backing colour
+surface_hover = "#266ed2ff"     # pointer-hover overlay
+border = "#5c8aa5c0"            # primary outline
 border_soft = "#2a8aa5c0"      # canvas dividers, inactive marks
-accent = "#ff6ed2ff"
-selection_border = "#666ed2ff"
-text = "#ffe1e2e5"
-muted = "#ffc0c7cd"
-urgent = "#ffffb4ab"
+accent = "#ff6ed2ff"            # active/focused accent
+selection_border = "#666ed2ff" # retained selection-outline colour
+text = "#ffe1e2e5"              # primary labels and selected title
+muted = "#ffc0c7cd"             # secondary labels
+urgent = "#ffffb4ab"            # urgent-window marker
 shadow = "#4e000000"           # panel drop shadow
 floating_backing = "#be0c1016" # disc behind floating icons and the drag ghost
 
 radius = 14.0       # small elements, e.g. the urgency ring
 panel_radius = 20.0 # the popup panel itself
-border_width = 1.0
-icon_size = 28
+border_width = 1.0  # logical-pixel outline thickness
+icon_size = 28      # normal app icon size in logical pixels
 icon_size_focused = 40 # selected icon; emphasis by scale, not by outline
 dim_alpha = 0.45       # opacity of icons outside the selected workspace
 gap = 8.0              # bar spacing
@@ -130,8 +133,8 @@ canvas_gap = 12.0      # between one monitor's canvas and the next
 column_gap = 10.0      # added to icon_size_focused for the horizontal step
 stack_gap = 6.0        # added to icon_size inside a vertically stacked column
 row_gap = 16.0         # added to icon_size_focused for the vertical step
-shadow_offset = 6.0
-shadow_spread = 4.0
+shadow_offset = 6.0    # shadow displacement in logical pixels
+shadow_spread = 4.0    # extra size of the softer shadow pass
 empty_dot_radius = 3.0 # stands in for an empty workspace
-label_font_size = 11.0
-title_font_size = 10.0
+label_font_size = 11.0 # workspace/output label size
+title_font_size = 10.0 # selected application title size

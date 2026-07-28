@@ -52,6 +52,10 @@ navigation, and a passive workspace-change peek overlay.
 - Reused rendering pixmaps and skipped already-blank popup surfaces to reduce
   allocation/upload stalls.
 - Removed all wave configuration/rendering and all focal/selection glow code.
+- Added backward-compatible percentage strings for popup caps, canvas sizes,
+  fixed coordinates, and per-output margins. Numeric values remain logical
+  pixels and percentages resolve against each host output.
+- `print-default-config` now emits the fully commented maintained template.
 
 ## Relevant files
 
@@ -75,7 +79,7 @@ navigation, and a passive workspace-change peek overlay.
 Verified on 2026-07-28:
 
 - `cargo fmt --all`
-- `cargo test --workspace` — 39 passed
+- `cargo test --workspace` — 43 passed
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo build --release -p niri-xmb`
 - `git diff --check`
