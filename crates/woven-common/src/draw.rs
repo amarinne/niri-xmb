@@ -1,7 +1,8 @@
 //! Shared tiny-skia drawing primitives for woven-shell.
 
 use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform,
+    Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, PathBuilder, Pixmap,
+    Point, Rect, SpreadMode, Stroke, Transform,
 };
 
 /// Parse a hex color string (#RRGGBB or #AARRGGBB) into a tiny-skia Color.
@@ -75,6 +76,56 @@ pub fn fill_rounded_rect(
     }
 }
 
+/// Fill a rounded rectangle with a vertical `top` to `bottom` linear gradient.
+///
+/// Falls back to a flat `top` fill when the two stops are identical or the
+/// gradient cannot be built.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_gradient_rounded_rect(
+    pixmap: &mut Pixmap,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+    top: Color,
+    bottom: Color,
+) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    if top == bottom {
+        fill_rounded_rect(pixmap, x, y, w, h, r, top);
+        return;
+    }
+    let shader = LinearGradient::new(
+        Point::from_xy(x, y),
+        Point::from_xy(x, y + h),
+        vec![GradientStop::new(0.0, top), GradientStop::new(1.0, bottom)],
+        SpreadMode::Pad,
+        Transform::identity(),
+    );
+    let Some(shader) = shader else {
+        fill_rounded_rect(pixmap, x, y, w, h, r, top);
+        return;
+    };
+    let Some(path) = rounded_rect_path(x, y, w, h, r.max(0.0).min(w * 0.5).min(h * 0.5)) else {
+        return;
+    };
+    let paint = Paint {
+        shader,
+        anti_alias: true,
+        ..Paint::default()
+    };
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+}
+
 /// Stroke a rounded rectangle outline.
 #[allow(clippy::too_many_arguments)]
 pub fn stroke_rounded_rect(
@@ -135,6 +186,29 @@ pub fn blit_icon(
     src_w: u32,
     src_h: u32,
 ) {
+    blit_icon_alpha(pixmap, x, y, size, rgba, src_w, src_h, 1.0);
+}
+
+/// Blit an icon with its alpha scaled by `alpha` (0.0..=1.0).
+///
+/// Dimming unfocused icons is what lets the focused one read as the focal
+/// point without drawing a container around it.
+#[allow(clippy::too_many_arguments)]
+pub fn blit_icon_alpha(
+    pixmap: &mut Pixmap,
+    x: i32,
+    y: i32,
+    size: u32,
+    rgba: &[u8],
+    src_w: u32,
+    src_h: u32,
+    alpha: f32,
+) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if alpha <= 0.0 || size == 0 || src_w == 0 || src_h == 0 {
+        return;
+    }
+    let alpha_scale = (alpha * 255.0).round() as u16;
     let pw = pixmap.width() as i32;
     let ph = pixmap.height() as i32;
     let pixels = pixmap.pixels_mut();
@@ -164,7 +238,10 @@ pub fn blit_icon(
 
             let idx = (py * pw + px) as usize;
             let dst = &mut pixels[idx];
-            let src_a = sa as u16;
+            let src_a = sa as u16 * alpha_scale / 255;
+            if src_a == 0 {
+                continue;
+            }
             let inv_a = 255u16 - src_a;
             let dr = ((sr as u16 * src_a + dst.red() as u16 * inv_a) / 255) as u8;
             let dg = ((sg as u16 * src_a + dst.green() as u16 * inv_a) / 255) as u8;

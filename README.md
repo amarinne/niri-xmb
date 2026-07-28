@@ -84,9 +84,130 @@ Important behavior:
   Niri's temporary rearrangement focus are ignored.
 - `popup.surface_mode = "mirror"`: show the popup on every monitor. With
   `outputs = "combined"`, every monitor receives the same combined organizer.
-- `popup.position`: `"cursor"`, `"center"`, or `"fixed"`.
+- `popup.position`: `"anchored"`, `"cursor"`, `"center"`, or `"fixed"`.
+  Anchored placement can choose left/centre/right and top/centre/bottom per
+  output with `[[popup.placements]]`.
+- `popup.width` and `popup.height` are maximums, not fixed sizes. The panel
+  measures its icons and shrinks to fit.
 - `behavior.snap_cursor_after_drop = false`: restore the pointer to its release
   position after Niri's temporary focus step used for exact tiled placement.
+
+### Popup appearance
+
+The popup is icon-only by default: Niri's overview already provides the
+full-screen, text-heavy view, so this panel stays compact and carries state
+through position, scale, and brightness instead of nested boxes and labels.
+
+Each monitor gets its own small canvas and the canvases sit side by side. A
+canvas is a cross with a **fixed focal point at its centre**: workspaces run
+vertically through it, and the selected workspace's windows run horizontally
+through it. Moving the selection scrolls the content under the focal point
+rather than moving a cursor around the panel, so the eye never has to search
+for the selection. Rows that are not selected park their *active* window on the
+focal column, so that column always shows what activating each workspace would
+land on. Icons fade out toward the canvas edge instead of being clipped.
+
+- `popup.canvas_width` / `popup.canvas_height`: size of one monitor's canvas.
+  `popup.width` and `popup.height` only cap the overall panel.
+- `popup.show_labels = true`: add workspace and output names. Off by default.
+- `popup.show_titles = true`: add the title of the *selected* window only,
+  rather than a caption under every icon.
+### Theming
+
+The popup's palette and primary proportions—icon sizes, cross spacing, panel
+padding/radius, shadow, and transition timing—come from config. Small internal
+safety bounds and text insets remain implementation details. Start from the
+current defaults with `niri-xmb print-default-config`, which always reflects the
+running build.
+
+Highlights:
+
+- `style.background` and `style.background_end`: top and bottom stops of the
+  panel's vertical gradient. Set them equal for a flat panel.
+- `style.icon_size` and `style.icon_size_focused`: the selected window is drawn
+  larger, which is what marks selection in place of an outline.
+- `style.dim_alpha`: opacity of icons outside the selected workspace. Raise it
+  toward `1.0` for a flatter look, lower it for more focus separation.
+- `style.column_gap` and `style.row_gap`: added to `icon_size_focused` to get
+  the spacing of the cross. These set how far each keypress scrolls.
+- `style.stack_gap`: spacing between windows joined vertically inside one Niri
+  column. Columns remain horizontal while their member windows stack vertically.
+- `style.shadow`, `shadow_offset`, `shadow_spread`: the panel's drop shadow,
+  drawn as two offset passes. Set `shadow` transparent to remove it.
+- `[animation]`: `panel_ms`, `emphasis_ms`, and `scroll_ms` are durations, not
+  raw easing constants. `enabled = false` applies every change instantly.
+
+Opening the panel, changing the selection, and closing are all animated.
+Animation adds redraws only while something is actually moving; once every
+track settles, the daemon falls back to its normal idle behaviour rather than
+holding a frame loop open.
+
+#### Importing a theme
+
+Set a top-level `theme` key to the path of another TOML file:
+
+```toml
+theme = "~/.config/niri-xmb/themes/dank.toml"
+```
+
+A leading `~/` expands to `$HOME`; a relative path is resolved against the
+directory containing the config file that references it. The theme file only
+needs a `[style]` table, and only the keys it wants to change — it is merged
+over the main config's `[style]` table **key by key**, with the theme's
+values winning. Any style field the theme doesn't mention (radii, sizes,
+gaps, font sizes, and any colour it skips) keeps whatever the rest of the
+config, or the built-in defaults, already say. A missing or unparsable theme
+file is a hard error rather than a silent fallback.
+
+`themes/dank.toml` and `themes/noctalia.toml` ship as examples, derived from
+the matching alacritty colour schemes of the same names — each overrides only
+the colour fields, leaving layout and sizing at their defaults.
+
+### Navigation
+
+`behavior.navigation` picks how arrow keys relate to Niri's real focus:
+
+- `"deferred"` (default): arrows move a selection inside the popup and nothing
+  happens to Niri until Enter or a click confirms it. The popup is a staging
+  area you can look around in before committing.
+- `"live"`: every arrow key moves Niri's focus straight away, alt-tab style.
+
+In either mode the popup keeps its **own** cursor position for the duration of
+a session, rather than mirroring live state. Navigating away from a workspace
+and back returns to where you left off, not to whatever Niri happens to be
+focusing. The session ends — and the popup snaps back to live state — when the
+popup closes or a move is confirmed.
+
+With `navigation = "live"` and `popup.surface_mode = "follow_active"`, focusing
+across monitors will also make the popup migrate after `follow_delay_ms`. Set
+`surface_mode = "fixed"` if you would rather it stay put.
+
+### Peek overlay
+
+`peek.enabled = true` adds a third, passive mode. Navigate Niri with its own
+keybinds and the panel appears by itself, showing where focus just moved, then
+hides again. It is a readout, not a control: the surface takes neither pointer
+nor keyboard input, so the keybinds you are pressing keep reaching Niri and
+clicks pass through to the windows underneath.
+
+- `peek.duration_ms`: how long it lingers after the last focus change. The
+  countdown restarts on every change, so holding down a navigation key keeps
+  the overlay up and it disappears shortly after you stop.
+- `peek.on_window_focus = false`: only peek on workspace switches, ignoring
+  focus moves between windows in the same workspace.
+
+Peek stays out of the way of anything already covering the same ground:
+
+- **Niri's own overview.** Navigating with the overview open raises nothing,
+  and an overlay already up is dismissed the moment the overview opens over it.
+  A smaller duplicate of the overview is not useful.
+- **A session you are driving.** Pressing the popup keybind while a peek
+  overlay is up *promotes* it to a normal interactive popup rather than
+  dismissing it, and peek never takes over a manual popup.
+- **Focus changes niri-xmb caused itself** — confirming a pick, or
+  `navigation = "live"` — do not bounce back as a peek for the move just made.
+
+`niri-xmb status` reports `"mode"` as `hidden`, `manual`, or `peek`.
 
 Popup lifetime is configurable under `[behavior]`. The shipped defaults use a
 hybrid mode: clicking a window focuses it and closes the popup, while workspace

@@ -1,0 +1,17 @@
+# Derived from the "dank" alacritty theme (~/.config/alacritty/dank-theme.toml),
+# a warm rosy/mauve dark scheme. Only colours are set here; layout and sizing
+# are left to the built-in defaults.
+[style]
+background = "#f2221d1d"       # lightened lift of the terminal background
+background_end = "#f2161313"   # terminal background itself
+surface = "#66664c4f"          # normal magenta, muted mauve panel tint
+surface_hover = "#40debfc2"    # cursor/cyan at a light hover alpha
+border = "#5cdebfc2"           # cursor/cyan at low alpha
+border_soft = "#2adebfc2"      # cursor/cyan fainter still
+accent = "#ffdebfc2"           # cursor/cyan, the theme's brightest highlight
+selection_border = "#90debfc2" # cursor/cyan at a stronger alpha
+text = "#ffe9e1e0"             # foreground
+muted = "#ffbdb3b3"            # foreground blended toward bright black
+urgent = "#ffff7274"           # normal red
+shadow = "#4e000000"
+floating_backing = "#be0f0d0d" # near-black tinted toward the background

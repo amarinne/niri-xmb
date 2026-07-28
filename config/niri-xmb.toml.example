@@ -1,3 +1,7 @@
+# Merge a theme file's [style] table over the one below, key by key. See
+# themes/dank.toml and themes/noctalia.toml for examples.
+# theme = "~/.config/niri-xmb/themes/dank.toml"
+
 bars_enabled = true
 
 # Replace these connector names with `niri msg --json outputs` results.
@@ -40,14 +44,44 @@ scroll_reverse = false
 outputs = "combined" # "focused", "all", or "combined"
 surface_mode = "follow_active" # "fixed", "follow_active", or "mirror"
 follow_delay_ms = 180
-position = "cursor" # "cursor", "center", or "fixed"
+position = "anchored" # "anchored", "cursor", "center", or "fixed"
 width = 1600
 height = 850
 fixed_x = 80
 fixed_y = 80
-show_titles = false
+# width/height cap the panel; each monitor gets a canvas of the size below and
+# they are laid out side by side.
+canvas_width = 300
+canvas_height = 190
+show_labels = false # workspace and output names
+show_titles = false # title of the selected window only
+
+# Where the panel sits on each monitor, for position = "anchored". The combined
+# panel follows focus between monitors, so the anchor is per output. These stay
+# last in [popup]: once a [[popup.placements]] table opens, any bare key after
+# it belongs to that table rather than to [popup].
+[[popup.placements]]
+output = "HDMI-A-1"
+x = "right"  # "left", "center", "right"
+y = "center" # "top", "center", "bottom"
+margin = 48.0
+
+[[popup.placements]]
+output = "HDMI-A-2"
+x = "left"
+y = "center"
+margin = 48.0
+
+# Passive overlay while navigating Niri with its own keybinds. Takes no input.
+[peek]
+enabled = false
+duration_ms = 1200    # restarts on every focus change, so it stays while moving
+on_window_focus = false # workspace switches only; ignores dialogs and pointer focus
 
 [behavior]
+# "deferred": arrows stage a selection, Enter or a click applies it.
+# "live":     arrows move Niri's focus immediately, alt-tab style.
+navigation = "deferred"
 drag_threshold = 7.0
 empty_drop_floats = false
 floating_drop_tiles = true
@@ -59,18 +93,45 @@ close_on_drop = false
 close_on_outside_click = true
 close_on_escape = true
 
+[animation]
+enabled = true
+panel_ms = 140.0    # panel open and close
+emphasis_ms = 180.0 # selection and hover emphasis
+scroll_ms = 165.0   # canvas scrolling under the focal point
+open_scale = 0.94   # scale the panel grows from; 1.0 disables the scale
+
+# Primary popup colours and proportions. Colours are #RRGGBB or #AARRGGBB.
 [style]
-background = "#f5111415"
+background = "#f21b2530"       # popup gradient, top stop
+background_end = "#f20d1117"   # popup gradient, bottom stop
 surface = "#661d2022"
 surface_hover = "#266ed2ff"
-border = "#ff40484c"
-border_soft = "#3340484c"
+border = "#5c8aa5c0"
+border_soft = "#2a8aa5c0"      # canvas dividers, inactive marks
 accent = "#ff6ed2ff"
 selection_border = "#666ed2ff"
 text = "#ffe1e2e5"
 muted = "#ffc0c7cd"
 urgent = "#ffffb4ab"
-radius = 14.0
+shadow = "#4e000000"           # panel drop shadow
+floating_backing = "#be0c1016" # disc behind floating icons and the drag ghost
+
+radius = 14.0       # small elements, e.g. the urgency ring
+panel_radius = 20.0 # the popup panel itself
 border_width = 1.0
 icon_size = 28
-gap = 8.0
+icon_size_focused = 40 # selected icon; emphasis by scale, not by outline
+dim_alpha = 0.45       # opacity of icons outside the selected workspace
+gap = 8.0              # bar spacing
+
+# Popup proportions.
+panel_padding = 14.0   # panel edge to canvas
+canvas_gap = 12.0      # between one monitor's canvas and the next
+column_gap = 10.0      # added to icon_size_focused for the horizontal step
+stack_gap = 6.0        # added to icon_size inside a vertically stacked column
+row_gap = 16.0         # added to icon_size_focused for the vertical step
+shadow_offset = 6.0
+shadow_spread = 4.0
+empty_dot_radius = 3.0 # stands in for an empty workspace
+label_font_size = 11.0
+title_font_size = 10.0

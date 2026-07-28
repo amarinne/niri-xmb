@@ -121,6 +121,14 @@ fn refresh_outputs(state: &mut NiriState) {
     if let Ok(Ok(Response::Outputs(outputs))) = socket.send(Request::Outputs) {
         state.replace_outputs(outputs);
     }
+    // Overview state only arrives as an event on change, so seed it here. Niri
+    // sends ConfigLoaded on connect, which brings us through this path.
+    let Ok(mut socket) = Socket::connect() else {
+        return;
+    };
+    if let Ok(Ok(Response::OverviewState(overview))) = socket.send(Request::OverviewState) {
+        state.set_overview_open(overview.is_open);
+    }
 }
 
 fn apply_event(state: &mut NiriState, event: Event) -> bool {
@@ -184,6 +192,10 @@ fn apply_event(state: &mut NiriState, event: Event) -> bool {
                     window.layout = layout;
                 }
             }
+            true
+        }
+        Event::OverviewOpenedOrClosed { is_open } => {
+            state.set_overview_open(is_open);
             true
         }
         Event::ConfigLoaded { .. } => {

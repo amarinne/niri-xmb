@@ -1,15 +1,142 @@
-use crate::config::{BarConfig, Config, Edge, PopupOutputs, PopupPosition};
+use crate::anim::{Animator, Timing, lerp};
+use crate::config::{AnchorX, AnchorY, BarConfig, Config, Edge, PopupOutputs, PopupPosition};
 use crate::icons::IconCache;
-use crate::model::{OutputModel, Snapshot, WindowModel, WorkspaceModel};
+use crate::model::{OutputModel, Snapshot, WindowModel, WindowSlot, WorkspaceModel};
 use crate::wayland::{SurfaceInfo, SurfaceKind};
 use std::collections::HashMap;
-use tiny_skia::{Color, Pixmap};
+use tiny_skia::{Color, FilterQuality, Pixmap, PixmapPaint, Transform};
 use woven_common::{
     draw::{
-        blit_icon, clear, fill_circle, fill_rect, fill_rounded_rect, hex_color, stroke_rounded_rect,
+        blit_icon_alpha, clear, fill_circle, fill_gradient_rounded_rect, fill_rect,
+        fill_rounded_rect, hex_color, stroke_rounded_rect,
     },
     text::TextRenderer,
 };
+
+/// Icon sizing derived from the style config, shared by every popup layout.
+#[derive(Debug, Clone, Copy)]
+struct IconMetrics {
+    /// Size of an unselected icon.
+    base: f32,
+    /// Size of the selected icon; emphasis by scale replaces the selection box.
+    focused: f32,
+    /// Horizontal advance between windows in a workspace.
+    column_step: f32,
+    /// Vertical advance between windows joined into one Niri column.
+    stack_step: f32,
+    /// Empty space kept between workspace bands.
+    workspace_gap: f32,
+}
+
+impl IconMetrics {
+    fn new(config: &Config) -> Self {
+        let base = config.style.icon_size.max(16) as f32;
+        let focused = (config.style.icon_size_focused as f32).max(base);
+        Self {
+            base,
+            focused,
+            column_step: focused + config.style.column_gap,
+            stack_step: base + config.style.stack_gap,
+            workspace_gap: config.style.row_gap,
+        }
+    }
+
+    fn workspace_step(&self, output: &OutputModel) -> f32 {
+        let max_stack = output
+            .workspaces
+            .iter()
+            .map(WorkspaceModel::max_stack)
+            .max()
+            .unwrap_or(1) as f32;
+        self.focused + self.stack_step * (max_stack - 1.0) + self.workspace_gap
+    }
+}
+
+/// Fade an icon out as it approaches the canvas edge.
+///
+/// The canvas is smaller than its content, so something has to give at the
+/// boundary; fading reads as "more content this way", a hard clip reads as a
+/// rendering bug.
+fn edge_fade(rect: Rect, canvas: Rect, margin: f32) -> f32 {
+    let margin = margin.max(1.0);
+    let left = (rect.x + rect.width - canvas.x) / margin;
+    let right = (canvas.x + canvas.width - rect.x) / margin;
+    let top = (rect.y + rect.height - canvas.y) / margin;
+    let bottom = (canvas.y + canvas.height - rect.y) / margin;
+    left.min(right).min(top).min(bottom).clamp(0.0, 1.0)
+}
+
+/// Whether a rect is far enough inside the canvas to be worth hit-testing.
+fn rect_within(rect: Rect, canvas: Rect) -> bool {
+    rect.x >= canvas.x - 1.0
+        && rect.y >= canvas.y - 1.0
+        && rect.x + rect.width <= canvas.x + canvas.width + 1.0
+        && rect.y + rect.height <= canvas.y + canvas.height + 1.0
+}
+
+/// Trim a rect to the canvas bounds, returning a zero-size rect when outside.
+fn clamp_rect(rect: Rect, canvas: Rect) -> Rect {
+    let x0 = rect.x.max(canvas.x);
+    let y0 = rect.y.max(canvas.y);
+    let x1 = (rect.x + rect.width).min(canvas.x + canvas.width);
+    let y1 = (rect.y + rect.height).min(canvas.y + canvas.height);
+    Rect {
+        x: x0,
+        y: y0,
+        width: (x1 - x0).max(0.0),
+        height: (y1 - y0).max(0.0),
+    }
+}
+
+/// Panel background: soft drop shadow, vertical gradient body, hairline edge.
+fn draw_panel_chrome(pixmap: &mut Pixmap, panel: Rect, config: &Config) {
+    let radius = config.style.panel_radius;
+    let offset = config.style.shadow_offset;
+    let spread = config.style.shadow_spread;
+    let shadow = hex_color(&config.style.shadow);
+    // Two offset passes approximate a blur without a real blur pass. The outer
+    // one is spread wider and drawn fainter.
+    let mut outer = shadow;
+    outer.set_alpha(outer.alpha() * 0.6);
+    fill_rounded_rect(
+        pixmap,
+        panel.x - spread * 0.5,
+        panel.y + offset - spread * 0.5,
+        panel.width + spread,
+        panel.height + spread,
+        radius + spread,
+        outer,
+    );
+    fill_rounded_rect(
+        pixmap,
+        panel.x,
+        panel.y + offset,
+        panel.width,
+        panel.height,
+        radius,
+        shadow,
+    );
+    fill_gradient_rounded_rect(
+        pixmap,
+        panel.x,
+        panel.y,
+        panel.width,
+        panel.height,
+        radius,
+        hex_color(&config.style.background),
+        hex_color(&config.style.background_end),
+    );
+    stroke_rounded_rect(
+        pixmap,
+        panel.x + 0.5,
+        panel.y + 0.5,
+        panel.width - 1.0,
+        panel.height - 1.0,
+        radius,
+        hex_color(&config.style.border),
+        config.style.border_width,
+    );
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Rect {
@@ -70,6 +197,27 @@ pub struct SelectionVisual {
     pub output: String,
     pub workspace_id: u64,
     pub window_id: Option<u64>,
+    /// Staged cursor position per workspace id, for workspaces the popup
+    /// session has already visited. Absent entries fall back to the
+    /// workspace's own active window.
+    pub anchors: HashMap<u64, usize>,
+}
+
+impl SelectionVisual {
+    /// Index that should sit on the focal column for `workspace`.
+    pub fn anchor(&self, workspace: &WorkspaceModel) -> usize {
+        let count = workspace.windows().count();
+        match self.anchors.get(&workspace.id) {
+            Some(&staged) if staged < count => staged,
+            _ => workspace.active_index(),
+        }
+    }
+
+    pub fn anchor_slot(&self, workspace: &WorkspaceModel) -> WindowSlot {
+        workspace
+            .window_slot_at(self.anchor(workspace))
+            .unwrap_or_else(|| workspace.active_slot())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +234,13 @@ pub struct Renderer {
     hovered_surface: Option<usize>,
     hovered_target: Option<HoverTarget>,
     render_surface: Option<usize>,
+    anim: Animator,
+    /// Scratch buffers reused across frames. A popup surface is output-sized,
+    /// so reallocating these per frame is the dominant cost of animating.
+    canvas: Option<Pixmap>,
+    layer: Option<Pixmap>,
+    /// Surfaces already presented blank, so they can be skipped.
+    blanked: std::collections::HashSet<usize>,
 }
 
 impl Renderer {
@@ -98,7 +253,90 @@ impl Renderer {
             hovered_surface: None,
             hovered_target: None,
             render_surface: None,
+            anim: Animator::new(),
+            canvas: None,
+            layer: None,
+            blanked: std::collections::HashSet::new(),
         }
+    }
+
+    /// Recompute every animation target from current state and advance the
+    /// clock. Returns true while anything is still moving, which the caller
+    /// uses to keep redrawing.
+    ///
+    /// Targets are derived here rather than during drawing so that rendering
+    /// stays a pure function of animation state.
+    pub fn update_animations(
+        &mut self,
+        snapshot: &Snapshot,
+        config: &Config,
+        selection: Option<&SelectionVisual>,
+        open_outputs: &std::collections::HashSet<String>,
+    ) -> bool {
+        self.anim.begin_sync();
+        for output in snapshot.outputs.keys() {
+            self.anim
+                .set_panel_open(output, open_outputs.contains(output));
+        }
+        // A popup surface can outlive its output in the snapshot; keep any
+        // panel that is still open so it does not vanish mid-transition.
+        for output in open_outputs {
+            self.anim.set_panel_open(output, true);
+        }
+
+        let metrics = IconMetrics::new(config);
+        for output in snapshot.outputs.values() {
+            let workspace_step = metrics.workspace_step(output);
+            let selected = selection.filter(|selection| selection.output == output.name);
+            // A canvas the selection is not on still centres something useful:
+            // its own active workspace.
+            let mut focal_row = output
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.active || workspace.focused)
+                .unwrap_or(0);
+            for (index, workspace) in output.workspaces.iter().enumerate() {
+                let is_selected =
+                    selected.is_some_and(|selection| selection.workspace_id == workspace.id);
+                let emphasized = is_selected
+                    || self.workspace_hovered(workspace.id)
+                    || workspace.active
+                    || workspace.focused;
+                self.anim.set_workspace_emphasis(workspace.id, emphasized);
+                if is_selected {
+                    focal_row = index;
+                }
+
+                // Which window this row parks on the focal column. For the
+                // selected row that is the selection; for every other row its
+                // own staged-or-active window. Each row keeps its own track, so
+                // becoming selected does not change where the row already sits.
+                let mut focal_slot = selected
+                    .map(|selection| selection.anchor_slot(workspace))
+                    .unwrap_or_else(|| workspace.active_slot());
+                for window in workspace.windows() {
+                    let focused = selected
+                        .and_then(|selection| selection.window_id)
+                        .is_some_and(|id| id == window.id);
+                    self.anim
+                        .set_window_emphasis(window.id, focused || self.window_hovered(window.id));
+                    if is_selected && focused {
+                        focal_slot = workspace.window_slot(window.id).unwrap_or(focal_slot);
+                    }
+                }
+                self.anim
+                    .set_row_scroll(workspace.id, focal_slot.column as f32 * metrics.column_step);
+                self.anim
+                    .set_stack_scroll(workspace.id, focal_slot.row as f32 * metrics.stack_step);
+            }
+            self.anim
+                .set_column_scroll(&output.name, focal_row as f32 * workspace_step);
+        }
+        self.anim.retain_scrolls(
+            |output| snapshot.outputs.contains_key(output),
+            |workspace| snapshot.workspace(workspace).is_some(),
+        );
+        self.anim.tick(Timing::from_config(&config.animation))
     }
 
     pub fn set_popup_cursor_origin(&mut self, output: &str, x: f64, y: f64) {
@@ -178,18 +416,44 @@ impl Renderer {
         None
     }
 
+    /// Render `surface`, returning its pixels, or `None` when there is nothing
+    /// new to present.
+    ///
+    /// A popup layer surface spans its whole output, so a naive implementation
+    /// allocates, clears, and uploads a full-screen buffer every frame for
+    /// every monitor — including monitors showing no popup at all. Both are
+    /// avoided here: the scratch pixmap is reused across frames, and a surface
+    /// that is blank and was already blank last frame is skipped entirely.
     pub fn render(
         &mut self,
         surface: &SurfaceInfo,
         snapshot: &Snapshot,
         config: &Config,
-        popup_visible: bool,
         drag: Option<&DragVisual>,
         selection: Option<&SelectionVisual>,
-    ) -> Vec<u8> {
-        let Some(mut pixmap) = Pixmap::new(surface.width.max(1), surface.height.max(1)) else {
-            return Vec::new();
+    ) -> Option<&[u8]> {
+        let (width, height) = (surface.width.max(1), surface.height.max(1));
+        let progress = match surface.kind {
+            SurfaceKind::Bar(_) => 1.0,
+            SurfaceKind::Popup => self.anim.panel(&surface.output),
         };
+        let blank = progress <= 0.004 && drag.is_none();
+        if blank && !self.blanked.insert(surface.id) {
+            // Already cleared on a previous frame; nothing to upload.
+            return None;
+        }
+        if !blank {
+            self.blanked.remove(&surface.id);
+        }
+
+        let reusable = self
+            .canvas
+            .as_ref()
+            .is_some_and(|pixmap| pixmap.width() == width && pixmap.height() == height);
+        if !reusable {
+            self.canvas = Pixmap::new(width, height);
+        }
+        let mut pixmap = self.canvas.take()?;
         clear(&mut pixmap, Color::TRANSPARENT);
         self.render_surface = Some(surface.id);
         let mut zones = Vec::new();
@@ -203,24 +467,27 @@ impl Renderer {
                     self.render_bar(&mut pixmap, output, bar, config, &mut zones);
                 }
             }
-            SurfaceKind::Popup if popup_visible => {
-                self.render_popup(
-                    &mut pixmap,
-                    &surface.output,
-                    snapshot,
-                    config,
-                    selection,
-                    &mut zones,
-                );
+            SurfaceKind::Popup => {
+                if progress > 0.004 {
+                    self.render_popup_layer(
+                        &mut pixmap,
+                        &surface.output,
+                        snapshot,
+                        config,
+                        selection,
+                        progress,
+                        &mut zones,
+                    );
+                }
             }
-            SurfaceKind::Popup => {}
         }
 
         if let Some(drag) = drag {
             self.render_drag_ghost(&mut pixmap, surface, drag, config);
         }
         self.hit_zones.insert(surface.id, zones);
-        pixmap.take()
+        self.canvas = Some(pixmap);
+        self.canvas.as_ref().map(|pixmap| pixmap.data())
     }
 
     fn render_bar(
@@ -338,7 +605,7 @@ impl Renderer {
                         height: icon_size as f32,
                     }
                 };
-                self.draw_window_icon(pixmap, icon_rect, window, config, false);
+                self.draw_window_icon(pixmap, icon_rect, window, config, 0.0, 1.0);
                 zones.push(HitZone {
                     rect: icon_rect,
                     target: HitTarget::Window {
@@ -374,6 +641,59 @@ impl Renderer {
         }
     }
 
+    /// Draw the popup, applying the open/close transition.
+    ///
+    /// While the transition is running the panel is composed through an
+    /// offscreen layer so it can be scaled and faded as a whole; once it has
+    /// settled it is drawn straight into the surface.
+    #[allow(clippy::too_many_arguments)]
+    fn render_popup_layer(
+        &mut self,
+        pixmap: &mut Pixmap,
+        host_output: &str,
+        snapshot: &Snapshot,
+        config: &Config,
+        selection: Option<&SelectionVisual>,
+        progress: f32,
+        zones: &mut Vec<HitZone>,
+    ) {
+        if progress >= 0.996 {
+            self.render_popup(pixmap, host_output, snapshot, config, selection, zones);
+            return;
+        }
+        let reusable = self
+            .layer
+            .as_ref()
+            .is_some_and(|l| l.width() == pixmap.width() && l.height() == pixmap.height());
+        if !reusable {
+            self.layer = Pixmap::new(pixmap.width(), pixmap.height());
+        }
+        let Some(mut layer) = self.layer.take() else {
+            return;
+        };
+        clear(&mut layer, Color::TRANSPARENT);
+        let panel = self.render_popup(&mut layer, host_output, snapshot, config, selection, zones);
+        let Some(panel) = panel else {
+            self.layer = Some(layer);
+            return;
+        };
+        // Grow into place from slightly small, pivoting on the panel centre.
+        let scale = lerp(config.animation.open_scale, 1.0, progress);
+        let pivot_x = panel.x + panel.width * 0.5;
+        let pivot_y = panel.y + panel.height * 0.5;
+        let transform = Transform::from_translate(pivot_x, pivot_y)
+            .pre_scale(scale, scale)
+            .pre_translate(-pivot_x, -pivot_y);
+        let paint = PixmapPaint {
+            opacity: progress.clamp(0.0, 1.0),
+            quality: FilterQuality::Bilinear,
+            ..PixmapPaint::default()
+        };
+        pixmap.draw_pixmap(0, 0, layer.as_ref(), &paint, transform, None);
+        self.layer = Some(layer);
+    }
+
+    /// Lay out one canvas per output, side by side, and return the panel rect.
     fn render_popup(
         &mut self,
         pixmap: &mut Pixmap,
@@ -382,69 +702,33 @@ impl Renderer {
         config: &Config,
         selection: Option<&SelectionVisual>,
         zones: &mut Vec<HitZone>,
-    ) {
-        if config.popup.outputs == PopupOutputs::Combined {
-            self.render_combined_popup(pixmap, host_output, snapshot, config, selection, zones);
-        } else if let Some(output) = snapshot.outputs.get(host_output) {
-            self.render_single_popup(pixmap, output, config, selection, zones);
+    ) -> Option<Rect> {
+        let outputs = self.popup_outputs(host_output, snapshot, config);
+        if outputs.is_empty() {
+            return None;
         }
-    }
 
-    fn render_combined_popup(
-        &mut self,
-        pixmap: &mut Pixmap,
-        host_output: &str,
-        snapshot: &Snapshot,
-        config: &Config,
-        selection: Option<&SelectionVisual>,
-        zones: &mut Vec<HitZone>,
-    ) {
-        if snapshot.outputs.is_empty() {
-            return;
-        }
-        let outputs = snapshot.outputs.values().collect::<Vec<_>>();
-        let icon_span = config.style.icon_size.max(28) as f32 + 14.0;
-        let section_desired_widths = outputs
-            .iter()
-            .map(|output| {
-                let widest_strip = output
-                    .workspaces
-                    .iter()
-                    .map(|workspace| workspace.columns.len().max(1) as f32 * icon_span)
-                    .fold(0.0, f32::max);
-                (widest_strip + 64.0).max(220.0)
-            })
-            .collect::<Vec<_>>();
-        let max_workspace_count = outputs
-            .iter()
-            .map(|output| output.workspaces.len())
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        let max_stack = outputs
-            .iter()
-            .flat_map(|output| &output.workspaces)
-            .flat_map(|workspace| workspace.columns.values())
-            .map(|windows| windows.len())
-            .max()
-            .unwrap_or(1);
-        let desired_row_height = (max_stack as f32 * 34.0 + 14.0).max(58.0);
-        let padding = 16.0;
-        let output_gap = 8.0;
-        let header_height = 26.0;
-        let desired_panel_width = padding * 2.0
-            + section_desired_widths.iter().sum::<f32>()
-            + output_gap * outputs.len().saturating_sub(1) as f32;
-        let desired_panel_height =
-            padding * 2.0 + header_height + desired_row_height * max_workspace_count as f32;
-        let panel_width = desired_panel_width
+        let padding = config.style.panel_padding;
+        let gap = config.style.canvas_gap;
+        let header = if config.popup.show_labels {
+            config.style.label_font_size + 7.0
+        } else {
+            0.0
+        };
+        let count = outputs.len() as f32;
+        // Canvases keep their configured size; `popup.width`/`height` only cap
+        // how much of the panel can be shown on a small screen.
+        let canvas_width = (config.popup.canvas_width.max(120) as f32)
+            .min((pixmap.width().saturating_sub(64) as f32 / count).max(120.0));
+        let canvas_height = (config.popup.canvas_height.max(90) as f32)
+            .min(pixmap.height().saturating_sub(64) as f32);
+        let panel_width = (padding * 2.0 + canvas_width * count + gap * (count - 1.0))
             .min(config.popup.width as f32)
-            .min(pixmap.width().saturating_sub(24) as f32)
-            .max(360.0);
-        let panel_height = desired_panel_height
+            .min(pixmap.width().saturating_sub(24) as f32);
+        let panel_height = (padding * 2.0 + header + canvas_height)
             .min(config.popup.height as f32)
-            .min(pixmap.height().saturating_sub(24) as f32)
-            .max(180.0);
+            .min(pixmap.height().saturating_sub(24) as f32);
+
         let (mut panel_x, mut panel_y) = match config.popup.position {
             PopupPosition::Center => (
                 (pixmap.width() as f32 - panel_width) * 0.5,
@@ -457,634 +741,301 @@ impl Renderer {
                 .copied()
                 .map(|(x, y)| (x - panel_width * 0.5, y + 18.0))
                 .unwrap_or(((pixmap.width() as f32 - panel_width) * 0.5, 80.0)),
+            PopupPosition::Anchored => {
+                let placement = config.popup.placement(host_output);
+                let free_x = pixmap.width() as f32 - panel_width;
+                let free_y = pixmap.height() as f32 - panel_height;
+                (
+                    match placement.x {
+                        AnchorX::Left => placement.margin,
+                        AnchorX::Center => free_x * 0.5,
+                        AnchorX::Right => free_x - placement.margin,
+                    },
+                    match placement.y {
+                        AnchorY::Top => placement.margin,
+                        AnchorY::Center => free_y * 0.5,
+                        AnchorY::Bottom => free_y - placement.margin,
+                    },
+                )
+            }
         };
         panel_x = panel_x.clamp(12.0, (pixmap.width() as f32 - panel_width - 12.0).max(12.0));
         panel_y = panel_y.clamp(
             12.0,
             (pixmap.height() as f32 - panel_height - 12.0).max(12.0),
         );
+        let panel = Rect {
+            x: panel_x,
+            y: panel_y,
+            width: panel_width,
+            height: panel_height,
+        };
 
-        fill_rounded_rect(
-            pixmap,
-            panel_x + 5.0,
-            panel_y + 7.0,
-            panel_width,
-            panel_height,
-            config.style.radius + 7.0,
-            Color::from_rgba8(0, 0, 0, 82),
-        );
-        fill_rounded_rect(
-            pixmap,
-            panel_x,
-            panel_y,
-            panel_width,
-            panel_height,
-            config.style.radius + 7.0,
-            hex_color(&config.style.background),
-        );
-        stroke_rounded_rect(
-            pixmap,
-            panel_x + 0.5,
-            panel_y + 0.5,
-            panel_width - 1.0,
-            panel_height - 1.0,
-            config.style.radius + 7.0,
-            hex_color(&config.style.border),
-            config.style.border_width,
-        );
+        draw_panel_chrome(pixmap, panel, config);
         zones.push(HitZone {
-            rect: Rect {
-                x: panel_x,
-                y: panel_y,
-                width: panel_width,
-                height: panel_height,
-            },
+            rect: panel,
             target: HitTarget::Panel,
         });
-        let inner_width =
-            panel_width - padding * 2.0 - output_gap * outputs.len().saturating_sub(1) as f32;
-        let desired_sections_total = section_desired_widths.iter().sum::<f32>().max(1.0);
-        let section_scale = (inner_width / desired_sections_total).min(1.0);
-        let section_height = panel_height - padding * 2.0;
-        let row_height = ((section_height - header_height) / max_workspace_count as f32).max(36.0);
-        let mut section_x = panel_x + padding;
 
-        for (output_index, output) in outputs.into_iter().enumerate() {
-            let section_width = if output_index + 1 == section_desired_widths.len() {
-                panel_x + panel_width - padding - section_x
-            } else {
-                section_desired_widths[output_index] * section_scale
-            };
-            let section = Rect {
-                x: section_x,
-                y: panel_y + padding,
-                width: section_width,
-                height: section_height,
-            };
-            fill_rounded_rect(
-                pixmap,
-                section.x,
-                section.y,
-                section.width,
-                section.height,
-                config.style.radius + 2.0,
-                hex_color(&config.style.surface),
-            );
-            stroke_rounded_rect(
-                pixmap,
-                section.x + 0.5,
-                section.y + 0.5,
-                section.width - 1.0,
-                section.height - 1.0,
-                config.style.radius + 2.0,
-                hex_color(&config.style.border_soft),
-                config.style.border_width,
-            );
-            self.text.draw(
-                pixmap,
-                &output.name,
-                section.x + 12.0,
-                section.y + 9.0,
-                11.0,
-                hex_color(&config.style.muted),
-            );
-            let rows_y = section.y + header_height;
-
-            for workspace_index in 0..max_workspace_count {
-                let row = Rect {
-                    x: section.x + 7.0,
-                    y: rows_y + workspace_index as f32 * row_height,
-                    width: section.width - 14.0,
-                    height: row_height,
-                };
-                if workspace_index > 0 {
-                    fill_rect(
-                        pixmap,
-                        row.x,
-                        row.y,
-                        row.width,
-                        1.0,
-                        hex_color(&config.style.border_soft),
-                    );
-                }
-                let Some(workspace) = output.workspaces.get(workspace_index) else {
-                    continue;
-                };
-                let selected = selection.filter(|selection| {
-                    selection.output == output.name && selection.workspace_id == workspace.id
-                });
-                let hovered = self.workspace_hovered(workspace.id);
-                if selected.is_some() || workspace.active || workspace.focused || hovered {
-                    fill_rounded_rect(
-                        pixmap,
-                        row.x + 2.0,
-                        row.y + 3.0,
-                        row.width - 4.0,
-                        row.height - 6.0,
-                        config.style.radius,
-                        if selected.is_some() || hovered {
-                            hex_color(&config.style.surface_hover)
-                        } else {
-                            hex_color(&config.style.surface)
-                        },
-                    );
-                }
-                if selected.is_some() || hovered {
-                    stroke_rounded_rect(
-                        pixmap,
-                        row.x + 2.5,
-                        row.y + 3.5,
-                        row.width - 5.0,
-                        row.height - 7.0,
-                        config.style.radius,
-                        hex_color(&config.style.selection_border),
-                        1.0,
-                    );
-                }
-                zones.push(HitZone {
-                    rect: row,
-                    target: HitTarget::Workspace {
-                        workspace_id: workspace.id,
-                        column_count: workspace.columns.len(),
-                    },
-                });
-
-                let label = workspace.label();
+        for (index, output) in outputs.iter().enumerate() {
+            let origin_x = panel_x + padding + index as f32 * (canvas_width + gap);
+            let origin_y = panel_y + padding + header;
+            if index > 0 {
+                fill_rect(
+                    pixmap,
+                    (origin_x - gap * 0.5).round(),
+                    origin_y + 6.0,
+                    1.0,
+                    (canvas_height - 12.0).max(0.0),
+                    hex_color(&config.style.border_soft),
+                );
+            }
+            if config.popup.show_labels {
                 self.text.draw(
                     pixmap,
-                    &label,
-                    row.x + 9.0,
-                    row.y + (row.height - 11.0) * 0.5,
-                    11.0,
-                    if selected.is_some() || workspace.active || workspace.focused {
-                        hex_color(&config.style.text)
-                    } else {
-                        hex_color(&config.style.muted)
-                    },
-                );
-                fill_rounded_rect(
-                    pixmap,
-                    row.x + 1.5,
-                    row.y + 10.0,
-                    if workspace.active || workspace.focused {
-                        3.0
-                    } else {
-                        1.0
-                    },
-                    (row.height - 20.0).max(8.0),
-                    1.0,
-                    if workspace.urgent {
-                        hex_color(&config.style.urgent)
-                    } else if workspace.active || workspace.focused {
-                        hex_color(&config.style.accent)
-                    } else {
-                        hex_color(&config.style.border_soft)
-                    },
-                );
-
-                let canvas = Rect {
-                    x: row.x + 40.0,
-                    y: row.y + 5.0,
-                    width: row.width - 47.0,
-                    height: row.height - 10.0,
-                };
-                zones.push(HitZone {
-                    rect: canvas,
-                    target: HitTarget::Canvas {
-                        output: output.name.clone(),
-                        workspace_id: workspace.id,
-                        rect: canvas,
-                    },
-                });
-                self.draw_workspace_strip_windows(
-                    pixmap,
-                    output,
-                    workspace,
-                    canvas,
-                    config,
-                    selected.and_then(|selection| selection.window_id),
-                    zones,
+                    &output.name,
+                    origin_x + 4.0,
+                    panel_y + padding,
+                    config.style.label_font_size,
+                    hex_color(&config.style.muted),
                 );
             }
-            section_x += section_width + output_gap;
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn draw_workspace_strip_windows(
-        &mut self,
-        pixmap: &mut Pixmap,
-        output: &OutputModel,
-        workspace: &WorkspaceModel,
-        canvas: Rect,
-        config: &Config,
-        selected_window: Option<u64>,
-        zones: &mut Vec<HitZone>,
-    ) {
-        let max_icon = config.style.icon_size.max(28) as f32;
-        let column_count = workspace.columns.len().max(1);
-        let column_step = ((canvas.width - 8.0) / column_count as f32)
-            .min(max_icon + 18.0)
-            .max(20.0);
-        let mut column_x = canvas.x + 4.0;
-
-        for windows in workspace.columns.values() {
-            let row_count = windows.len().max(1);
-            let row_gap = 3.0;
-            let size = max_icon
-                .min(
-                    (canvas.height - row_gap * row_count.saturating_sub(1) as f32)
-                        / row_count as f32,
-                )
-                .min(column_step - 5.0)
-                .max(14.0);
-            let stack_height =
-                size * row_count as f32 + row_gap * row_count.saturating_sub(1) as f32;
-            let mut window_y = canvas.y + (canvas.height - stack_height) * 0.5;
-            for window in windows.values() {
-                let rect = Rect {
-                    x: column_x + (column_step - size) * 0.5,
-                    y: window_y,
-                    width: size,
-                    height: size,
-                };
-                self.draw_window_icon(
-                    pixmap,
-                    rect,
-                    window,
-                    config,
-                    selected_window == Some(window.id),
-                );
-                zones.push(HitZone {
-                    rect,
-                    target: HitTarget::Window {
-                        output: output.name.clone(),
-                        workspace_id: workspace.id,
-                        window_id: window.id,
-                        column: window.column,
-                        floating: false,
-                        rect,
-                        canvas: Some(canvas),
-                    },
-                });
-                window_y += size + row_gap;
-            }
-            column_x += column_step;
-        }
-
-        for window in &workspace.floating {
-            let center_x = window.x.unwrap_or(output.width as f64 * 0.5) + window.tile_width * 0.5;
-            let center_y =
-                window.y.unwrap_or(output.height as f64 * 0.5) + window.tile_height * 0.5;
-            let normalized_x = center_x / output.width.max(1) as f64;
-            let normalized_y = center_y / output.height.max(1) as f64;
-            let size = max_icon.min(canvas.height * 0.7).max(18.0);
-            let rect = Rect {
-                x: (canvas.x + normalized_x as f32 * canvas.width - size * 0.5)
-                    .clamp(canvas.x, canvas.x + canvas.width - size),
-                y: (canvas.y + normalized_y as f32 * canvas.height - size * 0.5)
-                    .clamp(canvas.y, canvas.y + canvas.height - size),
-                width: size,
-                height: size,
-            };
-            fill_circle(
+            self.draw_output_canvas(
                 pixmap,
-                rect.x + rect.width * 0.5,
-                rect.y + rect.height * 0.5,
-                rect.width * 0.53,
-                Color::from_rgba8(20, 24, 29, 210),
-            );
-            self.draw_window_icon(
-                pixmap,
-                rect,
-                window,
-                config,
-                selected_window == Some(window.id),
-            );
-            zones.push(HitZone {
-                rect,
-                target: HitTarget::Window {
-                    output: output.name.clone(),
-                    workspace_id: workspace.id,
-                    window_id: window.id,
-                    column: None,
-                    floating: true,
-                    rect,
-                    canvas: Some(canvas),
+                output,
+                Rect {
+                    x: origin_x,
+                    y: origin_y,
+                    width: canvas_width,
+                    height: canvas_height,
                 },
-            });
+                config,
+                selection,
+                zones,
+            );
+        }
+        Some(panel)
+    }
+
+    /// Outputs shown in the popup: every monitor in combined mode, otherwise
+    /// just the one hosting the surface.
+    fn popup_outputs<'a>(
+        &self,
+        host_output: &str,
+        snapshot: &'a Snapshot,
+        config: &Config,
+    ) -> Vec<&'a OutputModel> {
+        if config.popup.outputs == PopupOutputs::Combined {
+            snapshot.outputs.values().collect()
+        } else {
+            snapshot.outputs.get(host_output).into_iter().collect()
         }
     }
 
-    fn render_single_popup(
+    /// Draw one monitor's cross into `canvas`.
+    ///
+    /// The focal point is fixed at the centre of the canvas: workspaces run
+    /// vertically through it and the selected workspace's windows run
+    /// horizontally through it. Changing the selection scrolls the content
+    /// rather than moving a cursor, so the eye never has to track the
+    /// selection across the panel.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_output_canvas(
         &mut self,
         pixmap: &mut Pixmap,
         output: &OutputModel,
+        canvas: Rect,
         config: &Config,
         selection: Option<&SelectionVisual>,
         zones: &mut Vec<HitZone>,
     ) {
-        let panel_width = config
-            .popup
-            .width
-            .min(pixmap.width().saturating_sub(24))
-            .max(240) as f32;
-        let panel_height = config
-            .popup
-            .height
-            .min(pixmap.height().saturating_sub(24))
-            .max(160) as f32;
-        let (mut panel_x, mut panel_y) = match config.popup.position {
-            PopupPosition::Center => (
-                (pixmap.width() as f32 - panel_width) * 0.5,
-                (pixmap.height() as f32 - panel_height) * 0.5,
-            ),
-            PopupPosition::Fixed => (config.popup.fixed_x as f32, config.popup.fixed_y as f32),
-            PopupPosition::Cursor => self
-                .popup_origins
-                .get(&output.name)
-                .copied()
-                .map(|(x, y)| (x - panel_width * 0.5, y + 18.0))
-                .unwrap_or(((pixmap.width() as f32 - panel_width) * 0.5, 80.0)),
-        };
-        panel_x = panel_x.clamp(12.0, (pixmap.width() as f32 - panel_width - 12.0).max(12.0));
-        panel_y = panel_y.clamp(
-            12.0,
-            (pixmap.height() as f32 - panel_height - 12.0).max(12.0),
-        );
-
-        fill_rounded_rect(
-            pixmap,
-            panel_x + 7.0,
-            panel_y + 9.0,
-            panel_width,
-            panel_height,
-            config.style.radius + 8.0,
-            Color::from_rgba8(0, 0, 0, 90),
-        );
-        fill_rounded_rect(
-            pixmap,
-            panel_x,
-            panel_y,
-            panel_width,
-            panel_height,
-            config.style.radius + 8.0,
-            hex_color(&config.style.background),
-        );
-        stroke_rounded_rect(
-            pixmap,
-            panel_x,
-            panel_y,
-            panel_width,
-            panel_height,
-            config.style.radius + 8.0,
-            hex_color(&config.style.border),
-            config.style.border_width,
-        );
-        zones.push(HitZone {
-            rect: Rect {
-                x: panel_x,
-                y: panel_y,
-                width: panel_width,
-                height: panel_height,
-            },
-            target: HitTarget::Panel,
-        });
-
-        let padding = 16.0;
-        let gap = config.style.gap.max(8.0);
-        let count = output.workspaces.len().max(1);
-        let card_width = ((panel_width - padding * 2.0 - gap * count.saturating_sub(1) as f32)
-            / count as f32)
-            .max(76.0);
-        let card_height = panel_height - 24.0;
-        let rail_y = panel_y + 47.0;
-        let rail_start = panel_x + padding + card_width * 0.5;
-        let rail_end = rail_start + (count.saturating_sub(1)) as f32 * (card_width + gap);
-        fill_rect(
-            pixmap,
-            rail_start,
-            rail_y,
-            (rail_end - rail_start).max(0.0),
-            1.0,
-            hex_color(&config.style.border_soft),
-        );
+        let metrics = IconMetrics::new(config);
+        let focal_x = canvas.x + canvas.width * 0.5;
+        let focal_y = canvas.y + canvas.height * 0.5;
+        let scroll_y = self.anim.column_scroll(&output.name);
+        let workspace_step = metrics.workspace_step(output);
 
         for (index, workspace) in output.workspaces.iter().enumerate() {
-            let selected = selection.filter(|selection| {
-                selection.output == output.name && selection.workspace_id == workspace.id
-            });
-            let rect = Rect {
-                x: panel_x + padding + index as f32 * (card_width + gap),
-                y: panel_y + 12.0,
-                width: card_width,
-                height: card_height,
+            let row_y = focal_y + index as f32 * workspace_step - scroll_y;
+            if row_y < canvas.y - workspace_step
+                || row_y > canvas.y + canvas.height + workspace_step
+            {
+                continue;
+            }
+            let emphasis = self.anim.workspace(workspace.id);
+            let row = Rect {
+                x: canvas.x,
+                y: row_y - workspace_step * 0.5,
+                width: canvas.width,
+                height: workspace_step,
             };
-            self.draw_popup_workspace_background(
-                pixmap,
-                rect,
-                workspace,
-                config,
-                selected.is_some(),
-            );
             zones.push(HitZone {
-                rect,
+                rect: clamp_rect(row, canvas),
                 target: HitTarget::Workspace {
                     workspace_id: workspace.id,
                     column_count: workspace.columns.len(),
                 },
             });
-
-            let label = workspace.label();
-            let label_width = self.text.measure(&label, 13.0);
-            self.text.draw(
-                pixmap,
-                &label,
-                rect.x + (rect.width - label_width) * 0.5,
-                panel_y + 18.0,
-                13.0,
-                if selected.is_some() || workspace.active || workspace.focused {
-                    hex_color(&config.style.text)
-                } else {
-                    hex_color(&config.style.muted)
-                },
-            );
-            let node_x = rect.x + rect.width * 0.5;
-            if selected.is_some() {
-                fill_circle(
-                    pixmap,
-                    node_x,
-                    rail_y + 0.5,
-                    9.0,
-                    hex_color(&config.style.surface_hover),
-                );
-            }
-            fill_circle(
-                pixmap,
-                node_x,
-                rail_y + 0.5,
-                if workspace.active || workspace.focused {
-                    5.5
-                } else {
-                    3.5
-                },
-                if workspace.urgent {
-                    hex_color(&config.style.urgent)
-                } else if selected.is_some() || workspace.active || workspace.focused {
-                    hex_color(&config.style.accent)
-                } else {
-                    hex_color(&config.style.muted)
-                },
-            );
-            let canvas = Rect {
-                x: rect.x + 8.0,
-                y: rail_y + 15.0,
-                width: rect.width - 16.0,
-                height: (rect.y + rect.height - rail_y - 24.0).max(24.0),
-            };
             zones.push(HitZone {
-                rect: canvas,
+                rect: clamp_rect(row, canvas),
                 target: HitTarget::Canvas {
                     output: output.name.clone(),
                     workspace_id: workspace.id,
                     rect: canvas,
                 },
             });
-            self.draw_workspace_windows(
+
+            // Every row reads its own animated offset, selected or not, so the
+            // focal column always reads as "what you get if you go here".
+            let offset = self.anim.row_scroll(workspace.id);
+            let stack_offset = self.anim.stack_scroll(workspace.id);
+            self.draw_canvas_row(
                 pixmap,
                 output,
                 workspace,
                 canvas,
+                focal_x - offset,
+                row_y - stack_offset,
+                emphasis,
                 config,
-                selected.and_then(|selection| selection.window_id),
+                selection,
+                zones,
+            );
+        }
+    }
+
+    /// One workspace's windows, laid out rightward from `start_x`.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_canvas_row(
+        &mut self,
+        pixmap: &mut Pixmap,
+        output: &OutputModel,
+        workspace: &WorkspaceModel,
+        canvas: Rect,
+        start_x: f32,
+        row_y: f32,
+        emphasis: f32,
+        config: &Config,
+        selection: Option<&SelectionVisual>,
+        zones: &mut Vec<HitZone>,
+    ) {
+        let metrics = IconMetrics::new(config);
+        let selected_window = selection
+            .filter(|selection| selection.output == output.name)
+            .and_then(|selection| selection.window_id);
+        let base_alpha = lerp(config.style.dim_alpha.clamp(0.0, 1.0), 1.0, emphasis);
+
+        if workspace.windows().next().is_none() {
+            // An empty workspace still occupies a rung on the vertical axis.
+            let mut dot = hex_color(&config.style.border_soft);
+            dot.set_alpha(dot.alpha() * base_alpha);
+            fill_circle(pixmap, start_x, row_y, config.style.empty_dot_radius, dot);
+            return;
+        }
+
+        for (column, windows) in workspace.columns.values().enumerate() {
+            let center_x = start_x + column as f32 * metrics.column_step;
+            for (stack_row, window) in windows.values().enumerate() {
+                let center_y = row_y + stack_row as f32 * metrics.stack_step;
+                self.draw_canvas_window(
+                    pixmap,
+                    output,
+                    workspace,
+                    window,
+                    canvas,
+                    center_x,
+                    center_y,
+                    base_alpha,
+                    selected_window,
+                    metrics,
+                    config,
+                    zones,
+                );
+            }
+        }
+
+        let floating_start = workspace.columns.len();
+        for (index, window) in workspace.floating.iter().enumerate() {
+            self.draw_canvas_window(
+                pixmap,
+                output,
+                workspace,
+                window,
+                canvas,
+                start_x + (floating_start + index) as f32 * metrics.column_step,
+                row_y,
+                base_alpha,
+                selected_window,
+                metrics,
+                config,
                 zones,
             );
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_workspace_windows(
+    fn draw_canvas_window(
         &mut self,
         pixmap: &mut Pixmap,
         output: &OutputModel,
         workspace: &WorkspaceModel,
+        window: &WindowModel,
         canvas: Rect,
-        config: &Config,
+        center_x: f32,
+        center_y: f32,
+        base_alpha: f32,
         selected_window: Option<u64>,
+        metrics: IconMetrics,
+        config: &Config,
         zones: &mut Vec<HitZone>,
     ) {
-        let column_widths = workspace
-            .columns
-            .values()
-            .map(|windows| {
-                windows
-                    .values()
-                    .next()
-                    .map(|window| window.tile_width.max(1.0) as f32)
-                    .unwrap_or(1.0)
-            })
-            .collect::<Vec<_>>();
-        let total_width = column_widths.iter().sum::<f32>().max(1.0);
-        let mut column_x = canvas.x;
-        for (column_index, (_column, windows)) in workspace.columns.iter().enumerate() {
-            let column_width = canvas.width * column_widths[column_index] / total_width;
-            let row_heights = windows
-                .values()
-                .map(|window| window.tile_height.max(1.0) as f32)
-                .collect::<Vec<_>>();
-            let total_height = row_heights.iter().sum::<f32>().max(1.0);
-            let mut row_y = canvas.y;
-            for (row_index, window) in windows.values().enumerate() {
-                let row_height = canvas.height * row_heights[row_index] / total_height;
-                let max_icon = config.style.icon_size.max(34) as f32;
-                let size = max_icon
-                    .min(column_width - 5.0)
-                    .min(row_height - 5.0)
-                    .max(14.0);
-                let rect = Rect {
-                    x: column_x + (column_width - size) * 0.5,
-                    y: row_y + (row_height - size) * 0.5,
-                    width: size,
-                    height: size,
-                };
-                self.draw_window_icon(
-                    pixmap,
-                    rect,
-                    window,
-                    config,
-                    selected_window == Some(window.id),
-                );
-                zones.push(HitZone {
-                    rect,
-                    target: HitTarget::Window {
-                        output: output.name.clone(),
-                        workspace_id: workspace.id,
-                        window_id: window.id,
-                        column: window.column,
-                        floating: false,
-                        rect,
-                        canvas: Some(canvas),
-                    },
-                });
-                if config.popup.show_titles {
-                    let title = truncate_label(&window.title, 12);
-                    self.text.draw(
-                        pixmap,
-                        &title,
-                        rect.x,
-                        (rect.y + rect.height + 2.0).min(canvas.y + canvas.height - 10.0),
-                        9.0,
-                        hex_color(&config.style.muted),
-                    );
-                }
-                row_y += row_height;
-            }
-            column_x += column_width;
+        let focus = self.anim.window(window.id);
+        let size = lerp(metrics.base, metrics.focused, focus);
+        let rect = Rect {
+            x: center_x - size * 0.5,
+            y: center_y - size * 0.5,
+            width: size,
+            height: size,
+        };
+        // Fade rather than clip at the canvas edge, so a partially visible
+        // icon reads as "more this way" instead of a cut-off box.
+        let alpha =
+            base_alpha * edge_fade(rect, canvas, metrics.column_step.max(metrics.stack_step));
+        if alpha <= 0.01 {
+            return;
         }
-
-        for window in &workspace.floating {
-            let center_x = window.x.unwrap_or(output.width as f64 * 0.5) + window.tile_width * 0.5;
-            let center_y =
-                window.y.unwrap_or(output.height as f64 * 0.5) + window.tile_height * 0.5;
-            let normalized_x = center_x / output.width.max(1) as f64;
-            let normalized_y = center_y / output.height.max(1) as f64;
-            let size = (config.style.icon_size as f32 + 12.0)
-                .min(canvas.width * 0.3)
-                .max(18.0);
-            let rect = Rect {
-                x: (canvas.x + normalized_x as f32 * canvas.width - size * 0.5)
-                    .clamp(canvas.x, canvas.x + canvas.width - size),
-                y: (canvas.y + normalized_y as f32 * canvas.height - size * 0.5)
-                    .clamp(canvas.y, canvas.y + canvas.height - size),
-                width: size,
-                height: size,
-            };
-            fill_circle(
-                pixmap,
-                rect.x + rect.width * 0.5,
-                rect.y + rect.height * 0.5,
-                rect.width * 0.52,
-                Color::from_rgba8(20, 24, 29, 210),
-            );
-            self.draw_window_icon(
-                pixmap,
-                rect,
-                window,
-                config,
-                selected_window == Some(window.id),
-            );
+        if window.floating {
+            self.draw_floating_backing(pixmap, rect, config, alpha);
+        }
+        self.draw_window_icon(pixmap, rect, window, config, focus, alpha);
+        if rect_within(rect, canvas) {
             zones.push(HitZone {
                 rect,
                 target: HitTarget::Window {
                     output: output.name.clone(),
                     workspace_id: workspace.id,
                     window_id: window.id,
-                    column: None,
-                    floating: true,
+                    column: window.column,
+                    floating: window.floating,
                     rect,
                     canvas: Some(canvas),
                 },
             });
+        }
+        if config.popup.show_titles && selected_window == Some(window.id) {
+            let title = truncate_label(&window.title, 18);
+            let size = config.style.title_font_size;
+            let width = self.text.measure(&title, size);
+            let mut color = hex_color(&config.style.text);
+            color.set_alpha(color.alpha() * focus);
+            self.text.draw(
+                pixmap,
+                &title,
+                center_x - width * 0.5,
+                (rect.y + rect.height + 4.0).min(canvas.y + canvas.height - size - 1.0),
+                size,
+                color,
+            );
         }
     }
 
@@ -1149,95 +1100,44 @@ impl Renderer {
         }
     }
 
-    fn draw_popup_workspace_background(
+    /// Dark disc behind a floating window icon so it stays readable over the
+    /// panel gradient.
+    fn draw_floating_backing(
         &mut self,
         pixmap: &mut Pixmap,
         rect: Rect,
-        workspace: &WorkspaceModel,
         config: &Config,
-        selected: bool,
+        alpha: f32,
     ) {
-        let hovered = self.workspace_hovered(workspace.id);
-        fill_rounded_rect(
+        let mut color = hex_color(&config.style.floating_backing);
+        color.set_alpha(color.alpha() * alpha.clamp(0.0, 1.0));
+        fill_circle(
             pixmap,
-            rect.x,
-            rect.y,
-            rect.width,
-            rect.height,
-            config.style.radius + 2.0,
-            if selected || hovered {
-                hex_color(&config.style.surface_hover)
-            } else if workspace.active || workspace.focused {
-                hex_color(&config.style.surface)
-            } else {
-                Color::TRANSPARENT
-            },
+            rect.x + rect.width * 0.5,
+            rect.y + rect.height * 0.5,
+            rect.width * 0.56,
+            color,
         );
-
-        if selected || hovered || workspace.urgent {
-            stroke_rounded_rect(
-                pixmap,
-                rect.x + 0.5,
-                rect.y + 0.5,
-                rect.width - 1.0,
-                rect.height - 1.0,
-                config.style.radius + 2.0,
-                if workspace.urgent {
-                    hex_color(&config.style.urgent)
-                } else {
-                    hex_color(&config.style.selection_border)
-                },
-                1.0,
-            );
-        }
-
-        if workspace.active || workspace.focused || workspace.urgent {
-            fill_rounded_rect(
-                pixmap,
-                rect.x + 12.0,
-                rect.y + rect.height - 4.0,
-                (rect.width - 24.0).max(10.0),
-                2.5,
-                1.25,
-                if workspace.urgent {
-                    hex_color(&config.style.urgent)
-                } else {
-                    hex_color(&config.style.accent)
-                },
-            );
-        }
     }
 
+    /// Draw an app icon at `rect`, dimmed to `alpha`.
+    ///
+    /// Selection is conveyed by the fixed focal position, scale, and opacity.
     fn draw_window_icon(
         &mut self,
         pixmap: &mut Pixmap,
         rect: Rect,
         window: &WindowModel,
         config: &Config,
-        selected: bool,
+        emphasis: f32,
+        alpha: f32,
     ) {
-        let hovered = self.window_hovered(window.id);
-        if selected {
-            fill_rounded_rect(
-                pixmap,
-                rect.x - 3.0,
-                rect.y - 3.0,
-                rect.width + 6.0,
-                rect.height + 6.0,
-                config.style.radius,
-                hex_color(&config.style.surface_hover),
-            );
-            stroke_rounded_rect(
-                pixmap,
-                rect.x - 2.5,
-                rect.y - 2.5,
-                rect.width + 5.0,
-                rect.height + 5.0,
-                config.style.radius,
-                hex_color(&config.style.selection_border),
-                1.0,
-            );
-        } else if window.urgent {
+        // No halo: the selected icon is already the one sitting on the focal
+        // point and drawn larger, so a glow only adds noise around it.
+        let emphasis = emphasis.clamp(0.0, 1.0);
+        // Urgency keeps a hard ring: it must survive dimming and read as an
+        // alarm rather than as emphasis.
+        if window.urgent {
             stroke_rounded_rect(
                 pixmap,
                 rect.x - 2.0,
@@ -1248,29 +1148,11 @@ impl Renderer {
                 hex_color(&config.style.urgent),
                 1.25,
             );
-        } else if hovered {
-            fill_rounded_rect(
-                pixmap,
-                rect.x - 2.0,
-                rect.y - 2.0,
-                rect.width + 4.0,
-                rect.height + 4.0,
-                config.style.radius,
-                hex_color(&config.style.surface_hover),
-            );
-            stroke_rounded_rect(
-                pixmap,
-                rect.x - 1.5,
-                rect.y - 1.5,
-                rect.width + 3.0,
-                rect.height + 3.0,
-                config.style.radius,
-                hex_color(&config.style.selection_border),
-                1.0,
-            );
         }
+        // Emphasis lifts an icon back to full opacity as it eases into focus.
+        let alpha = lerp(alpha.clamp(0.0, 1.0), 1.0, emphasis);
         if let Some((width, height, pixels)) = self.icons.get(&window.app_id) {
-            blit_icon(
+            blit_icon_alpha(
                 pixmap,
                 rect.x.round() as i32,
                 rect.y.round() as i32,
@@ -1278,16 +1160,19 @@ impl Renderer {
                 pixels,
                 *width,
                 *height,
+                alpha,
             );
         } else {
+            let mut plate = hex_color(&config.style.border);
+            plate.set_alpha(plate.alpha() * alpha);
             fill_rounded_rect(
                 pixmap,
                 rect.x,
                 rect.y,
                 rect.width,
                 rect.height,
-                5.0,
-                hex_color(&config.style.border),
+                rect.width * 0.22,
+                plate,
             );
             let fallback = window
                 .app_id
@@ -1296,13 +1181,17 @@ impl Renderer {
                 .unwrap_or('?')
                 .to_uppercase()
                 .to_string();
+            let mut text_color = hex_color(&config.style.text);
+            text_color.set_alpha(text_color.alpha() * alpha);
+            let font_size = rect.height * 0.55;
+            let text_width = self.text.measure(&fallback, font_size);
             self.text.draw(
                 pixmap,
                 &fallback,
-                rect.x + rect.width * 0.28,
-                rect.y + rect.height * 0.17,
-                rect.height * 0.55,
-                hex_color(&config.style.text),
+                rect.x + (rect.width - text_width) * 0.5,
+                rect.y + rect.height * 0.2,
+                font_size,
+                text_color,
             );
         }
     }
@@ -1336,8 +1225,8 @@ impl Renderer {
             rect.y - 5.0,
             rect.width + 10.0,
             rect.height + 10.0,
-            9.0,
-            Color::from_rgba8(10, 12, 15, 210),
+            config.style.radius,
+            hex_color(&config.style.floating_backing),
         );
         let ghost_window = WindowModel {
             id: drag.window_id,
@@ -1353,7 +1242,7 @@ impl Renderer {
             x: None,
             y: None,
         };
-        self.draw_window_icon(pixmap, rect, &ghost_window, config, false);
+        self.draw_window_icon(pixmap, rect, &ghost_window, config, 0.0, 1.0);
     }
 }
 

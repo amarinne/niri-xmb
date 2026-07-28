@@ -1,0 +1,17 @@
+# Derived from the "noctalia" alacritty theme
+# (~/.config/alacritty/themes/noctalia.toml), a cool teal dark scheme. Only
+# colours are set here; layout and sizing are left to the built-in defaults.
+[style]
+background = "#f2182022"       # lightened lift of the terminal background
+background_end = "#f20e1415"   # terminal background itself
+surface = "#660f2a30"          # dark teal panel tint
+surface_hover = "#4082d3e1"    # teal at a light hover alpha
+border = "#5c82d3e1"           # teal at low alpha
+border_soft = "#2a82d3e1"      # teal fainter still
+accent = "#ff82d3e1"           # teal, the theme's most saturated highlight
+selection_border = "#9082d3e1" # teal at a stronger alpha
+text = "#ffdee3e5"             # foreground
+muted = "#ffb1cbd0"            # dimmer cyan/foreground blend
+urgent = "#ffffb4ab"           # normal red
+shadow = "#4e000000"
+floating_backing = "#be0a0f10" # near-black tinted toward the background

@@ -266,18 +266,35 @@ impl SurfaceManager {
     }
 
     pub fn show_popups(&mut self, outputs: &[String]) -> Result<()> {
+        self.show_popups_with(outputs, true)
+    }
+
+    /// Show the popup on `outputs`.
+    ///
+    /// With `interactive` false the surface takes neither pointer nor keyboard
+    /// input: that is what makes the peek overlay a passive readout, letting
+    /// the compositor keybinds the user is pressing continue to reach Niri and
+    /// clicks pass through to whatever is underneath.
+    pub fn show_popups_with(&mut self, outputs: &[String], interactive: bool) -> Result<()> {
         for surface in &mut self.state.surfaces {
             if surface.kind != SurfaceKind::Popup {
                 continue;
             }
             let show = outputs.iter().any(|output| output == &surface.output);
             surface.visible = show;
-            set_input_region(&self.queue.handle(), &self.state.compositor, surface, show);
-            surface.layer_surface.set_keyboard_interactivity(if show {
-                KeyboardInteractivity::Exclusive
-            } else {
-                KeyboardInteractivity::None
-            });
+            set_input_region(
+                &self.queue.handle(),
+                &self.state.compositor,
+                surface,
+                show && interactive,
+            );
+            surface
+                .layer_surface
+                .set_keyboard_interactivity(if show && interactive {
+                    KeyboardInteractivity::Exclusive
+                } else {
+                    KeyboardInteractivity::None
+                });
             surface.layer_surface.commit();
         }
         self.queue.roundtrip(&mut self.state)?;

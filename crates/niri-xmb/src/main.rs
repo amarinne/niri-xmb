@@ -1,3 +1,4 @@
+mod anim;
 mod config;
 mod ipc;
 mod model;
@@ -10,7 +11,7 @@ mod icons;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use config::{BarConfig, Config, PopupOutputs, PopupPosition, PopupSurfaceMode};
+use config::{BarConfig, Config, NavigationMode, PopupOutputs, PopupPosition, PopupSurfaceMode};
 use crossbeam_channel::unbounded;
 use ipc::{ControlCommand, ControlRequest};
 use model::Snapshot;
@@ -18,10 +19,32 @@ use niri::{NiriCommand, spawn as spawn_niri};
 use niri_ipc::socket::Socket;
 use niri_ipc::{Request, Response};
 use render::{DragVisual, HitTarget, Renderer, SelectionVisual};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use wayland::{SurfaceKind, SurfaceManager, UiEvent, UiEventKind};
+
+/// How long after niri-xmb moves focus itself that the resulting snapshot is
+/// treated as our own echo rather than as external navigation.
+const SELF_FOCUS_GRACE: Duration = Duration::from_millis(400);
+
+/// How long focus must hold still before deciding whether to raise the overlay.
+///
+/// One user action reaches us as several events — a monitor change activates a
+/// workspace and then focuses a window inside it; closing a window reports the
+/// focus change before the removal. Judging each event as it arrives therefore
+/// misreads half of them. Waiting for the burst to settle costs an
+/// imperceptible delay on an overlay that then lingers for a second or more.
+const FOCUS_SETTLE: Duration = Duration::from_millis(120);
+
+/// How long a window counts as newly appeared.
+///
+/// Focus landing on a window this young is that window starting up and taking
+/// focus, not the user navigating to it. A settle window alone is not enough:
+/// an app can map its surface and only claim focus a second later, well after
+/// any fixed grace period, and the focus event on its own is indistinguishable
+/// from navigation unless the window's age is known.
+const NEW_WINDOW_GRACE: Duration = Duration::from_millis(1200);
 
 const BTN_LEFT: u32 = 272;
 const KEY_ESCAPE: u32 = 0xff1b;
@@ -85,6 +108,16 @@ enum Command {
     PrintDefaultConfig,
 }
 
+/// Why the popup is currently on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupMode {
+    Hidden,
+    /// Opened by the user; takes input and stages a selection.
+    Manual,
+    /// Opened by itself to mirror Niri navigation; takes no input.
+    Peek,
+}
+
 #[derive(Debug, Clone)]
 struct PressState {
     window_id: u64,
@@ -101,6 +134,37 @@ struct Selection {
     output: String,
     workspace: usize,
     window: usize,
+    /// Where the cursor was left in each workspace, keyed by workspace id.
+    ///
+    /// The popup is a staging area, not a live view: navigating away from a
+    /// workspace and back must return to where you were, not to whatever Niri
+    /// is focusing right now. Discarded when the popup closes or a move is
+    /// confirmed, so a fresh popup always starts from live state.
+    visited: HashMap<u64, usize>,
+}
+
+impl Selection {
+    /// Record the current position so returning to this workspace restores it.
+    fn remember(&mut self, snapshot: &Snapshot) {
+        if let Some(workspace) = selected_workspace(self, snapshot) {
+            self.visited.insert(workspace, self.window);
+        }
+    }
+
+    /// Where to land when entering `workspace`: the remembered position if
+    /// this popup session has one, otherwise the window Niri would focus.
+    fn entry_index(&self, workspace: &model::WorkspaceModel) -> usize {
+        let count = workspace.windows().count();
+        match self.visited.get(&workspace.id) {
+            Some(&remembered) if remembered < count => remembered,
+            _ => workspace.active_index(),
+        }
+    }
+
+    /// End the staging session. The next popup starts from live state again.
+    fn clear_session(&mut self) {
+        self.visited.clear();
+    }
 }
 
 fn main() -> Result<()> {
@@ -286,6 +350,18 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut follow_candidate: Option<(String, Instant)> = None;
     let mut press: Option<PressState> = None;
     let mut selection = Selection::default();
+    let mut popup_was_open = false;
+    let mut popup_mode = PopupMode::Hidden;
+    let mut peek_deadline: Option<Instant> = None;
+    // Focus changes we caused ourselves must not bounce back as a peek.
+    let mut peek_suppressed_until = Instant::now();
+    let mut window_first_seen: HashMap<u64, Instant> = HashMap::new();
+    // Focus state as last observed, versus as last acted on. The gap between
+    // them is the burst of events still settling.
+    let mut observed: Option<FocusMark> = None;
+    let mut acted_focus: Option<FocusMark> = None;
+    let mut acted_windows: Option<HashSet<u64>> = None;
+    let mut pending_focus_since: Option<Instant> = None;
     let mut running = true;
     let mut dirty = true;
     let mut last_redraw = Instant::now() - Duration::from_secs(1);
@@ -308,16 +384,110 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         while let Ok(next) = snapshot_rx.try_recv() {
             snapshot = next;
             normalize_selection(&mut selection, &snapshot);
+            let now = Instant::now();
+            let windows = live_window_ids(&snapshot);
+            for id in &windows {
+                window_first_seen.entry(*id).or_insert(now);
+            }
+            window_first_seen.retain(|id, _| windows.contains(id));
+
+            // Re-syncing the panel to live state is safe to do immediately.
+            // The manual panel always mirrors complete live focus, including
+            // left/right and stacked-window changes. Peek granularity is a
+            // separate concern handled after the event burst settles.
+            let signature = focus_signature(&snapshot, true);
+            let changed = observed
+                .replace(signature)
+                .is_some_and(|previous| previous != *observed.as_ref().unwrap());
+            if changed {
+                if Instant::now() >= peek_suppressed_until {
+                    // Whatever the popup is showing, it now shows where Niri
+                    // actually is. Peek and the interactive panel behave as one
+                    // thing here: an external move re-syncs both, so the panel
+                    // never sits on a stale workspace while Niri has moved on.
+                    selection.clear_session();
+                    reset_selection(&mut selection, &snapshot);
+                }
+                // Whether to *raise* an overlay is decided only once focus has
+                // settled. Niri reports one user action as a burst of events in
+                // an order that cannot be relied on — closing a window emits
+                // the focus change before the window removal, so judging each
+                // event as it arrives mistakes the fallback focus for
+                // navigation. Waiting for the burst to finish and then
+                // comparing against the last state we acted on removes the
+                // whole class of ordering bug.
+                pending_focus_since = Some(now);
+            }
+            dirty = true;
+        }
+
+        if let Some(since) = pending_focus_since {
+            let now = Instant::now();
+            if now.duration_since(since) >= FOCUS_SETTLE {
+                pending_focus_since = None;
+                let signature = focus_signature(&snapshot, config.peek.on_window_focus);
+                let windows = live_window_ids(&snapshot);
+                let movement = acted_focus
+                    .as_ref()
+                    .map(|previous| classify_focus_move(previous, &signature))
+                    .unwrap_or(FocusMove::None);
+                // A window appearing or disappearing moves focus without the
+                // user navigating anywhere.
+                let lifecycle = acted_windows
+                    .as_ref()
+                    .is_some_and(|previous| *previous != windows);
+                // A slow-starting app can map its surface and only claim focus
+                // a second later, long after the burst settled, so window age
+                // is checked separately from the lifecycle comparison.
+                let focused_is_new = snapshot
+                    .focused_window
+                    .and_then(|id| window_first_seen.get(&id))
+                    .is_some_and(|seen| now.duration_since(*seen) < NEW_WINDOW_GRACE);
+
+                if movement == FocusMove::WithinOutput
+                    && !lifecycle
+                    && !focused_is_new
+                    && now >= peek_suppressed_until
+                {
+                    peek_deadline = trigger_peek(
+                        &mut surfaces,
+                        &snapshot,
+                        &config,
+                        &mut popup_outputs,
+                        &mut popup_mode,
+                        &mut selection,
+                        peek_suppressed_until,
+                    )?;
+                    dirty = true;
+                }
+                acted_focus = Some(signature);
+                acted_windows = Some(windows);
+            }
+        }
+        // Guarded on Peek: a manual session must never inherit this expiry.
+        // The overview opening counts as an expiry, so an overlay already up
+        // gets out of the way immediately.
+        if popup_mode == PopupMode::Peek
+            && (snapshot.overview_open
+                || peek_deadline.is_some_and(|deadline| Instant::now() >= deadline))
+        {
+            surfaces.hide_all_popups()?;
+            popup_outputs.clear();
+            popup_mode = PopupMode::Hidden;
+            peek_deadline = None;
             dirty = true;
         }
 
         while let Ok(request) = control_rx.try_recv() {
             let response = match request.command {
                 ControlCommand::Show => {
-                    if popup_outputs.is_empty() {
+                    if popup_mode != PopupMode::Manual {
                         popup_origin_focus = snapshot.focused_window;
                     }
-                    show_popup(&mut surfaces, &snapshot, &config, &mut popup_outputs)?;
+                    show_popup(&mut surfaces, &snapshot, &config, &mut popup_outputs, true)?;
+                    popup_mode = PopupMode::Manual;
+                    // Taking control cancels the peek countdown.
+                    peek_deadline = None;
                     follow_candidate = None;
                     reset_selection(&mut selection, &snapshot);
                     dirty = true;
@@ -326,6 +496,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 ControlCommand::Hide => {
                     surfaces.hide_all_popups()?;
                     popup_outputs.clear();
+                    popup_mode = PopupMode::Hidden;
                     popup_origin_focus = None;
                     follow_candidate = None;
                     press = None;
@@ -333,17 +504,22 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     "ok\n".into()
                 }
                 ControlCommand::Toggle => {
-                    if popup_outputs.is_empty() {
-                        popup_origin_focus = snapshot.focused_window;
-                        show_popup(&mut surfaces, &snapshot, &config, &mut popup_outputs)?;
-                        follow_candidate = None;
-                        reset_selection(&mut selection, &snapshot);
-                    } else {
+                    // A peek overlay is promoted rather than dismissed: the
+                    // keybind means "let me drive this", not "hide it".
+                    if popup_mode == PopupMode::Manual {
                         surfaces.hide_all_popups()?;
                         popup_outputs.clear();
+                        popup_mode = PopupMode::Hidden;
                         popup_origin_focus = None;
                         follow_candidate = None;
                         press = None;
+                    } else {
+                        popup_origin_focus = snapshot.focused_window;
+                        show_popup(&mut surfaces, &snapshot, &config, &mut popup_outputs, true)?;
+                        popup_mode = PopupMode::Manual;
+                        peek_deadline = None;
+                        follow_candidate = None;
+                        reset_selection(&mut selection, &snapshot);
                     }
                     dirty = true;
                     "ok\n".into()
@@ -351,6 +527,18 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 ControlCommand::Status => {
                     serde_json::json!({
                         "visible": !popup_outputs.is_empty(),
+                        "mode": match popup_mode {
+                            PopupMode::Hidden => "hidden",
+                            PopupMode::Manual => "manual",
+                            PopupMode::Peek => "peek",
+                        },
+                        "selection": selection_visual(&selection, &snapshot).map(|visual| {
+                            serde_json::json!({
+                                "output": visual.output,
+                                "workspace_id": visual.workspace_id,
+                                "window_id": visual.window_id,
+                            })
+                        }),
                         "outputs": popup_outputs,
                         "generation": snapshot.generation,
                         "socket": ipc::socket_path(),
@@ -497,18 +685,48 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 popup_origin_focus,
                 &mut press,
                 &mut selection,
+                &mut peek_suppressed_until,
             )?;
         }
 
-        dirty |= update_following_popup(
-            &mut surfaces,
+        // Only the manual popup uses the delayed follow. A peek overlay is
+        // re-placed on the focused output the moment focus moves, and routing
+        // it through here would re-show it as an input-grabbing surface.
+        if popup_mode == PopupMode::Manual {
+            dirty |= update_following_popup(
+                &mut surfaces,
+                &snapshot,
+                &config,
+                &mut popup_outputs,
+                press.is_some(),
+                &mut follow_candidate,
+                &mut selection,
+            )?;
+        }
+
+        // Catch every way the popup can close — Escape, outside click, a
+        // confirmed pick, IPC — in one place, and end the staging session.
+        let popup_open = !popup_outputs.is_empty();
+        if popup_was_open && !popup_open {
+            selection.clear_session();
+            popup_mode = PopupMode::Hidden;
+            peek_deadline = None;
+            // Confirming a pick moves Niri's focus, which would otherwise come
+            // straight back as a peek for the move just made.
+            peek_suppressed_until = Instant::now() + SELF_FOCUS_GRACE;
+        }
+        popup_was_open = popup_open;
+
+        // Animation targets are recomputed every iteration, not only on
+        // redraw, so a settled UI stops requesting frames entirely.
+        let selection_visual = selection_visual(&selection, &snapshot);
+        let animating = renderer.update_animations(
             &snapshot,
             &config,
-            &mut popup_outputs,
-            press.is_some(),
-            &mut follow_candidate,
-            &mut selection,
-        )?;
+            selection_visual.as_ref(),
+            &popup_outputs,
+        );
+        dirty |= animating;
 
         if dirty || last_redraw.elapsed() >= Duration::from_millis(250) {
             let surface_infos = surfaces.surfaces();
@@ -521,26 +739,28 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     global_x: press.current_x,
                     global_y: press.current_y,
                 });
-            let selection_visual = selection_visual(&selection, &snapshot);
             for surface in &surface_infos {
                 if !surface.configured {
                     continue;
                 }
-                let visible = popup_outputs.contains(&surface.output);
-                let pixels = renderer.render(
+                // `None` means the surface is blank and already was: skip the
+                // full-screen upload entirely.
+                if let Some(pixels) = renderer.render(
                     surface,
                     &snapshot,
                     &config,
-                    visible,
                     drag.as_ref(),
                     selection_visual.as_ref(),
-                );
-                surfaces.present(surface.id, &pixels)?;
+                ) {
+                    surfaces.present(surface.id, pixels)?;
+                }
             }
             dirty = false;
             last_redraw = Instant::now();
         }
-        std::thread::sleep(Duration::from_millis(8));
+        // Poll tighter while animating so the easing is not quantised by the
+        // loop period, and back off when idle.
+        std::thread::sleep(Duration::from_millis(if animating { 3 } else { 8 }));
     }
 
     let result = surfaces.hide_all_popups();
@@ -565,13 +785,95 @@ fn wait_for_snapshot(receiver: &crossbeam_channel::Receiver<Snapshot>) -> Option
     receiver.recv_timeout(Duration::from_secs(2)).ok()
 }
 
-fn show_popup(
+/// Ids of every window currently mapped, across all outputs.
+fn live_window_ids(snapshot: &Snapshot) -> HashSet<u64> {
+    snapshot
+        .outputs
+        .values()
+        .flat_map(|output| &output.workspaces)
+        .flat_map(|workspace| workspace.windows())
+        .map(|window| window.id)
+        .collect()
+}
+
+/// Where Niri's focus currently is, at the granularity peek cares about.
+type FocusMark = (Option<String>, Option<u64>, Option<u64>);
+
+/// What kind of focus movement a new snapshot represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusMove {
+    None,
+    /// Navigation inside one monitor: a workspace or window change.
+    WithinOutput,
+    /// Focus landed on a different monitor.
+    AcrossOutputs,
+}
+
+fn classify_focus_move(previous: &FocusMark, current: &FocusMark) -> FocusMove {
+    if previous == current {
+        FocusMove::None
+    } else if previous.0 != current.0 {
+        FocusMove::AcrossOutputs
+    } else {
+        FocusMove::WithinOutput
+    }
+}
+
+fn focus_signature(snapshot: &Snapshot, include_window: bool) -> FocusMark {
+    let output = snapshot.focused_output().map(str::to_string);
+    let workspace = snapshot
+        .outputs
+        .values()
+        .flat_map(|output| &output.workspaces)
+        .find(|workspace| workspace.focused)
+        .map(|workspace| workspace.id);
+    let window = include_window.then_some(snapshot.focused_window).flatten();
+    (output, workspace, window)
+}
+
+/// Whether a focus change should be ignored rather than raising a peek overlay.
+///
+/// Peek stays out of the way of anything that already covers the same ground:
+/// a session the user is driving, and Niri's own full-screen overview.
+fn peek_should_skip(config: &Config, snapshot: &Snapshot, mode: PopupMode) -> bool {
+    !config.peek.enabled || mode == PopupMode::Manual || snapshot.overview_open
+}
+
+/// Raise (or extend) the passive peek overlay after Niri focus moved.
+///
+/// Returns the new expiry, or `None` when peek should not be showing. A manual
+/// popup always wins: peek never steals a session the user is driving.
+#[allow(clippy::too_many_arguments)]
+fn trigger_peek(
     surfaces: &mut SurfaceManager,
     snapshot: &Snapshot,
     config: &Config,
     visible: &mut HashSet<String>,
-) -> Result<()> {
-    let outputs = match (config.popup.outputs, config.popup.surface_mode) {
+    mode: &mut PopupMode,
+    selection: &mut Selection,
+    suppressed_until: Instant,
+) -> Result<Option<Instant>> {
+    if peek_should_skip(config, snapshot, *mode) || Instant::now() < suppressed_until {
+        return Ok(None);
+    }
+    // Showing a surface costs a blocking Wayland roundtrip, so while already
+    // peeking only re-show when focus actually moved to a different monitor.
+    let targets = popup_output_targets(snapshot, config);
+    let same_outputs =
+        targets.len() == visible.len() && targets.iter().all(|output| visible.contains(output));
+    if *mode == PopupMode::Hidden || !same_outputs {
+        show_popup(surfaces, snapshot, config, visible, false)?;
+        *mode = PopupMode::Peek;
+    }
+    reset_selection(selection, snapshot);
+    Ok(Some(
+        Instant::now() + Duration::from_millis(config.peek.duration_ms.max(1)),
+    ))
+}
+
+/// Outputs the popup should occupy for the current focus and configuration.
+fn popup_output_targets(snapshot: &Snapshot, config: &Config) -> Vec<String> {
+    match (config.popup.outputs, config.popup.surface_mode) {
         (PopupOutputs::All, _) | (_, PopupSurfaceMode::Mirror) => {
             snapshot.outputs.keys().cloned().collect::<Vec<_>>()
         }
@@ -586,8 +888,18 @@ fn show_popup(
                     .map(|output| vec![output.clone()])
             })
             .unwrap_or_default(),
-    };
-    surfaces.show_popups(&outputs)?;
+    }
+}
+
+fn show_popup(
+    surfaces: &mut SurfaceManager,
+    snapshot: &Snapshot,
+    config: &Config,
+    visible: &mut HashSet<String>,
+    interactive: bool,
+) -> Result<()> {
+    let outputs = popup_output_targets(snapshot, config);
+    surfaces.show_popups_with(&outputs, interactive)?;
     visible.clear();
     visible.extend(outputs);
     Ok(())
@@ -658,6 +970,7 @@ fn handle_ui_event(
     popup_origin_focus: Option<u64>,
     press: &mut Option<PressState>,
     selection: &mut Selection,
+    suppress_peek: &mut Instant,
 ) -> Result<bool> {
     if matches!(event.kind, SurfaceKind::Popup)
         && config.popup.position == PopupPosition::Cursor
@@ -756,6 +1069,7 @@ fn handle_ui_event(
                 }
             } else {
                 let _ = niri_tx.send(NiriCommand::FocusWindow(released.window_id));
+                *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
                 if matches!(event.kind, SurfaceKind::Popup) && config.behavior.close_on_window_click
                 {
                     surfaces.hide_all_popups()?;
@@ -772,12 +1086,30 @@ fn handle_ui_event(
                         popup_outputs.clear();
                     }
                 }
-                KEY_LEFT => move_selection(selection, snapshot, 0, -1),
-                KEY_RIGHT => move_selection(selection, snapshot, 0, 1),
-                KEY_UP => move_selection(selection, snapshot, -1, 0),
-                KEY_DOWN => move_selection(selection, snapshot, 1, 0),
-                KEY_TAB => move_output_selection(selection, snapshot, 1),
-                KEY_SHIFT_TAB => move_output_selection(selection, snapshot, -1),
+                KEY_LEFT => {
+                    move_selection(selection, snapshot, 0, -1);
+                    follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+                }
+                KEY_RIGHT => {
+                    move_selection(selection, snapshot, 0, 1);
+                    follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+                }
+                KEY_UP => {
+                    move_selection(selection, snapshot, -1, 0);
+                    follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+                }
+                KEY_DOWN => {
+                    move_selection(selection, snapshot, 1, 0);
+                    follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+                }
+                KEY_TAB => {
+                    move_output_selection(selection, snapshot, 1);
+                    follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+                }
+                KEY_SHIFT_TAB => {
+                    move_output_selection(selection, snapshot, -1);
+                    follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+                }
                 KEY_RETURN => {
                     let close = if let Some(window_id) = selected_window(selection, snapshot) {
                         let _ = niri_tx.send(NiriCommand::FocusWindow(window_id));
@@ -788,6 +1120,10 @@ fn handle_ui_event(
                     } else {
                         false
                     };
+                    // The queued move is resolved either way; a popup left open
+                    // after confirming should track live state again.
+                    selection.clear_session();
+                    *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
                     if close {
                         surfaces.hide_all_popups()?;
                         popup_outputs.clear();
@@ -814,6 +1150,7 @@ fn handle_ui_event(
                 }
             } else {
                 move_selection(selection, snapshot, if dy > 0.0 { 1 } else { -1 }, 0);
+                follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
             }
             Ok(true)
         }
@@ -1134,6 +1471,8 @@ fn normalize_selection(selection: &mut Selection, snapshot: &Snapshot) {
 }
 
 fn reset_selection(selection: &mut Selection, snapshot: &Snapshot) {
+    // Opening the popup starts a fresh session against live state.
+    selection.clear_session();
     selection.output = snapshot
         .focused_output()
         .or_else(|| snapshot.outputs.keys().next().map(String::as_str))
@@ -1159,10 +1498,13 @@ fn select_active_workspace(selection: &mut Selection, snapshot: &Snapshot) {
                 .position(|workspace| workspace.active)
         })
         .unwrap_or(0);
+    // Land on the window Niri would focus, not on the first one. `focused` is
+    // only ever set for the globally focused window, so searching for it would
+    // fall back to index 0 on every other workspace.
     selection.window = output
         .workspaces
         .get(selection.workspace)
-        .and_then(|workspace| workspace.windows().position(|window| window.focused))
+        .map(|workspace| selection.entry_index(workspace))
         .unwrap_or(0);
 }
 
@@ -1190,12 +1532,21 @@ fn move_selection(
         return;
     };
     if workspace_delta != 0 && !output.workspaces.is_empty() {
+        // Leaving a workspace stores the cursor so coming back restores it.
+        selection.remember(snapshot);
         selection.workspace = wrap_index(
             selection.workspace,
             workspace_delta,
             output.workspaces.len(),
         );
-        selection.window = 0;
+        // Arrive on the entry window. The popup parks that window on the focal
+        // column, so moving between workspaces travels straight up or down
+        // instead of also sliding the row sideways.
+        selection.window = output
+            .workspaces
+            .get(selection.workspace)
+            .map(|workspace| selection.entry_index(workspace))
+            .unwrap_or(0);
     }
     if window_delta != 0 {
         let count = output
@@ -1205,8 +1556,34 @@ fn move_selection(
             .unwrap_or(0);
         if count > 0 {
             selection.window = wrap_index(selection.window, window_delta, count);
+            selection.remember(snapshot);
         }
     }
+}
+
+/// In live mode, apply the selection to Niri as soon as it moves.
+///
+/// In deferred mode this does nothing: the move stays queued in the popup
+/// until Enter or a click confirms it.
+fn follow_selection(
+    config: &Config,
+    selection: &Selection,
+    snapshot: &Snapshot,
+    niri_tx: &crossbeam_channel::Sender<NiriCommand>,
+    suppress_peek: &mut Instant,
+) {
+    if config.behavior.navigation != NavigationMode::Live {
+        return;
+    }
+    if let Some(window_id) = selected_window(selection, snapshot) {
+        let _ = niri_tx.send(NiriCommand::FocusWindow(window_id));
+    } else if let Some(workspace_id) = selected_workspace(selection, snapshot) {
+        // An empty workspace has nothing to focus, but is still reachable.
+        let _ = niri_tx.send(NiriCommand::FocusWorkspace(workspace_id));
+    } else {
+        return;
+    }
+    *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
 }
 
 fn wrap_index(current: usize, delta: i32, length: usize) -> usize {
@@ -1238,6 +1615,9 @@ fn selection_visual(selection: &Selection, snapshot: &Snapshot) -> Option<Select
         output: selection.output.clone(),
         workspace_id: selected_workspace(selection, snapshot)?,
         window_id: selected_window(selection, snapshot),
+        // The renderer parks these on the focal column. They must match where
+        // navigation will actually land, or arriving on a row makes it slide.
+        anchors: selection.visited.clone(),
     })
 }
 
@@ -1304,5 +1684,384 @@ mod tests {
         assert_eq!(adjust_same_workspace_index(3, Some(4), true), 3);
         assert_eq!(adjust_same_workspace_index(3, Some(1), false), 3);
         assert_eq!(adjust_same_workspace_index(1, Some(1), true), 1);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crate::model::{OutputModel, Snapshot, WindowModel, WorkspaceModel};
+    use std::collections::BTreeMap;
+
+    fn window(id: u64, column: usize) -> WindowModel {
+        WindowModel {
+            id,
+            workspace_id: 0,
+            app_id: "app".into(),
+            title: String::new(),
+            focused: false,
+            urgent: false,
+            floating: false,
+            column: Some(column),
+            tile_width: 100.0,
+            tile_height: 100.0,
+            x: None,
+            y: None,
+        }
+    }
+
+    /// `active` is the index of the window Niri would focus on this workspace.
+    fn workspace(id: u64, count: usize, active: usize) -> WorkspaceModel {
+        let mut columns: BTreeMap<usize, BTreeMap<usize, WindowModel>> = BTreeMap::new();
+        for index in 0..count {
+            columns
+                .entry(index)
+                .or_default()
+                .insert(0, window(id * 100 + index as u64, index));
+        }
+        WorkspaceModel {
+            id,
+            index: id as u8,
+            name: None,
+            active: id == 1,
+            focused: id == 1,
+            urgent: false,
+            active_window: Some(id * 100 + active as u64),
+            columns,
+            floating: Vec::new(),
+        }
+    }
+
+    fn snapshot() -> Snapshot {
+        let mut outputs = BTreeMap::new();
+        outputs.insert(
+            "DP-1".to_string(),
+            OutputModel {
+                name: "DP-1".into(),
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                // Each workspace's active window sits at a different index.
+                workspaces: vec![workspace(1, 4, 2), workspace(2, 3, 1), workspace(3, 5, 4)],
+            },
+        );
+        Snapshot {
+            outputs,
+            focused_window: None,
+            overview_open: false,
+            generation: 1,
+        }
+    }
+
+    /// A peek overlay would only duplicate Niri's own overview, so navigation
+    /// while the overview is open must not raise one.
+    #[test]
+    fn peek_is_suppressed_while_the_overview_is_open() {
+        let mut config = Config::default();
+        config.peek.enabled = true;
+        let mut snapshot = snapshot();
+        snapshot.overview_open = true;
+
+        assert!(
+            peek_should_skip(&config, &snapshot, PopupMode::Hidden),
+            "overview open must suppress peek"
+        );
+        snapshot.overview_open = false;
+        assert!(
+            !peek_should_skip(&config, &snapshot, PopupMode::Hidden),
+            "with the overview closed peek should be allowed"
+        );
+    }
+
+    #[test]
+    fn peek_never_takes_over_a_manual_session() {
+        let mut config = Config::default();
+        config.peek.enabled = true;
+        let snapshot = snapshot();
+        assert!(
+            peek_should_skip(&config, &snapshot, PopupMode::Manual),
+            "a session the user is driving must win"
+        );
+    }
+
+    /// The pointer crossing a monitor edge changes the focused output. That is
+    /// not navigation the user asked to see a panel for.
+    #[test]
+    fn crossing_to_another_monitor_is_not_within_output_navigation() {
+        let a: FocusMark = (Some("DP-1".into()), Some(1), Some(100));
+        let b: FocusMark = (Some("DP-2".into()), Some(4), Some(400));
+        assert_eq!(classify_focus_move(&a, &b), FocusMove::AcrossOutputs);
+        assert_eq!(classify_focus_move(&b, &a), FocusMove::AcrossOutputs);
+    }
+
+    #[test]
+    fn workspace_and_window_changes_are_within_output_navigation() {
+        let base: FocusMark = (Some("DP-1".into()), Some(1), Some(100));
+        let other_workspace: FocusMark = (Some("DP-1".into()), Some(2), Some(200));
+        let other_window: FocusMark = (Some("DP-1".into()), Some(1), Some(101));
+        assert_eq!(
+            classify_focus_move(&base, &other_workspace),
+            FocusMove::WithinOutput
+        );
+        assert_eq!(
+            classify_focus_move(&base, &other_window),
+            FocusMove::WithinOutput
+        );
+    }
+
+    #[test]
+    fn an_unchanged_signature_is_not_a_move() {
+        let a: FocusMark = (Some("DP-1".into()), Some(1), Some(100));
+        assert_eq!(classify_focus_move(&a, &a.clone()), FocusMove::None);
+    }
+
+    /// A file picker or dialog appearing takes focus without the user
+    /// navigating, so the window set changing must be detectable.
+    #[test]
+    fn a_window_opening_or_closing_changes_the_live_window_set() {
+        let snapshot = snapshot();
+        let before = live_window_ids(&snapshot);
+        assert!(!before.is_empty());
+
+        // A dialog appears on the focused workspace.
+        let mut opened = snapshot.clone();
+        let workspace = &mut opened.outputs.get_mut("DP-1").unwrap().workspaces[0];
+        workspace
+            .columns
+            .entry(99)
+            .or_default()
+            .insert(0, window(9999, 99));
+        let after_open = live_window_ids(&opened);
+        assert_ne!(before, after_open);
+        assert!(after_open.contains(&9999));
+
+        // ...and closing one is likewise visible.
+        let mut closed = snapshot.clone();
+        closed.outputs.get_mut("DP-1").unwrap().workspaces[0]
+            .columns
+            .remove(&0);
+        assert_ne!(before, live_window_ids(&closed));
+    }
+
+    #[test]
+    fn an_unchanged_window_set_compares_equal() {
+        let snapshot = snapshot();
+        assert_eq!(
+            live_window_ids(&snapshot),
+            live_window_ids(&snapshot.clone())
+        );
+    }
+
+    #[test]
+    fn peek_is_off_unless_enabled() {
+        let config = Config::default();
+        let snapshot = snapshot();
+        assert!(!config.peek.enabled, "peek must default to off");
+        assert!(peek_should_skip(&config, &snapshot, PopupMode::Hidden));
+    }
+
+    #[test]
+    fn moving_between_workspaces_lands_on_the_active_window() {
+        let snapshot = snapshot();
+        let mut selection = Selection {
+            output: "DP-1".into(),
+            workspace: 0,
+            window: 2,
+            ..Selection::default()
+        };
+        move_selection(&mut selection, &snapshot, 1, 0);
+        assert_eq!((selection.workspace, selection.window), (1, 1));
+        move_selection(&mut selection, &snapshot, 1, 0);
+        assert_eq!((selection.workspace, selection.window), (2, 4));
+        // Wrapping back round must not reset to the first window either.
+        move_selection(&mut selection, &snapshot, 1, 0);
+        assert_eq!((selection.workspace, selection.window), (0, 2));
+    }
+
+    /// The renderer parks each row's anchor on the focal column, so vertical
+    /// movement must land exactly on that anchor. If the two ever disagree the
+    /// row visibly slides sideways on arrival.
+    #[test]
+    fn vertical_movement_does_not_scroll_the_row_sideways() {
+        let snapshot = snapshot();
+        let output = &snapshot.outputs["DP-1"];
+        let mut selection = Selection {
+            output: "DP-1".into(),
+            workspace: 0,
+            window: 0,
+            ..Selection::default()
+        };
+        // Twice around, so the second lap exercises remembered positions.
+        for _ in 0..output.workspaces.len() * 2 {
+            let before = selection_visual(&selection, &snapshot).expect("a selection");
+            move_selection(&mut selection, &snapshot, 1, 0);
+            let arrived = &output.workspaces[selection.workspace];
+            assert_eq!(
+                selection.window,
+                before.anchor(arrived),
+                "selection must arrive on the column the row was already parked at"
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_the_active_workspace_uses_its_active_window() {
+        let snapshot = snapshot();
+        let mut selection = Selection {
+            output: "DP-1".into(),
+            workspace: 0,
+            window: 0,
+            ..Selection::default()
+        };
+        select_active_workspace(&mut selection, &snapshot);
+        assert_eq!((selection.workspace, selection.window), (0, 2));
+    }
+
+    #[test]
+    fn navigating_away_and_back_returns_to_where_you_were() {
+        let snapshot = snapshot();
+        let mut selection = Selection {
+            output: "DP-1".into(),
+            workspace: 0,
+            window: 0,
+            ..Selection::default()
+        };
+        // Walk to the third window of workspace 0, which is not its active one.
+        move_selection(&mut selection, &snapshot, 0, 1);
+        move_selection(&mut selection, &snapshot, 0, 1);
+        assert_eq!(selection.window, 2);
+
+        move_selection(&mut selection, &snapshot, 1, 0);
+        assert_eq!((selection.workspace, selection.window), (1, 1));
+        move_selection(&mut selection, &snapshot, -1, 0);
+        assert_eq!(
+            (selection.workspace, selection.window),
+            (0, 2),
+            "must restore the staged position, not snap to the live active window"
+        );
+    }
+
+    #[test]
+    fn a_new_session_starts_from_live_state_again() {
+        let snapshot = snapshot();
+        let mut selection = Selection {
+            output: "DP-1".into(),
+            workspace: 0,
+            window: 0,
+            ..Selection::default()
+        };
+        move_selection(&mut selection, &snapshot, 0, 1);
+        assert_eq!(selection.window, 1);
+        assert!(!selection.visited.is_empty());
+
+        // Closing the popup ends the session.
+        selection.clear_session();
+        reset_selection(&mut selection, &snapshot);
+        assert_eq!(
+            (selection.workspace, selection.window),
+            (0, 2),
+            "workspace 0's active window index"
+        );
+    }
+
+    #[test]
+    fn a_remembered_index_past_the_end_falls_back_to_the_active_window() {
+        let snapshot = snapshot();
+        let workspace = &snapshot.outputs["DP-1"].workspaces[1];
+        let mut selection = Selection {
+            output: "DP-1".into(),
+            workspace: 1,
+            window: 0,
+            ..Selection::default()
+        };
+        // Stale entry from before windows closed on that workspace.
+        selection.visited.insert(workspace.id, 99);
+        assert_eq!(selection.entry_index(workspace), workspace.active_index());
+    }
+
+    #[test]
+    fn focus_signature_tracks_workspace_and_window() {
+        let mut snapshot = snapshot();
+        let base = focus_signature(&snapshot, true);
+
+        // Focusing a different window is a move when windows are included.
+        snapshot.focused_window = Some(101);
+        let moved = focus_signature(&snapshot, true);
+        assert_ne!(base, moved);
+
+        // ...and is not, when peek only cares about workspaces.
+        assert_eq!(
+            focus_signature(&snapshot, false),
+            focus_signature(
+                &{
+                    let mut other = snapshot.clone();
+                    other.focused_window = Some(102);
+                    other
+                },
+                false
+            ),
+            "window-level changes must be invisible in workspace-only mode"
+        );
+    }
+
+    #[test]
+    fn focus_signature_notices_a_workspace_change() {
+        let mut snapshot = snapshot();
+        let before = focus_signature(&snapshot, false);
+        let workspaces = &mut snapshot.outputs.get_mut("DP-1").unwrap().workspaces;
+        workspaces[0].focused = false;
+        workspaces[1].focused = true;
+        assert_ne!(before, focus_signature(&snapshot, false));
+    }
+
+    #[test]
+    fn horizontal_movement_still_walks_one_window_at_a_time() {
+        let snapshot = snapshot();
+        let mut selection = Selection {
+            output: "DP-1".into(),
+            workspace: 1,
+            window: 1,
+            ..Selection::default()
+        };
+        move_selection(&mut selection, &snapshot, 0, 1);
+        assert_eq!((selection.workspace, selection.window), (1, 2));
+        move_selection(&mut selection, &snapshot, 0, 1);
+        assert_eq!((selection.workspace, selection.window), (1, 0), "wraps");
+    }
+
+    #[test]
+    fn stacked_windows_keep_their_column_and_row_slots() {
+        let mut workspace = workspace(9, 0, 0);
+        workspace.columns.clear();
+        workspace
+            .columns
+            .entry(4)
+            .or_default()
+            .insert(2, window(901, 4));
+        workspace
+            .columns
+            .entry(4)
+            .or_default()
+            .insert(7, window(902, 4));
+        workspace
+            .columns
+            .entry(8)
+            .or_default()
+            .insert(1, window(903, 8));
+
+        assert_eq!(
+            workspace.window_slot(901),
+            Some(crate::model::WindowSlot { column: 0, row: 0 })
+        );
+        assert_eq!(
+            workspace.window_slot(902),
+            Some(crate::model::WindowSlot { column: 0, row: 1 })
+        );
+        assert_eq!(
+            workspace.window_slot(903),
+            Some(crate::model::WindowSlot { column: 1, row: 0 })
+        );
+        assert_eq!(workspace.max_stack(), 2);
     }
 }

@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, HashMap};
 pub struct Snapshot {
     pub outputs: BTreeMap<String, OutputModel>,
     pub focused_window: Option<u64>,
+    /// Whether Niri's own overview is on screen.
+    pub overview_open: bool,
     pub generation: u64,
 }
 
@@ -50,8 +52,21 @@ pub struct WorkspaceModel {
     pub active: bool,
     pub focused: bool,
     pub urgent: bool,
+    /// Window Niri would focus when this workspace is activated.
+    pub active_window: Option<u64>,
     pub columns: BTreeMap<usize, BTreeMap<usize, WindowModel>>,
     pub floating: Vec<WindowModel>,
+}
+
+/// Visual position of a window inside the XMB canvas.
+///
+/// Niri columns run horizontally. Windows joined into the same column use the
+/// same `column` and differ by `row`, so the renderer can preserve the real
+/// tiling topology instead of flattening every window into one ribbon.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowSlot {
+    pub column: usize,
+    pub row: usize,
 }
 
 impl WorkspaceModel {
@@ -60,6 +75,58 @@ impl WorkspaceModel {
             .values()
             .flat_map(|column| column.values())
             .chain(self.floating.iter())
+    }
+
+    /// Position of [`WorkspaceModel::active_window`] within [`WorkspaceModel::windows`].
+    ///
+    /// The popup parks this window on the focal point, so the focal column
+    /// always shows what activating the workspace would land on.
+    pub fn active_index(&self) -> usize {
+        self.active_window
+            .and_then(|active| self.windows().position(|window| window.id == active))
+            .unwrap_or(0)
+    }
+
+    /// Visual column/row occupied by the window at flattened selection
+    /// `index`. Floating windows each receive their own column after the tiled
+    /// columns.
+    pub fn window_slot_at(&self, index: usize) -> Option<WindowSlot> {
+        let mut current = 0;
+        for (column, rows) in self.columns.values().enumerate() {
+            for row in 0..rows.len() {
+                if current == index {
+                    return Some(WindowSlot { column, row });
+                }
+                current += 1;
+            }
+        }
+        self.floating
+            .get(index.checked_sub(current)?)
+            .map(|_| WindowSlot {
+                column: self.columns.len() + index - current,
+                row: 0,
+            })
+    }
+
+    pub fn window_slot(&self, id: u64) -> Option<WindowSlot> {
+        self.windows()
+            .position(|window| window.id == id)
+            .and_then(|index| self.window_slot_at(index))
+    }
+
+    pub fn active_slot(&self) -> WindowSlot {
+        self.active_window
+            .and_then(|id| self.window_slot(id))
+            .unwrap_or_default()
+    }
+
+    pub fn max_stack(&self) -> usize {
+        self.columns
+            .values()
+            .map(BTreeMap::len)
+            .max()
+            .unwrap_or(1)
+            .max(1)
     }
 
     pub fn label(&self) -> String {
@@ -88,6 +155,7 @@ pub struct NiriState {
     outputs: HashMap<String, Output>,
     workspaces: HashMap<u64, Workspace>,
     windows: HashMap<u64, Window>,
+    overview_open: bool,
     generation: u64,
 }
 
@@ -170,6 +238,13 @@ impl NiriState {
         self.generation += 1;
     }
 
+    pub fn set_overview_open(&mut self, open: bool) {
+        if self.overview_open != open {
+            self.overview_open = open;
+            self.generation += 1;
+        }
+    }
+
     pub fn set_focused_window(&mut self, id: Option<u64>) {
         for window in self.windows.values_mut() {
             window.is_focused = Some(window.id) == id;
@@ -228,6 +303,7 @@ impl NiriState {
                 active: workspace.is_active,
                 focused: workspace.is_focused,
                 urgent: workspace.is_urgent,
+                active_window: workspace.active_window_id,
                 columns: BTreeMap::new(),
                 floating: Vec::new(),
             };
@@ -285,6 +361,7 @@ impl NiriState {
         Snapshot {
             outputs,
             focused_window,
+            overview_open: self.overview_open,
             generation: self.generation,
         }
     }
