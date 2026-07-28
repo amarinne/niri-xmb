@@ -56,6 +56,9 @@ navigation, and a passive workspace-change peek overlay.
   fixed coordinates, and per-output margins. Numeric values remain logical
   pixels and percentages resolve against each host output.
 - `print-default-config` now emits the fully commented maintained template.
+- Added `niri-xmb restart`: validate config/theme first, leave a running daemon
+  untouched on validation errors, then gracefully stop, relaunch through Niri,
+  and verify the replacement control socket.
 
 ## Relevant files
 
@@ -79,7 +82,7 @@ navigation, and a passive workspace-change peek overlay.
 Verified on 2026-07-28:
 
 - `cargo fmt --all`
-- `cargo test --workspace` — 43 passed
+- `cargo test --workspace` — 44 passed
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo build --release -p niri-xmb`
 - `git diff --check`

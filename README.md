@@ -231,6 +231,18 @@ Print the complete commented configuration template with:
 niri-xmb print-default-config
 ```
 
+After editing the config or theme, apply it with:
+
+```bash
+niri-xmb restart
+```
+
+`restart` parses the config and referenced theme before touching the running
+daemon. Invalid changes return an error and leave the existing daemon alive.
+After successful validation it gracefully stops the daemon, asks Niri to
+relaunch the same executable and config path, and waits for the control socket
+to become healthy before returning.
+
 ## Run and bind in Niri
 
 For a quick foreground test:

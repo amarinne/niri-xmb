@@ -21,6 +21,7 @@ use niri_ipc::{Request, Response};
 use render::{DragVisual, HitTarget, Renderer, SelectionVisual};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
 use wayland::{SurfaceKind, SurfaceManager, UiEvent, UiEventKind};
 
@@ -105,6 +106,8 @@ enum Command {
         cursor_y: Option<f64>,
     },
     Quit,
+    /// Validate the config, gracefully stop the daemon, and relaunch through Niri.
+    Restart,
     /// Print the fully commented configuration template.
     PrintDefaultConfig,
 }
@@ -209,6 +212,7 @@ fn main() -> Result<()> {
             cursor_y,
         }),
         Command::Quit => print_control(ControlCommand::Quit),
+        Command::Restart => restart_daemon(cli.config.unwrap_or_else(Config::default_path)),
         Command::PrintDefaultConfig => {
             print!("{}", include_str!("../../../config/niri-xmb.toml.example"));
             Ok(())
@@ -219,6 +223,81 @@ fn main() -> Result<()> {
 fn print_control(command: ControlCommand) -> Result<()> {
     print!("{}", ipc::send(command)?);
     Ok(())
+}
+
+fn restart_daemon(config_path: PathBuf) -> Result<()> {
+    let config_path = if config_path.is_absolute() {
+        config_path
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve the config path")?
+            .join(config_path)
+    };
+
+    Config::load(&config_path)
+        .with_context(|| "config validation failed; the running daemon was not stopped")?;
+    println!("config valid: {}", config_path.display());
+
+    if daemon_status().is_some() {
+        let response = ipc::send(ControlCommand::Quit).context("failed to stop the daemon")?;
+        if response.trim() != "ok" {
+            anyhow::bail!("daemon rejected restart: {}", response.trim());
+        }
+        if wait_for_daemon(false, Duration::from_secs(3)).is_none() {
+            anyhow::bail!("daemon did not stop within 3 seconds");
+        }
+        println!("daemon stopped");
+    } else {
+        println!("daemon was not running");
+    }
+
+    let executable = std::env::current_exe().context("failed to locate niri-xmb executable")?;
+    let output = ProcessCommand::new("niri")
+        .args(["msg", "action", "spawn", "--"])
+        .arg(&executable)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("daemon")
+        .output()
+        .context("failed to ask Niri to launch the daemon")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Niri rejected daemon launch: {}", stderr.trim());
+    }
+
+    let Some(status) = wait_for_daemon(true, Duration::from_secs(5)) else {
+        anyhow::bail!("daemon did not become ready within 5 seconds");
+    };
+    println!("daemon started");
+    println!("{}", status.trim());
+    Ok(())
+}
+
+/// Wait for the control socket to enter the requested state. When waiting for
+/// startup, return the first healthy status response. When waiting for
+/// shutdown, return a marker once no healthy daemon answers.
+fn wait_for_daemon(running: bool, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = daemon_status();
+        if running {
+            if status.is_some() {
+                return status;
+            }
+        } else if status.is_none() {
+            return Some(String::new());
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn daemon_status() -> Option<String> {
+    ipc::send(ControlCommand::Status)
+        .ok()
+        .filter(|response| !response.trim_start().starts_with("error:"))
 }
 
 fn snapshot_json(snapshot: &Snapshot, output_filter: Option<&str>) -> String {
@@ -1652,6 +1731,12 @@ fn adjust_same_workspace_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_is_available_as_a_cli_subcommand() {
+        let cli = Cli::try_parse_from(["niri-xmb", "restart"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Restart)));
+    }
 
     #[test]
     fn tiled_drop_preserves_niris_one_based_indices() {
