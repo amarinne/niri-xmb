@@ -182,6 +182,25 @@ struct SurfaceSpec {
     kind: SurfaceSpecKind,
 }
 
+/// Keep one dormant popup surface specification for every known output.
+///
+/// Virtual outputs can appear after the daemon starts. The specification must
+/// be added when Wayland reports the output so `sync_surfaces` can create the
+/// layer surface without a daemon restart.
+fn ensure_popup_spec(specs: &mut Vec<SurfaceSpec>, output: &str) -> bool {
+    if specs
+        .iter()
+        .any(|spec| spec.output == output && matches!(&spec.kind, SurfaceSpecKind::Popup))
+    {
+        return false;
+    }
+    specs.push(SurfaceSpec {
+        output: output.to_string(),
+        kind: SurfaceSpecKind::Popup,
+    });
+    true
+}
+
 struct OutputRecord {
     output: wl_output::WlOutput,
     name: String,
@@ -248,10 +267,7 @@ impl SurfaceManager {
             });
         }
         for output in popup_outputs {
-            specs.push(SurfaceSpec {
-                output: output.clone(),
-                kind: SurfaceSpecKind::Popup,
-            });
+            ensure_popup_spec(&mut specs, output);
         }
 
         let state = WaylandState {
@@ -696,7 +712,10 @@ fn copy_rgba_to_argb8888(destination: &mut [u8], source: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DamageRect, alpha_bounds, copy_rgba_to_argb8888, copy_rgba_to_argb8888_region};
+    use super::{
+        DamageRect, SurfaceSpecKind, alpha_bounds, copy_rgba_to_argb8888,
+        copy_rgba_to_argb8888_region, ensure_popup_spec,
+    };
 
     #[test]
     fn converts_tiny_skia_rgba_to_wayland_argb8888_memory_order() {
@@ -745,6 +764,22 @@ mod tests {
         assert_eq!(&destination[..4], &[0xaa; 4]);
         assert_eq!(&destination[4..8], &[30, 20, 10, 40]);
         assert_eq!(&destination[8..], &[0xaa; 8]);
+    }
+
+    #[test]
+    fn popup_spec_is_added_once_for_hotplugged_output() {
+        let mut specs = Vec::new();
+
+        assert!(ensure_popup_spec(&mut specs, "Virtual-1"));
+        assert!(!ensure_popup_spec(&mut specs, "Virtual-1"));
+        assert!(ensure_popup_spec(&mut specs, "HDMI-A-1"));
+
+        let popup_outputs = specs
+            .iter()
+            .filter(|spec| matches!(&spec.kind, SurfaceSpecKind::Popup))
+            .map(|spec| spec.output.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(popup_outputs, ["Virtual-1", "HDMI-A-1"]);
     }
 }
 
@@ -839,6 +874,9 @@ impl WaylandState {
         let Some(name) = info.name else {
             return;
         };
+        if ensure_popup_spec(&mut self.specs, &name) {
+            tracing::info!(output = %name, "registered popup surface for connected output");
+        }
         let (x, y) = info.logical_position.unwrap_or((0, 0));
         let (width, height) = info.logical_size.unwrap_or((1920, 1080));
         self.outputs.insert(
@@ -1099,8 +1137,9 @@ impl OutputHandler for WaylandState {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+    fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         self.refresh_output(&output);
+        self.sync_surfaces(qh);
     }
 
     fn update_output(

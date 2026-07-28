@@ -73,7 +73,8 @@ Important behavior:
   switching with the wheel over each bar.
 - `popup.outputs = "focused"`: show one popup on the focused monitor.
 - `popup.outputs = "all"`: show a separate local workspace map on every
-  monitor at the same time.
+  monitor at the same time. Outputs added after daemon startup, including Niri
+  virtual outputs, receive a popup surface automatically.
 - `popup.outputs = "combined"`: show one panel on the focused monitor with all
   outputs side by side. Workspaces are rows from top to bottom, while each
   workspace's Niri columns run left to right. The panel grows to the widest

@@ -15,9 +15,11 @@ navigation, and a passive workspace-change peek overlay.
   inserts a new workspace above or below and moves the window to it.
 - [x] Make the shell `niri` command use the deployed custom binary. The
   `~/.local/bin/niri` link now targets the active custom prefix.
-- [x] Replace the damaged Niri worktree for builds. The clean worktree is
-  `/home/ez/Projects/niri-sync-20260728`. Preserve the damaged worktree until
-  the interrupted file-copy state is no longer useful for diagnosis.
+- [x] Consolidate Niri into the clean canonical checkout at
+  `/home/ez/Projects/niri`. The old clean build tree and damaged worktree are
+  preserved under `~/.local/state/dotfiles/retired-20260729/sources/`.
+- [x] Add dynamic popup surfaces for outputs connected after daemon startup.
+  This lets Sunshine's `Virtual-1` output join the XMB without a daemon restart.
 - [x] Finish the hidden popup surface lifecycle. Hidden popups now destroy the
   layer role and `wl_surface`. The daemon keeps SHM buffers for fast remapping.
 - [x] Commit and push the pending niri-xmb popup input and hidden-surface fixes.
@@ -54,6 +56,8 @@ navigation, and a passive workspace-change peek overlay.
 - Popup placement is anchored per output. The deployed config places
   `HDMI-A-1` on the right and `HDMI-A-2` on the left, both vertically centred,
   so the two panels face inward.
+- The deployed config places Sunshine's `Virtual-1` panel at the top centre of
+  the Moonlight view.
 - The animated wave background was rejected for this panel and is not compiled.
   Its CPU prototype is retained at `reference/xmb_wave.rs` for possible reuse in
   a wallpaper/background engine.
