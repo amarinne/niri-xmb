@@ -1,5 +1,9 @@
 {
   "settings": {
+    "capsule": {
+      "label": "Outer bar capsule",
+      "description": "Wrap the entire XMB strip in a Noctalia capsule. Keep disabled to use one pill per workspace."
+    },
     "target_output": {
       "label": "Target output",
       "description": "Niri output whose workspaces this widget displays. Empty uses the bar output."

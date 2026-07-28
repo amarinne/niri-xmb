@@ -172,7 +172,14 @@ impl NiriState {
             .windows
             .values()
             .find(|window| window.is_focused)
-            .map(|window| window.id);
+            .map(|window| window.id)
+            .or_else(|| {
+                self.workspaces
+                    .values()
+                    .find(|workspace| workspace.is_focused)
+                    .and_then(|workspace| workspace.active_window_id)
+                    .filter(|id| self.windows.contains_key(id))
+            });
         let mut outputs = BTreeMap::new();
 
         for (name, output) in &self.outputs {
@@ -235,7 +242,7 @@ impl NiriState {
                     workspace_id: workspace.id,
                     app_id: window.app_id.unwrap_or_default(),
                     title: window.title.unwrap_or_default(),
-                    focused: window.is_focused,
+                    focused: focused_window == Some(window.id),
                     urgent: window.is_urgent,
                     floating: window.is_floating,
                     column: position.map(|position| position.0),

@@ -273,8 +273,8 @@ local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, showIndi
         paddingV = 2,
         radius = 18,
         fill = workspace.active and "primary/0.10" or "surface_variant/0.20",
-        border = workspace.urgent and "error/0.9" or (workspace.active and "primary/0.42" or "outline/0.18"),
-        borderWidth = 1,
+        border = "#00000000",
+        borderWidth = 0,
         opacity = workspace.active and 1.0 or inactiveOpacity,
     }
 

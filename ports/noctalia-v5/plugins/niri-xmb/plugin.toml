@@ -1,6 +1,6 @@
 id = "amarinne/niri-xmb"
 name = "Niri XMB"
-version = "0.2.1"
+version = "0.2.2"
 description = "Per-output Niri workspace and window strip backed by niri-xmb."
 icon = "layout-grid"
 plugin_api = 16
@@ -9,6 +9,13 @@ license = "GPL-3.0-only"
 [[widget]]
 id = "workspace-strip"
 entry = "bar.luau"
+
+[[widget.setting]]
+key = "capsule"
+type = "bool"
+label_key = "settings.capsule.label"
+description_key = "settings.capsule.description"
+default = false
 
 [[widget.setting]]
 key = "target_output"
