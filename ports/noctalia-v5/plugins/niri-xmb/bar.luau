@@ -270,7 +270,9 @@ local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, showIndi
         align = "stretch",
         gap = 1,
         paddingH = 3,
-        paddingV = 2,
+        -- Keep the icon row, active indicator, and gap within Noctalia's
+        -- default 34px bar instead of clipping the capsule edges.
+        paddingV = 1,
         radius = 18,
         fill = workspace.active and "primary/0.10" or "surface_variant/0.20",
         border = "#00000000",
