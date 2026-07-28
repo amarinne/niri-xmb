@@ -13,34 +13,33 @@ navigation, and a passive workspace-change peek overlay.
   branches still contain commit `62cfdc3f`. Keep this commit during upstream
   merges. The action moves inside a column first. At a column edge, the action
   inserts a new workspace above or below and moves the window to it.
-- [ ] Make the shell `niri` command use the deployed custom binary. The stock
-  CLI reports a version mismatch and does not list the custom smart actions.
-- [ ] Recover or replace the damaged Niri worktree before the next build. The
-  worktree currently reports 4,901 changed paths, mostly tracked deletions.
-  Preserve the current worktree until the deletion source is known.
-- [ ] Finish the hidden popup surface lifecycle. Destroy hidden popup surfaces
-  if null-buffer unmap does not remove the layer object and input state.
-- [ ] Commit and push the pending niri-xmb popup input and hidden-surface fixes.
-- [ ] Merge current Noctalia upstream `main` into the Noctalia fork. Preserve the
-   custom taskbar output target, icon, drag source, and drop routing changes.
-- [ ] Run the Noctalia v5 test suite and build the desktop package. Do not build
-   Noctalia on the laptop.
-- [ ] Build a portable Noctalia v5 package. Bundle `libtomlplusplus.so.3` or
-  remove the build-host RPATH dependency.
-- [ ] Back up the desktop Noctalia v4 configuration. Keep the backup as the only
-   v4 rollback path. Do not add more v4 features.
-- [ ] Create the desktop Noctalia v5 configuration. Add one taskbar widget for
-   `HDMI-A-1` and one taskbar widget for `HDMI-A-2`. Configure both widgets to
-   use `niri-xmb` for drag and drop.
-- [ ] Remove v4-only plugin entries from the v5 configuration. Replace necessary
-   functions with built-in widgets or command widgets.
-- [ ] Disable Neowall autostart. Use the native Noctalia v5 wallpaper function.
-- [ ] Replace the desktop v4 startup command with the native Noctalia v5 startup
-  command.
+- [x] Make the shell `niri` command use the deployed custom binary. The
+  `~/.local/bin/niri` link now targets the active custom prefix.
+- [x] Replace the damaged Niri worktree for builds. The clean worktree is
+  `/home/ez/Projects/niri-sync-20260728`. Preserve the damaged worktree until
+  the interrupted file-copy state is no longer useful for diagnosis.
+- [x] Finish the hidden popup surface lifecycle. Hidden popups now destroy the
+  layer role and `wl_surface`. The daemon keeps SHM buffers for fast remapping.
+- [x] Commit and push the pending niri-xmb popup input and hidden-surface fixes.
+- [x] Merge current Noctalia upstream `main` into the Noctalia fork. Preserve
+  the custom taskbar output target, icon, drag source, and drop routing changes.
+- [x] Run the Noctalia v5 test suite and build the desktop package. All 62 tests
+  pass. The build ran only on the desktop.
+- [x] Build a portable Noctalia v5 package. The binary uses
+  `$ORIGIN/../lib`, and the private libraries are bundled in the prefix.
+- [x] Back up the desktop Noctalia v4 configuration. The frozen backup is
+  `/home/ez/.local/share/noctalia-rollback/v4-desktop-20260728`.
+- [x] Create the desktop Noctalia v5 configuration. One top bar on `HDMI-A-2`
+  contains two taskbar widgets. Each widget has an explicit output target and
+  `niri-xmb` drag routing.
+- [x] Remove v4-only plugin entries from active v5 configuration. Disable the
+  old recorder key bindings until native replacements are selected.
+- [x] Disable Neowall autostart. Use the native Noctalia v5 wallpaper function.
+- [x] Replace the desktop v4 startup command with the native Noctalia v5
+  startup command.
 - [ ] Validate both bars, dock input, taskbar input, XMB drag and reorder,
   `Mod+Z`, tray, audio, network, notifications, lock, and wallpaper.
-- [ ] Push a Noctalia fork checkpoint after the desktop v5 cutover passes all
-  checks.
+- [ ] Push a Noctalia fork checkpoint after the remaining manual checks pass.
 
 ## Current product decisions
 
@@ -138,6 +137,11 @@ Verified on 2026-07-28:
   approximately 43 MB RSS after the popup buffers were exercised.
 - Noctalia v4 was restarted cleanly and loaded `niri-xmb-bar` without QML
   errors. Pointer interaction still needs one manual widget/dock confirmation.
+- Hidden lifecycle verification on 2026-07-28 showed zero `niri-xmb-popup`
+  entries in `niri msg layers`. Showing created one entry per output. Hiding
+  removed both entries again.
+- Ten show/hide cycles completed successfully. The 20 local control calls took
+  0.04 seconds. The daemon returned to hidden mode with approximately 43 MB RSS.
 
 
 ## Deployment state

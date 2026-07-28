@@ -199,7 +199,7 @@ struct SurfaceEntry {
     output_y: i32,
     output_width: i32,
     output_height: i32,
-    layer_surface: SctLayerSurface,
+    layer_surface: Option<SctLayerSurface>,
     pool: SlotPool,
     width: u32,
     height: u32,
@@ -423,7 +423,10 @@ impl SurfaceManager {
             (index, display_damage)
         };
 
-        let wl_surface = surface.layer_surface.wl_surface();
+        let Some(layer_surface) = &surface.layer_surface else {
+            return Ok(false);
+        };
+        let wl_surface = layer_surface.wl_surface();
         wl_surface.frame(&self.queue.handle(), wl_surface.clone());
         surface.buffers[buffer_index]
             .buffer
@@ -437,7 +440,7 @@ impl SurfaceManager {
         );
         surface.last_damage = current_damage;
         surface.frame_ready = false;
-        surface.layer_surface.commit();
+        layer_surface.commit();
         Ok(true)
     }
 
@@ -457,33 +460,44 @@ impl SurfaceManager {
         interactive: bool,
         capture_outside: bool,
     ) -> Result<()> {
-        for surface in &mut self.state.surfaces {
-            if surface.kind != SurfaceKind::Popup {
+        for index in 0..self.state.surfaces.len() {
+            if self.state.surfaces[index].kind != SurfaceKind::Popup {
                 continue;
             }
-            let show = outputs.iter().any(|output| output == &surface.output);
+            let show = outputs
+                .iter()
+                .any(|output| output == &self.state.surfaces[index].output);
             if show {
-                let remap = !surface.visible;
+                let remap = self.state.surfaces[index].layer_surface.is_none();
+                if remap {
+                    self.state.map_popup_surface(index, &self.queue.handle())?;
+                }
+                let surface = &mut self.state.surfaces[index];
                 surface.visible = true;
                 surface.interactive = interactive;
                 surface.capture_outside = capture_outside;
                 if remap {
-                    // A null-buffer commit unmaps a layer surface. Request a
-                    // fresh configure before attaching the cached SHM buffer.
+                    // A new layer role needs a fresh configure before the
+                    // cached SHM buffer can be attached.
                     surface.configured = false;
                     surface.frame_ready = true;
                     surface.last_damage = None;
                 }
                 apply_input_region(&self.queue.handle(), &self.state.compositor, surface);
-                surface
-                    .layer_surface
-                    .set_keyboard_interactivity(if interactive {
-                        KeyboardInteractivity::Exclusive
-                    } else {
-                        KeyboardInteractivity::None
-                    });
-                surface.layer_surface.commit();
-            } else if surface.visible || surface.configured {
+                let Some(layer_surface) = &surface.layer_surface else {
+                    continue;
+                };
+                layer_surface.set_keyboard_interactivity(if interactive {
+                    KeyboardInteractivity::Exclusive
+                } else {
+                    KeyboardInteractivity::None
+                });
+                layer_surface.commit();
+            } else if self.state.surfaces[index].visible
+                || self.state.surfaces[index].configured
+                || self.state.surfaces[index].layer_surface.is_some()
+            {
+                let surface = &mut self.state.surfaces[index];
                 surface.visible = false;
                 surface.interactive = false;
                 surface.capture_outside = false;
@@ -491,17 +505,16 @@ impl SurfaceManager {
                 surface.configured = false;
                 surface.frame_ready = true;
                 surface.last_damage = None;
-                apply_input_region(&self.queue.handle(), &self.state.compositor, surface);
-                surface
-                    .layer_surface
-                    .set_keyboard_interactivity(KeyboardInteractivity::None);
-                surface.layer_surface.wl_surface().attach(None, 0, 0);
-                surface.layer_surface.commit();
+                if self.state.pointer_surface == Some(surface.id) {
+                    self.state.pointer_surface = None;
+                }
+                // Dropping the layer role also destroys its wl_surface. Keep
+                // the SHM pool and buffers in SurfaceEntry for a cheap remap.
+                surface.layer_surface.take();
             }
         }
-        // Keep the daemon and its buffer pools alive, but fully unmap hidden
-        // popup surfaces. This prevents an invisible overlay from receiving
-        // pointer input. Remapping is asynchronous; the event loop renders
+        // Keep the daemon and buffer pools alive, but destroy hidden popup
+        // layer objects. Remapping is asynchronous; the event loop renders
         // after the compositor sends a fresh configure.
         self.queue
             .flush()
@@ -524,7 +537,9 @@ impl SurfaceManager {
         surface.input_rect = Some(rect);
         if surface.visible && surface.interactive && !surface.capture_outside {
             apply_input_region(&self.queue.handle(), &self.state.compositor, surface);
-            surface.layer_surface.commit();
+            if let Some(layer_surface) = &surface.layer_surface {
+                layer_surface.commit();
+            }
             self.queue
                 .flush()
                 .context("failed to flush popup panel input region")?;
@@ -738,8 +753,11 @@ fn apply_input_region(
     compositor: &CompositorState,
     surface: &SurfaceEntry,
 ) {
+    let Some(layer_surface) = &surface.layer_surface else {
+        return;
+    };
     if surface.visible && surface.interactive && surface.capture_outside {
-        surface.layer_surface.wl_surface().set_input_region(None);
+        layer_surface.wl_surface().set_input_region(None);
         return;
     }
     let region = compositor.wl_compositor().create_region(qh, ());
@@ -754,10 +772,7 @@ fn apply_input_region(
             rect.height as i32,
         );
     }
-    surface
-        .layer_surface
-        .wl_surface()
-        .set_input_region(Some(&region));
+    layer_surface.wl_surface().set_input_region(Some(&region));
     region.destroy();
 }
 
@@ -784,6 +799,39 @@ struct WaylandState {
 }
 
 impl WaylandState {
+    fn map_popup_surface(&mut self, index: usize, qh: &QueueHandle<Self>) -> Result<()> {
+        let Some(entry) = self.surfaces.get(index) else {
+            return Ok(());
+        };
+        if entry.kind != SurfaceKind::Popup || entry.layer_surface.is_some() {
+            return Ok(());
+        }
+        let output_name = entry.output.clone();
+        let output = self
+            .outputs
+            .values()
+            .find(|output| output.name == output_name)
+            .map(|output| output.output.clone())
+            .with_context(|| format!("popup output {output_name} disappeared"))?;
+
+        let surface = self.compositor.create_surface(qh);
+        let layer_surface = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Overlay,
+            Some("niri-xmb-popup"),
+            Some(&output),
+        );
+        layer_surface.set_anchor(Anchor::all());
+        layer_surface.set_size(0, 0);
+        layer_surface.set_exclusive_zone(-1);
+        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer_surface.commit();
+
+        self.surfaces[index].layer_surface = Some(layer_surface);
+        Ok(())
+    }
+
     fn refresh_output(&mut self, output: &wl_output::WlOutput) {
         let Some(info) = self.output_state.info(output) else {
             return;
@@ -874,7 +922,7 @@ impl WaylandState {
                 output_y: output.y,
                 output_width: output.width,
                 output_height: output.height,
-                layer_surface,
+                layer_surface: Some(layer_surface),
                 pool,
                 width: 0,
                 height: 0,
@@ -891,9 +939,12 @@ impl WaylandState {
     }
 
     fn surface_for_wl(&self, wl_surface: &wl_surface::WlSurface) -> Option<&SurfaceEntry> {
-        self.surfaces
-            .iter()
-            .find(|surface| surface.layer_surface.wl_surface() == wl_surface)
+        self.surfaces.iter().find(|surface| {
+            surface
+                .layer_surface
+                .as_ref()
+                .is_some_and(|layer_surface| layer_surface.wl_surface() == wl_surface)
+        })
     }
 
     fn emit(&self, surface_id: usize, event: UiEventKind) {
@@ -1016,11 +1067,12 @@ impl CompositorHandler for WaylandState {
         wl_surface: &wl_surface::WlSurface,
         _: u32,
     ) {
-        if let Some(surface) = self
-            .surfaces
-            .iter_mut()
-            .find(|surface| surface.layer_surface.wl_surface() == wl_surface)
-        {
+        if let Some(surface) = self.surfaces.iter_mut().find(|surface| {
+            surface
+                .layer_surface
+                .as_ref()
+                .is_some_and(|layer_surface| layer_surface.wl_surface() == wl_surface)
+        }) {
             surface.frame_ready = true;
         }
     }
@@ -1277,8 +1329,12 @@ impl KeyboardHandler for WaylandState {
 
 impl LayerShellHandler for WaylandState {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer_surface: &SctLayerSurface) {
-        self.surfaces
-            .retain(|surface| surface.layer_surface.wl_surface() != layer_surface.wl_surface());
+        self.surfaces.retain(|surface| {
+            !surface
+                .layer_surface
+                .as_ref()
+                .is_some_and(|candidate| candidate == layer_surface)
+        });
     }
 
     fn configure(
@@ -1289,11 +1345,12 @@ impl LayerShellHandler for WaylandState {
         configure: LayerSurfaceConfigure,
         _: u32,
     ) {
-        if let Some(surface) = self
-            .surfaces
-            .iter_mut()
-            .find(|surface| surface.layer_surface.wl_surface() == layer_surface.wl_surface())
-        {
+        if let Some(surface) = self.surfaces.iter_mut().find(|surface| {
+            surface
+                .layer_surface
+                .as_ref()
+                .is_some_and(|candidate| candidate == layer_surface)
+        }) {
             if configure.new_size.0 > 0 {
                 surface.width = configure.new_size.0;
             }
