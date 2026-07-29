@@ -371,6 +371,21 @@ impl Default for PopupPlacement {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UrgentIndicator {
+    None,
+    Ring,
+    Glow,
+    Badge,
+}
+
+impl Default for UrgentIndicator {
+    fn default() -> Self {
+        Self::Glow
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StyleConfig {
@@ -386,14 +401,22 @@ pub struct StyleConfig {
     pub selection_border: String,
     pub text: String,
     pub muted: String,
-    /// Colour used by urgent window rings and workspace urgency markers.
+    /// Colour used by urgent window indicators and workspace urgency markers.
     pub urgent: String,
-    /// Draw a ring around urgent window icons.
+    /// Preset used to mark urgent window icons.
+    pub urgent_indicator: UrgentIndicator,
+    /// Legacy ring visibility switch. It only affects the `ring` preset.
     pub show_urgent_ring: bool,
     /// Stroke width of the urgent window ring in logical pixels.
     pub urgent_ring_width: f32,
     /// Gap between an urgent window icon and its ring in logical pixels.
     pub urgent_ring_padding: f32,
+    /// Distance that the `glow` preset extends behind an icon.
+    pub urgent_glow_spread: f32,
+    /// Maximum opacity of the `glow` preset from 0.0 to 1.0.
+    pub urgent_glow_alpha: f32,
+    /// Radius of the top-right dot used by the `badge` preset.
+    pub urgent_badge_radius: f32,
     /// Drop shadow behind the popup panel.
     pub shadow: String,
     /// Disc drawn behind a floating window's icon so it stays legible.
@@ -449,9 +472,13 @@ impl Default for StyleConfig {
             text: "#ffe1e2e5".into(),
             muted: "#ffc0c7cd".into(),
             urgent: "#ffffb4ab".into(),
+            urgent_indicator: UrgentIndicator::Glow,
             show_urgent_ring: true,
             urgent_ring_width: 1.25,
             urgent_ring_padding: 2.0,
+            urgent_glow_spread: 7.0,
+            urgent_glow_alpha: 0.42,
+            urgent_badge_radius: 3.5,
             shadow: "#4e000000".into(),
             floating_backing: "#be0c1016".into(),
             radius: 14.0,
@@ -650,6 +677,21 @@ mod tests {
         assert!(!config.style.show_urgent_ring);
         assert_eq!(config.style.urgent_ring_width, 3.5);
         assert_eq!(config.style.urgent_ring_padding, 6.0);
+    }
+
+    #[test]
+    fn urgent_indicator_presets_parse() {
+        for (name, expected) in [
+            ("none", UrgentIndicator::None),
+            ("ring", UrgentIndicator::Ring),
+            ("glow", UrgentIndicator::Glow),
+            ("badge", UrgentIndicator::Badge),
+        ] {
+            let config =
+                toml::from_str::<Config>(&format!("[style]\nurgent_indicator = \"{name}\"\n"))
+                    .unwrap();
+            assert_eq!(config.style.urgent_indicator, expected);
+        }
     }
 
     #[test]

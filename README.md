@@ -137,10 +137,15 @@ Highlights:
   larger, which is what marks selection in place of an outline.
 - `style.dim_alpha`: opacity of icons outside the selected workspace. Raise it
   toward `1.0` for a flatter look, lower it for more focus separation.
-- `style.show_urgent_ring`, `style.urgent_ring_width`, and
-  `style.urgent_ring_padding`:
-  enable and size the ring around urgent window icons. `style.urgent` sets its
-  colour and also colours workspace urgency markers.
+- `style.urgent_indicator`: select `none`, `ring`, `glow`, or `badge` for urgent
+  window icons. `glow` draws a soft background. `badge` draws a dot at the
+  top-right corner. `style.urgent` sets the indicator colour and workspace
+  urgency marker colour.
+- `style.urgent_glow_spread` and `style.urgent_glow_alpha`: size and opacity of
+  the glow preset.
+- `style.urgent_badge_radius`: size of the badge preset.
+- `style.urgent_ring_width` and `style.urgent_ring_padding`: size of the ring
+  preset. `style.show_urgent_ring` remains for old configurations.
 - `style.column_gap` and `style.row_gap`: added to `icon_size_focused` to get
   the spacing of the cross. These set how far each keypress scrolls.
 - `style.stack_gap`: spacing between windows joined vertically inside one Niri

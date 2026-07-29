@@ -1,5 +1,7 @@
 use crate::anim::{Animator, Timing, lerp};
-use crate::config::{AnchorX, AnchorY, BarConfig, Config, Edge, PopupOutputs, PopupPosition};
+use crate::config::{
+    AnchorX, AnchorY, BarConfig, Config, Edge, PopupOutputs, PopupPosition, UrgentIndicator,
+};
 use crate::draw::{
     blit_icon_alpha, fill_circle, fill_gradient_rounded_rect, fill_rect, fill_rounded_rect,
     hex_color, stroke_rounded_rect,
@@ -1239,25 +1241,12 @@ impl Renderer {
         emphasis: f32,
         alpha: f32,
     ) {
-        // No halo: the selected icon is already the one sitting on the focal
-        // point and drawn larger, so a glow only adds noise around it.
+        // Focus has no halo: position, scale, and opacity show selection.
+        // Urgency has a separate configurable indicator.
         let emphasis = emphasis.clamp(0.0, 1.0);
-        // Urgency can keep a hard ring that survives dimming and reads as an
-        // alarm rather than as emphasis. Colour, width, padding, and visibility
-        // are all user-configurable.
-        let urgent_width = config.style.urgent_ring_width.max(0.0);
-        let urgent_padding = config.style.urgent_ring_padding.max(0.0);
-        if window.urgent && config.style.show_urgent_ring && urgent_width > 0.0 {
-            stroke_rounded_rect(
-                pixmap,
-                rect.x - urgent_padding,
-                rect.y - urgent_padding,
-                rect.width + urgent_padding * 2.0,
-                rect.height + urgent_padding * 2.0,
-                config.style.radius + urgent_padding,
-                hex_color(&config.style.urgent),
-                urgent_width,
-            );
+        let urgent_badge = window.urgent && config.style.urgent_indicator == UrgentIndicator::Badge;
+        if window.urgent && !urgent_badge {
+            self.draw_urgent_indicator(pixmap, rect, config);
         }
         // Emphasis lifts an icon back to full opacity as it eases into focus.
         let alpha = lerp(alpha.clamp(0.0, 1.0), 1.0, emphasis);
@@ -1303,6 +1292,68 @@ impl Renderer {
                 font_size,
                 text_color,
             );
+        }
+        if urgent_badge {
+            self.draw_urgent_indicator(pixmap, rect, config);
+        }
+    }
+
+    fn draw_urgent_indicator(&self, pixmap: &mut Pixmap, rect: Rect, config: &Config) {
+        let urgent = hex_color(&config.style.urgent);
+        match config.style.urgent_indicator {
+            UrgentIndicator::None => {}
+            UrgentIndicator::Ring if config.style.show_urgent_ring => {
+                let width = config.style.urgent_ring_width.max(0.0);
+                let padding = config.style.urgent_ring_padding.max(0.0);
+                if width > 0.0 {
+                    stroke_rounded_rect(
+                        pixmap,
+                        rect.x - padding,
+                        rect.y - padding,
+                        rect.width + padding * 2.0,
+                        rect.height + padding * 2.0,
+                        config.style.radius + padding,
+                        urgent,
+                        width,
+                    );
+                }
+            }
+            UrgentIndicator::Ring => {}
+            UrgentIndicator::Glow => {
+                let spread = config.style.urgent_glow_spread.max(0.0);
+                let alpha = config.style.urgent_glow_alpha.clamp(0.0, 1.0);
+                if spread <= 0.0 || alpha <= 0.0 {
+                    return;
+                }
+                // Three soft backing passes approximate a glow without adding
+                // a full-frame blur pass.
+                for (scale, opacity) in [(1.0, 0.18), (0.65, 0.28), (0.32, 0.42)] {
+                    let pass = spread * scale;
+                    let mut color = urgent;
+                    color.set_alpha(color.alpha() * alpha * opacity / 0.42);
+                    fill_rounded_rect(
+                        pixmap,
+                        rect.x - pass,
+                        rect.y - pass,
+                        rect.width + pass * 2.0,
+                        rect.height + pass * 2.0,
+                        config.style.radius + pass,
+                        color,
+                    );
+                }
+            }
+            UrgentIndicator::Badge => {
+                let radius = config.style.urgent_badge_radius.max(0.0);
+                if radius <= 0.0 {
+                    return;
+                }
+                let x = rect.x + rect.width - radius * 0.15;
+                let y = rect.y + radius * 0.15;
+                let mut backing = hex_color(&config.style.background_end);
+                backing.set_alpha(backing.alpha().max(0.82));
+                fill_circle(pixmap, x, y, radius + 1.25, backing);
+                fill_circle(pixmap, x, y, radius, urgent);
+            }
         }
     }
 
