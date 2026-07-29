@@ -132,6 +132,10 @@ The bar must contain independent taskbar widgets for these output targets:
 Each taskbar widget must call `niri-xmb drop` for window drag and drop.
 Each taskbar widget must route window and workspace focus through `niri-xmb`.
 Taskbar focus changes must not raise peek. Niri keybind focus changes can raise peek.
+Each desktop taskbar widget must set `middle_click_command` to `niri-xmb toggle`.
+A configured middle-click command must replace the native window-close action.
+An omitted or empty command must keep the native window-close action.
+Middle-click applies to window icons, including grouped and running pinned icons.
 The `Virtual-1` widget must remain empty when the output is absent.
 
 Noctalia dock item reordering applies only to pinned applications.

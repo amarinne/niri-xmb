@@ -10,6 +10,15 @@ The Noctalia fork adds only the generic host support the plugin API was missing:
 bar-side declarative drag/drop, click-without-drag callbacks, and optional drop
 coordinates. Window/workspace state and all Niri actions remain in `niri-xmb`.
 
+The desktop profile uses native Noctalia taskbar widgets. Set this field on
+each taskbar instance to replace middle-click window close with XMB toggle:
+
+```toml
+middle_click_command = "$HOME/.local/bin/niri-xmb toggle"
+```
+
+Leave the field empty to keep the native close-window action.
+
 Use `config.toml.example` as the two-instance template. Keep this in the
 standalone backend configuration:
 
