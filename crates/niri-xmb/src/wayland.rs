@@ -571,6 +571,61 @@ impl SurfaceManager {
         self.state.virtual_pointer.is_some()
     }
 
+    /// Send one complete click through the virtual pointer at a global point.
+    ///
+    /// The caller must hide its input surface first. Wayland processes these
+    /// requests in order, so the click reaches the surface below the popup.
+    pub fn replay_pointer_click(&mut self, global_x: f64, global_y: f64, button: u32) -> bool {
+        let Some(pointer) = &self.state.virtual_pointer else {
+            return false;
+        };
+        let Some(min_x) = self.state.outputs.values().map(|output| output.x).min() else {
+            return false;
+        };
+        let Some(min_y) = self.state.outputs.values().map(|output| output.y).min() else {
+            return false;
+        };
+        let Some(max_x) = self
+            .state
+            .outputs
+            .values()
+            .map(|output| output.x + output.width)
+            .max()
+        else {
+            return false;
+        };
+        let Some(max_y) = self
+            .state
+            .outputs
+            .values()
+            .map(|output| output.y + output.height)
+            .max()
+        else {
+            return false;
+        };
+        let width = (max_x - min_x).max(1) as u32;
+        let height = (max_y - min_y).max(1) as u32;
+        let x = (global_x - min_x as f64).round().clamp(0.0, width as f64) as u32;
+        let y = (global_y - min_y as f64).round().clamp(0.0, height as f64) as u32;
+        let time = self
+            .state
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u32::MAX as u128) as u32;
+
+        pointer.motion_absolute(time, x, y, width, height);
+        pointer.button(time, button, wl_pointer::ButtonState::Pressed);
+        pointer.frame();
+        pointer.button(
+            time.saturating_add(1),
+            button,
+            wl_pointer::ButtonState::Released,
+        );
+        pointer.frame();
+        self.queue.flush().is_ok()
+    }
+
     pub fn restore_pointer(&mut self, global_x: f64, global_y: f64) -> bool {
         let Some(pointer) = &self.state.virtual_pointer else {
             return false;

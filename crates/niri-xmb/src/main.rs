@@ -1003,6 +1003,12 @@ fn popup_output_targets(snapshot: &Snapshot, config: &Config) -> Vec<String> {
     }
 }
 
+/// Capture outside clicks only when niri-xmb can preserve their action.
+fn should_capture_outside_click(config: &Config, virtual_pointer_available: bool) -> bool {
+    config.behavior.close_on_outside_click
+        && (!config.behavior.replay_outside_click || virtual_pointer_available)
+}
+
 fn show_popup(
     surfaces: &mut SurfaceManager,
     snapshot: &Snapshot,
@@ -1011,11 +1017,8 @@ fn show_popup(
     interactive: bool,
 ) -> Result<()> {
     let outputs = popup_output_targets(snapshot, config);
-    surfaces.show_popups_with(
-        &outputs,
-        interactive,
-        config.behavior.close_on_outside_click,
-    )?;
+    let capture_outside = should_capture_outside_click(config, surfaces.cursor_restore_available());
+    surfaces.show_popups_with(&outputs, interactive, capture_outside)?;
     visible.clear();
     visible.extend(outputs);
     Ok(())
@@ -1066,10 +1069,8 @@ fn update_following_popup(
         .take()
         .map(|(output, _)| output)
         .unwrap_or(active_output);
-    surfaces.show_popups(
-        std::slice::from_ref(&active_output),
-        config.behavior.close_on_outside_click,
-    )?;
+    let capture_outside = should_capture_outside_click(config, surfaces.cursor_restore_available());
+    surfaces.show_popups(std::slice::from_ref(&active_output), capture_outside)?;
     visible.clear();
     visible.insert(active_output.clone());
     selection.output = active_output;
@@ -1135,6 +1136,9 @@ fn handle_ui_event(
             {
                 surfaces.hide_all_popups()?;
                 popup_outputs.clear();
+                if config.behavior.replay_outside_click {
+                    surfaces.replay_pointer_click(event.global_x, event.global_y, button);
+                }
             }
             Ok(true)
         }
@@ -1775,6 +1779,19 @@ mod tests {
     fn restart_is_available_as_a_cli_subcommand() {
         let cli = Cli::try_parse_from(["niri-xmb", "restart"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Restart)));
+    }
+
+    #[test]
+    fn outside_click_replay_requires_virtual_pointer() {
+        let mut config = Config::default();
+        config.behavior.close_on_outside_click = true;
+        config.behavior.replay_outside_click = true;
+
+        assert!(!should_capture_outside_click(&config, false));
+        assert!(should_capture_outside_click(&config, true));
+
+        config.behavior.replay_outside_click = false;
+        assert!(should_capture_outside_click(&config, false));
     }
 
     #[test]

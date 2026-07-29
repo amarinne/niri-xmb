@@ -559,6 +559,8 @@ pub struct BehaviorConfig {
     pub close_on_workspace_click: bool,
     pub close_on_drop: bool,
     pub close_on_outside_click: bool,
+    /// Replay a captured outside click after the popup closes.
+    pub replay_outside_click: bool,
     pub close_on_escape: bool,
 }
 
@@ -575,6 +577,7 @@ impl Default for BehaviorConfig {
             close_on_workspace_click: false,
             close_on_drop: false,
             close_on_outside_click: false,
+            replay_outside_click: false,
             close_on_escape: true,
         }
     }
