@@ -30,6 +30,9 @@ The popup is implemented as independent transparent layer-shell surfaces. This
 is deliberate: Noctalia v5's plugin item API does not expose the pointer motion
 and release events needed for cross-workspace drag and drop.
 
+See [UX_SPEC.md](UX_SPEC.md) for the normative interaction and desktop-profile
+behavior.
+
 ## Build
 
 Requirements are a recent Rust toolchain, Niri, and a compositor exposing
