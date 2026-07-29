@@ -3,8 +3,8 @@ use crate::config::{
     AnchorX, AnchorY, BarConfig, Config, Edge, PopupOutputs, PopupPosition, UrgentIndicator,
 };
 use crate::draw::{
-    blit_icon_alpha, fill_circle, fill_gradient_rounded_rect, fill_rect, fill_rounded_rect,
-    hex_color, stroke_rounded_rect,
+    blit_icon_alpha, fill_circle, fill_gradient_rounded_rect, fill_radial_glow, fill_rect,
+    fill_rounded_rect, hex_color, stroke_rounded_rect,
 };
 use crate::icons::IconCache;
 use crate::model::{OutputModel, Snapshot, WindowModel, WindowSlot, WorkspaceModel};
@@ -1325,22 +1325,15 @@ impl Renderer {
                 if spread <= 0.0 || alpha <= 0.0 {
                     return;
                 }
-                // Three soft backing passes approximate a glow without adding
-                // a full-frame blur pass.
-                for (scale, opacity) in [(1.0, 0.18), (0.65, 0.28), (0.32, 0.42)] {
-                    let pass = spread * scale;
-                    let mut color = urgent;
-                    color.set_alpha(color.alpha() * alpha * opacity / 0.42);
-                    fill_rounded_rect(
-                        pixmap,
-                        rect.x - pass,
-                        rect.y - pass,
-                        rect.width + pass * 2.0,
-                        rect.height + pass * 2.0,
-                        config.style.radius + pass,
-                        color,
-                    );
-                }
+                let mut color = urgent;
+                color.set_alpha(color.alpha() * alpha);
+                fill_radial_glow(
+                    pixmap,
+                    rect.x + rect.width * 0.5,
+                    rect.y + rect.height * 0.5,
+                    rect.width.max(rect.height) * 0.5 + spread,
+                    color,
+                );
             }
             UrgentIndicator::Badge => {
                 let radius = config.style.urgent_badge_radius.max(0.0);

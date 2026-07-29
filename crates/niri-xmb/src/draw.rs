@@ -2,7 +2,7 @@
 
 use tiny_skia::{
     Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, PathBuilder, Pixmap,
-    Point, Rect, SpreadMode, Stroke, Transform,
+    Point, RadialGradient, Rect, SpreadMode, Stroke, Transform,
 };
 
 /// Parse a hex color string (#RRGGBB or #AARRGGBB) into a tiny-skia Color.
@@ -171,6 +171,48 @@ pub fn fill_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, color: Color) 
     }
 }
 
+/// Draw a soft circular glow that fades to transparent at `radius`.
+pub fn fill_radial_glow(pixmap: &mut Pixmap, cx: f32, cy: f32, radius: f32, color: Color) {
+    if radius <= 0.0 || color.alpha() <= 0.0 {
+        return;
+    }
+    let mut middle = color;
+    middle.set_alpha(color.alpha() * 0.65);
+    let mut edge = color;
+    edge.set_alpha(0.0);
+    let center = Point::from_xy(cx, cy);
+    let Some(shader) = RadialGradient::new(
+        center,
+        center,
+        radius,
+        vec![
+            GradientStop::new(0.0, color),
+            GradientStop::new(0.55, middle),
+            GradientStop::new(1.0, edge),
+        ],
+        SpreadMode::Pad,
+        Transform::identity(),
+    ) else {
+        return;
+    };
+    let mut path = PathBuilder::new();
+    path.push_circle(cx, cy, radius);
+    let Some(path) = path.finish() else {
+        return;
+    };
+    pixmap.fill_path(
+        &path,
+        &Paint {
+            shader,
+            anti_alias: true,
+            ..Paint::default()
+        },
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+}
+
 fn sample_bilinear_rgba(rgba: &[u8], src_w: u32, src_h: u32, x: f32, y: f32) -> [u8; 4] {
     let x = x.clamp(0.0, src_w.saturating_sub(1) as f32);
     let y = y.clamp(0.0, src_h.saturating_sub(1) as f32);
@@ -296,5 +338,23 @@ mod tests {
         assert_eq!(green, 0);
         assert!((127..=128).contains(&blue));
         assert_eq!(alpha, 255);
+    }
+
+    #[test]
+    fn radial_glow_fades_toward_its_edge() {
+        let mut pixmap = Pixmap::new(25, 25).unwrap();
+        fill_radial_glow(
+            &mut pixmap,
+            12.0,
+            12.0,
+            10.0,
+            Color::from_rgba8(255, 0, 0, 128),
+        );
+
+        let center = pixmap.pixel(12, 12).unwrap().alpha();
+        let middle = pixmap.pixel(17, 12).unwrap().alpha();
+        let edge = pixmap.pixel(21, 12).unwrap().alpha();
+        assert!(center > middle);
+        assert!(middle > edge);
     }
 }
