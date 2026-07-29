@@ -386,7 +386,14 @@ pub struct StyleConfig {
     pub selection_border: String,
     pub text: String,
     pub muted: String,
+    /// Colour used by urgent window rings and workspace urgency markers.
     pub urgent: String,
+    /// Draw a ring around urgent window icons.
+    pub show_urgent_ring: bool,
+    /// Stroke width of the urgent window ring in logical pixels.
+    pub urgent_ring_width: f32,
+    /// Gap between an urgent window icon and its ring in logical pixels.
+    pub urgent_ring_padding: f32,
     /// Drop shadow behind the popup panel.
     pub shadow: String,
     /// Disc drawn behind a floating window's icon so it stays legible.
@@ -442,6 +449,9 @@ impl Default for StyleConfig {
             text: "#ffe1e2e5".into(),
             muted: "#ffc0c7cd".into(),
             urgent: "#ffffb4ab".into(),
+            show_urgent_ring: true,
+            urgent_ring_width: 1.25,
+            urgent_ring_padding: 2.0,
             shadow: "#4e000000".into(),
             floating_backing: "#be0c1016".into(),
             radius: 14.0,
@@ -615,6 +625,25 @@ mod tests {
         assert_eq!(config.popup.canvas_width.resolve(1000.0), 180.0);
         assert_eq!(config.popup.canvas_height.resolve(1000.0), 190.5);
         assert_eq!(config.popup.placements[0].margin.resolve(1000.0), 30.0);
+    }
+
+    #[test]
+    fn urgent_window_ring_is_configurable() {
+        let config = toml::from_str::<Config>(
+            r##"
+            [style]
+            urgent = "#ff112233"
+            show_urgent_ring = false
+            urgent_ring_width = 3.5
+            urgent_ring_padding = 6.0
+            "##,
+        )
+        .unwrap();
+
+        assert_eq!(config.style.urgent, "#ff112233");
+        assert!(!config.style.show_urgent_ring);
+        assert_eq!(config.style.urgent_ring_width, 3.5);
+        assert_eq!(config.style.urgent_ring_padding, 6.0);
     }
 
     #[test]

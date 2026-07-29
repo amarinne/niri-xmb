@@ -115,7 +115,10 @@ accent = "#ff6ed2ff"            # active/focused accent
 selection_border = "#666ed2ff" # retained selection-outline colour
 text = "#ffe1e2e5"              # primary labels and selected title
 muted = "#ffc0c7cd"             # secondary labels
-urgent = "#ffffb4ab"            # urgent-window marker
+urgent = "#ffffb4ab"            # urgent-window ring and workspace marker colour
+show_urgent_ring = true          # false hides the ring around urgent window icons
+urgent_ring_width = 1.25         # urgent ring stroke width in logical pixels
+urgent_ring_padding = 2.0        # gap between an urgent icon and its ring
 shadow = "#4e000000"           # panel drop shadow
 floating_backing = "#be0c1016" # disc behind floating icons and the drag ghost
 

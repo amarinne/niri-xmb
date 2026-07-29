@@ -1242,18 +1242,21 @@ impl Renderer {
         // No halo: the selected icon is already the one sitting on the focal
         // point and drawn larger, so a glow only adds noise around it.
         let emphasis = emphasis.clamp(0.0, 1.0);
-        // Urgency keeps a hard ring: it must survive dimming and read as an
-        // alarm rather than as emphasis.
-        if window.urgent {
+        // Urgency can keep a hard ring that survives dimming and reads as an
+        // alarm rather than as emphasis. Colour, width, padding, and visibility
+        // are all user-configurable.
+        let urgent_width = config.style.urgent_ring_width.max(0.0);
+        let urgent_padding = config.style.urgent_ring_padding.max(0.0);
+        if window.urgent && config.style.show_urgent_ring && urgent_width > 0.0 {
             stroke_rounded_rect(
                 pixmap,
-                rect.x - 2.0,
-                rect.y - 2.0,
-                rect.width + 4.0,
-                rect.height + 4.0,
-                config.style.radius,
+                rect.x - urgent_padding,
+                rect.y - urgent_padding,
+                rect.width + urgent_padding * 2.0,
+                rect.height + urgent_padding * 2.0,
+                config.style.radius + urgent_padding,
                 hex_color(&config.style.urgent),
-                1.25,
+                urgent_width,
             );
         }
         // Emphasis lifts an icon back to full opacity as it eases into focus.
