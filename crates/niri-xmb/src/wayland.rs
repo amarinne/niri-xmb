@@ -94,6 +94,8 @@ impl DamageRect {
 
 struct SurfaceBuffer {
     buffer: Buffer,
+    width: u32,
+    height: u32,
     content: Option<DamageRect>,
 }
 
@@ -405,15 +407,23 @@ impl SurfaceManager {
         };
 
         let mut available = None;
-        for index in 0..surface.buffers.len() {
-            if surface
+        let mut index = 0;
+        while index < surface.buffers.len() {
+            let size_matches = surface.buffers[index].width == surface.width
+                && surface.buffers[index].height == surface.height;
+            let released = surface
                 .pool
                 .canvas(&surface.buffers[index].buffer)
-                .is_some()
-            {
+                .is_some();
+            if size_matches && released {
                 available = Some(index);
                 break;
             }
+            if !size_matches && released {
+                surface.buffers.swap_remove(index);
+                continue;
+            }
+            index += 1;
         }
 
         let (buffer_index, submitted_damage) = if let Some(index) = available {
@@ -683,6 +693,8 @@ fn allocate_surface_buffer(surface: &mut SurfaceEntry) -> Result<()> {
         .context("failed to create SHM buffer")?;
     surface.buffers.push(SurfaceBuffer {
         buffer,
+        width: surface.width,
+        height: surface.height,
         content: None,
     });
     Ok(())
@@ -934,6 +946,14 @@ impl WaylandState {
         }
         let (x, y) = info.logical_position.unwrap_or((0, 0));
         let (width, height) = info.logical_size.unwrap_or((1920, 1080));
+        for surface in &mut self.surfaces {
+            if surface.output == name {
+                surface.output_x = x;
+                surface.output_y = y;
+                surface.output_width = width;
+                surface.output_height = height;
+            }
+        }
         self.outputs.insert(
             output.id().protocol_id(),
             OutputRecord {
@@ -1445,12 +1465,32 @@ impl LayerShellHandler for WaylandState {
                 .as_ref()
                 .is_some_and(|candidate| candidate == layer_surface)
         }) {
-            if configure.new_size.0 > 0 {
-                surface.width = configure.new_size.0;
+            let old_width = surface.width;
+            let old_height = surface.height;
+            let width = if configure.new_size.0 > 0 {
+                configure.new_size.0
+            } else {
+                old_width
+            };
+            let height = if configure.new_size.1 > 0 {
+                configure.new_size.1
+            } else {
+                old_height
+            };
+            if width != old_width || height != old_height {
+                tracing::debug!(
+                    output = %surface.output,
+                    old_width,
+                    old_height,
+                    width,
+                    height,
+                    "layer surface size changed"
+                );
+                surface.last_damage = None;
+                surface.input_rect = None;
             }
-            if configure.new_size.1 > 0 {
-                surface.height = configure.new_size.1;
-            }
+            surface.width = width;
+            surface.height = height;
             surface.configured = true;
         }
     }
