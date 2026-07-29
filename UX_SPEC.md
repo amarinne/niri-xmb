@@ -35,14 +35,17 @@ The desktop profile uses one combined panel. The panel must contain maps for all
 | Setting | Desktop value | Required behavior |
 | --- | --- | --- |
 | `popup.outputs` | `"combined"` | Put all output maps in one panel |
-| `popup.surface_mode` | `"follow_active"` | Move panel after active output settles |
+| `popup.surface_mode` | `"fixed"` | Keep panel on its spawn output |
 | `popup.position` | `"anchored"` | Use output placement rules |
-| Horizontal anchor | `"center"` | Center panel on active output |
+| Horizontal anchor | `"center"` | Center panel on spawn output |
 | Vertical anchor | `"top"` | Pin panel to top edge |
 
 The panel must support `HDMI-A-1`, `HDMI-A-2`, and `Virtual-1`.
 An output connected after daemon startup must receive a popup surface without a restart.
 An absent virtual output must not create visible empty content.
+
+Set `popup.surface_mode = "fixed"` to keep the panel on its initial output.
+Set `popup.surface_mode = "follow_active"` to follow active-output focus after `follow_delay_ms`.
 
 Workspaces must run from top to bottom. Windows must follow Niri column order from left to right.
 Panel size must shrink to visible content and stop at configured maximum sizes.
