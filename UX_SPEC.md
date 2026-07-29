@@ -130,6 +130,8 @@ The bar must contain independent taskbar widgets for these output targets:
 | `taskbar-virtual1` | `Virtual-1` |
 
 Each taskbar widget must call `niri-xmb drop` for window drag and drop.
+Each taskbar widget must route window and workspace focus through `niri-xmb`.
+Taskbar focus changes must not raise peek. Niri keybind focus changes can raise peek.
 The `Virtual-1` widget must remain empty when the output is absent.
 
 Noctalia dock item reordering applies only to pinned applications.

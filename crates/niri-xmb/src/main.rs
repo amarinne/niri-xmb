@@ -650,25 +650,34 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 ControlCommand::FocusWindow { window_id } => {
                     if snapshot.window(window_id).is_none() {
                         "error: unknown window\n".into()
-                    } else if niri_command_tx
-                        .send(NiriCommand::FocusWindow(window_id))
-                        .is_ok()
-                    {
-                        "ok\n".into()
                     } else {
-                        "error: Niri command worker unavailable\n".into()
+                        // IPC focus commands come from external controls such as
+                        // the Noctalia taskbar. Mark them as self-focus before
+                        // the worker can deliver the focus event back to us.
+                        peek_suppressed_until = Instant::now() + SELF_FOCUS_GRACE;
+                        if niri_command_tx
+                            .send(NiriCommand::FocusWindow(window_id))
+                            .is_ok()
+                        {
+                            "ok\n".into()
+                        } else {
+                            "error: Niri command worker unavailable\n".into()
+                        }
                     }
                 }
                 ControlCommand::FocusWorkspace { workspace_id } => {
                     if snapshot.workspace(workspace_id).is_none() {
                         "error: unknown workspace\n".into()
-                    } else if niri_command_tx
-                        .send(NiriCommand::FocusWorkspace(workspace_id))
-                        .is_ok()
-                    {
-                        "ok\n".into()
                     } else {
-                        "error: Niri command worker unavailable\n".into()
+                        peek_suppressed_until = Instant::now() + SELF_FOCUS_GRACE;
+                        if niri_command_tx
+                            .send(NiriCommand::FocusWorkspace(workspace_id))
+                            .is_ok()
+                        {
+                            "ok\n".into()
+                        } else {
+                            "error: Niri command worker unavailable\n".into()
+                        }
                     }
                 }
                 ControlCommand::CycleWorkspace { output, delta } => {
@@ -686,14 +695,17 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                         Some(model.workspaces[next].id)
                     });
                     match target {
-                        Some(workspace_id)
+                        Some(workspace_id) => {
+                            peek_suppressed_until = Instant::now() + SELF_FOCUS_GRACE;
                             if niri_command_tx
                                 .send(NiriCommand::FocusWorkspace(workspace_id))
-                                .is_ok() =>
-                        {
-                            "ok\n".into()
+                                .is_ok()
+                            {
+                                "ok\n".into()
+                            } else {
+                                "error: Niri command worker unavailable\n".into()
+                            }
                         }
-                        Some(_) => "error: Niri command worker unavailable\n".into(),
                         None => "error: unknown output or no workspaces\n".into(),
                     }
                 }
