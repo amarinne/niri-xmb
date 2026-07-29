@@ -558,6 +558,8 @@ pub struct BehaviorConfig {
     pub close_on_window_click: bool,
     pub close_on_workspace_click: bool,
     pub close_on_drop: bool,
+    /// Close when Niri focus changes outside an XMB action.
+    pub close_on_external_focus_change: bool,
     pub close_on_outside_click: bool,
     /// Replay a captured outside click after the popup closes.
     pub replay_outside_click: bool,
@@ -576,6 +578,7 @@ impl Default for BehaviorConfig {
             close_on_window_click: true,
             close_on_workspace_click: false,
             close_on_drop: false,
+            close_on_external_focus_change: false,
             close_on_outside_click: false,
             replay_outside_click: false,
             close_on_escape: true,

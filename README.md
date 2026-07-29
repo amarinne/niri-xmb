@@ -240,10 +240,15 @@ transient alt-tab-style popup. Outside click and Escape have independent
 switches as well.
 
 When `close_on_outside_click = false`, the popup advertises only its visible
-panel as a pointer-input region. Bars, docks, and windows remain clickable.
-Set `close_on_outside_click = true` and `replay_outside_click = true` to close
-the popup and send the click to the surface below it. If Niri does not provide
-the virtual pointer protocol, niri-xmb keeps outside clicks as pass-through.
+panel as a pointer-input region. Bars, docks, and windows keep pointer hover,
+drag, and click input. Set `close_on_external_focus_change = true` to close the
+popup after a pass-through click changes Niri focus.
+
+Set `close_on_outside_click = true` and `replay_outside_click = true` only for
+surfaces that do not need hover or drag input. This mode captures pointer
+motion while the popup is open, then replays the closing click. If Niri does
+not provide the virtual pointer protocol, niri-xmb keeps outside clicks as
+pass-through.
 
 Print the complete commented configuration template with:
 

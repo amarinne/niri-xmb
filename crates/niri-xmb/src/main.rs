@@ -486,6 +486,19 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 .replace(signature)
                 .is_some_and(|previous| previous != *observed.as_ref().unwrap());
             if changed {
+                if should_close_on_external_focus_change(
+                    &config,
+                    popup_mode,
+                    now,
+                    peek_suppressed_until,
+                ) {
+                    surfaces.hide_all_popups()?;
+                    popup_outputs.clear();
+                    popup_mode = PopupMode::Hidden;
+                    popup_origin_focus = None;
+                    follow_candidate = None;
+                    press = None;
+                }
                 if Instant::now() >= peek_suppressed_until {
                     // Whatever the popup is showing, it now shows where Niri
                     // actually is. Peek and the interactive panel behave as one
@@ -1009,6 +1022,17 @@ fn should_capture_outside_click(config: &Config, virtual_pointer_available: bool
         && (!config.behavior.replay_outside_click || virtual_pointer_available)
 }
 
+fn should_close_on_external_focus_change(
+    config: &Config,
+    popup_mode: PopupMode,
+    now: Instant,
+    self_focus_suppressed_until: Instant,
+) -> bool {
+    config.behavior.close_on_external_focus_change
+        && popup_mode == PopupMode::Manual
+        && now >= self_focus_suppressed_until
+}
+
 fn show_popup(
     surfaces: &mut SurfaceManager,
     snapshot: &Snapshot,
@@ -1122,6 +1146,7 @@ fn handle_ui_event(
                     }
                     HitTarget::Workspace { workspace_id, .. } => {
                         let _ = niri_tx.send(NiriCommand::FocusWorkspace(workspace_id));
+                        *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
                         if matches!(event.kind, SurfaceKind::Popup)
                             && config.behavior.close_on_workspace_click
                         {
@@ -1185,6 +1210,9 @@ fn handle_ui_event(
                         },
                         niri_tx,
                     );
+                    if dropped {
+                        *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
+                    }
                     if dropped && config.behavior.close_on_drop && !popup_outputs.is_empty() {
                         surfaces.hide_all_popups()?;
                         popup_outputs.clear();
@@ -1792,6 +1820,32 @@ mod tests {
 
         config.behavior.replay_outside_click = false;
         assert!(should_capture_outside_click(&config, false));
+    }
+
+    #[test]
+    fn external_focus_close_ignores_xmb_focus_echoes() {
+        let mut config = Config::default();
+        config.behavior.close_on_external_focus_change = true;
+        let now = Instant::now();
+
+        assert!(should_close_on_external_focus_change(
+            &config,
+            PopupMode::Manual,
+            now,
+            now
+        ));
+        assert!(!should_close_on_external_focus_change(
+            &config,
+            PopupMode::Manual,
+            now,
+            now + SELF_FOCUS_GRACE
+        ));
+        assert!(!should_close_on_external_focus_change(
+            &config,
+            PopupMode::Peek,
+            now,
+            now
+        ));
     }
 
     #[test]
