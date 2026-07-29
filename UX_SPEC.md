@@ -8,7 +8,7 @@ The words **must**, **should**, and **may** state requirement levels.
 - The popup must show Niri state without changing window layout.
 - Window organization must not move pointer focus to the target output.
 - Surfaces outside the panel must keep normal hover, drag, and click behavior.
-- Common window activation must close the popup with one action.
+- Window activation from inside the panel must close the popup with one action.
 - Multi-window organization must keep the popup open.
 - Missing optional configuration must use documented defaults.
 - Invalid configuration must not stop the active daemon.
@@ -25,6 +25,8 @@ Manual mode must take keyboard focus for navigation. Peek mode must remain passi
 Opening manual mode while peek is visible must promote the existing popup.
 The desktop profile must show peek for deliberate left/right window focus changes.
 Window creation, window removal, and XMB-generated focus changes must not raise peek.
+Each qualifying focus move must extend the active peek without hiding it first.
+Peek expiry must pause while a focus event burst settles.
 
 ## Panel placement and outputs
 
@@ -54,15 +56,14 @@ Dock magnification and drag operations must work while the popup is open.
 The desktop profile uses these settings:
 
 ```toml
-close_on_external_focus_change = true
+close_on_external_focus_change = false
 close_on_outside_click = false
 replay_outside_click = false
 ```
 
-A pass-through click that changes Niri focus must close the popup.
-A click on the wallpaper might not change focus and may leave the popup open.
-A click on the already-focused window might also leave the popup open.
-Use `Escape` or `Mod+Z` for these cases.
+External focus changes must keep a manual popup open.
+This rule gives hotkey navigation and pass-through clicks the same result.
+Use `Escape` or `Mod+Z` to close a manual popup after an outside interaction.
 
 Full-output click capture must remain optional. Click replay cannot reproduce hover or drag motion.
 Do not enable capture and replay for the desktop profile.
@@ -74,7 +75,7 @@ Do not enable capture and replay for the desktop profile.
 | Click a window icon | Focus window and close | `close_on_window_click = true` |
 | Click a workspace | Focus workspace and keep open | `close_on_workspace_click = false` |
 | Complete drag and drop | Move window and keep open | `close_on_drop = false` |
-| Click outside and change focus | Pass click through and close | `close_on_external_focus_change = true` |
+| Click outside and change focus | Pass click through and keep open | `close_on_external_focus_change = false` |
 | Press `Escape` | Close | `close_on_escape = true` |
 | Press `Mod+Z` while open | Close | Toggle command |
 
@@ -88,6 +89,7 @@ Closing the popup must clear the staged selection.
 
 The optional `live` mode may move Niri focus on every navigation step.
 XMB-generated focus changes must not close the popup as external changes.
+External Niri hotkeys must not change manual mode into hidden or peek mode.
 
 ## Drag and drop
 

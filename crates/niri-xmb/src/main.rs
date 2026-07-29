@@ -568,7 +568,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         // gets out of the way immediately.
         if popup_mode == PopupMode::Peek
             && (snapshot.overview_open
-                || peek_deadline.is_some_and(|deadline| Instant::now() >= deadline))
+                || peek_deadline_reached(peek_deadline, pending_focus_since, Instant::now()))
         {
             surfaces.hide_all_popups()?;
             popup_outputs.clear();
@@ -962,6 +962,18 @@ fn focus_signature(snapshot: &Snapshot, include_window: bool) -> FocusMark {
 /// a session the user is driving, and Niri's own full-screen overview.
 fn peek_should_skip(config: &Config, snapshot: &Snapshot, mode: PopupMode) -> bool {
     !config.peek.enabled || mode == PopupMode::Manual || snapshot.overview_open
+}
+
+/// Keep an existing peek visible while a focus event burst settles.
+///
+/// The settled event can extend the peek deadline. Hiding during the settle
+/// window causes a visible close-and-reopen flicker between hotkey moves.
+fn peek_deadline_reached(
+    deadline: Option<Instant>,
+    pending_focus_since: Option<Instant>,
+    now: Instant,
+) -> bool {
+    pending_focus_since.is_none() && deadline.is_some_and(|deadline| now >= deadline)
 }
 
 /// Raise (or extend) the passive peek overlay after Niri focus moved.
@@ -1846,6 +1858,16 @@ mod tests {
             now,
             now
         ));
+    }
+
+    #[test]
+    fn pending_focus_holds_expired_peek_open() {
+        let now = Instant::now();
+        let expired = Some(now - Duration::from_millis(1));
+
+        assert!(!peek_deadline_reached(expired, Some(now), now));
+        assert!(peek_deadline_reached(expired, None, now));
+        assert!(!peek_deadline_reached(None, None, now));
     }
 
     #[test]
