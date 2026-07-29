@@ -808,26 +808,42 @@ impl Renderer {
         let count = outputs.len() as f32;
         let output_width = pixmap.width() as f32;
         let output_height = pixmap.height() as f32;
-        // Canvases keep their configured size; `popup.width`/`height` only cap
-        // how much of the panel can be shown on a small screen.
+        // A configured canvas can be larger than the panel maximum. Fit the
+        // canvas inside the final panel so its focal point stays centred and
+        // content never extends beyond the panel chrome.
+        let max_panel_width = config
+            .popup
+            .width
+            .resolve(output_width)
+            .min(pixmap.width().saturating_sub(24) as f32)
+            .max(1.0);
+        let max_panel_height = config
+            .popup
+            .height
+            .resolve(output_height)
+            .min(pixmap.height().saturating_sub(24) as f32)
+            .max(1.0);
+        let canvas_width_limit =
+            ((max_panel_width - padding * 2.0 - gap * (count - 1.0)) / count).max(1.0);
+        let canvas_height_limit = (max_panel_height - padding * 2.0 - header).max(1.0);
+        let output_canvas_width_limit = (pixmap.width().saturating_sub(64) as f32 / count).max(1.0);
+        let output_canvas_height_limit = pixmap.height().saturating_sub(64) as f32;
         let canvas_width = config
             .popup
             .canvas_width
             .resolve(output_width)
             .max(120.0)
-            .min((pixmap.width().saturating_sub(64) as f32 / count).max(120.0));
+            .min(output_canvas_width_limit)
+            .min(canvas_width_limit);
         let canvas_height = config
             .popup
             .canvas_height
             .resolve(output_height)
             .max(90.0)
-            .min(pixmap.height().saturating_sub(64) as f32);
-        let panel_width = (padding * 2.0 + canvas_width * count + gap * (count - 1.0))
-            .min(config.popup.width.resolve(output_width))
-            .min(pixmap.width().saturating_sub(24) as f32);
-        let panel_height = (padding * 2.0 + header + canvas_height)
-            .min(config.popup.height.resolve(output_height))
-            .min(pixmap.height().saturating_sub(24) as f32);
+            .min(output_canvas_height_limit)
+            .min(canvas_height_limit);
+        let panel_width = padding * 2.0 + canvas_width * count + gap * (count - 1.0);
+        let panel_height = padding * 2.0 + header + canvas_height;
 
         let (mut panel_x, mut panel_y) = match config.popup.position {
             PopupPosition::Center => (
