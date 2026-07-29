@@ -165,6 +165,14 @@ niri msg action unset-window-urgent --id WINDOW_ID
 
 Niri does not set urgency on the focused window. Select a non-focused window ID.
 
+## Visual treatment
+
+The desktop profile uses a translucent warm glass theme.
+The panel gradient should remain between approximately 66 and 72 percent opacity.
+Panel borders and shadows should remain softer than application icons.
+Application icons, selected titles, accents, and urgency badges must remain legible.
+Transparency must not change pointer input regions or popup lifetime behavior.
+
 ## Configuration resolution
 
 An omitted field must use its Rust `Default` value.
