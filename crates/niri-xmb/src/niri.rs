@@ -189,12 +189,11 @@ fn apply_event(state: &mut NiriState, event: Event) -> bool {
             true
         }
         Event::WindowLayoutsChanged { changes } => {
+            let mut changed = false;
             for (id, layout) in changes {
-                if let Some(window) = state.window_mut(id) {
-                    window.layout = layout;
-                }
+                changed = state.set_window_layout(id, layout) || changed;
             }
-            true
+            changed
         }
         Event::OverviewOpenedOrClosed { is_open } => {
             state.set_overview_open(is_open);

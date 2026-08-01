@@ -4,7 +4,12 @@ local state = {
     lastGeneration = -1,
     lastError = nil,
     icons = {},
+    hoveredWindowId = nil,
+    pendingDrop = nil,
 }
+
+local render
+local poll
 
 local function config(key, fallback)
     local value = noctalia.getConfig(key)
@@ -47,6 +52,44 @@ local function findOutput(name)
     return nil
 end
 
+local function findWorkspaceIn(snapshot, workspaceId)
+    if snapshot == nil or snapshot.outputs == nil then
+        return nil, nil
+    end
+    for _, output in ipairs(snapshot.outputs) do
+        for _, workspace in ipairs(output.workspaces or {}) do
+            if workspace.id == workspaceId then
+                return output, workspace
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function findWorkspace(workspaceId)
+    return findWorkspaceIn(state.snapshot, workspaceId)
+end
+
+local function findWindowIn(snapshot, windowId)
+    if snapshot == nil or snapshot.outputs == nil then
+        return nil, nil, nil, nil
+    end
+    for _, output in ipairs(snapshot.outputs) do
+        for _, workspace in ipairs(output.workspaces or {}) do
+            for index, window in ipairs(workspace.windows or {}) do
+                if window.id == windowId then
+                    return output, workspace, index, window
+                end
+            end
+        end
+    end
+    return nil, nil, nil, nil
+end
+
+local function findWindow(windowId)
+    return findWindowIn(state.snapshot, windowId)
+end
+
 local function runAction(arguments, callback)
     local command = backend() .. " " .. arguments
     if callback == nil then
@@ -81,6 +124,64 @@ local function parseTarget(value)
     return tonumber(workspaceId), tonumber(targetWindowId), tonumber(fraction)
 end
 
+local function applyOptimisticDrop(sourceWindowId, workspaceId, targetWindowId, fraction)
+    local _, sourceWorkspace, sourceIndex, sourceWindow = findWindow(sourceWindowId)
+    local _, targetWorkspace = findWorkspace(workspaceId)
+    if sourceWorkspace == nil or sourceIndex == nil or sourceWindow == nil or targetWorkspace == nil then
+        return false
+    end
+    if targetWindowId == sourceWindowId then
+        return false
+    end
+
+    table.remove(sourceWorkspace.windows, sourceIndex)
+
+    local insertIndex = #(targetWorkspace.windows or {}) + 1
+    if targetWindowId ~= nil and targetWindowId > 0 then
+        for index, window in ipairs(targetWorkspace.windows or {}) do
+            if window.id == targetWindowId then
+                insertIndex = index
+                if fraction >= 0.5 then
+                    insertIndex = insertIndex + 1
+                end
+                break
+            end
+        end
+    end
+
+    sourceWindow.workspace_id = workspaceId
+    sourceWindow.floating = false
+    table.insert(targetWorkspace.windows, insertIndex, sourceWindow)
+    state.pendingDrop = {
+        sourceWindowId = sourceWindowId,
+        workspaceId = workspaceId,
+        targetWindowId = targetWindowId,
+        fraction = fraction,
+        pollsRemaining = 12,
+    }
+    state.lastGeneration = -1
+    render()
+    return true
+end
+
+local function pendingDropMatches(snapshot, pending)
+    local _, workspace, sourceIndex = findWindowIn(snapshot, pending.sourceWindowId)
+    if workspace == nil or sourceIndex == nil or workspace.id ~= pending.workspaceId then
+        return false
+    end
+    if pending.targetWindowId == nil or pending.targetWindowId <= 0 then
+        return true
+    end
+    local _, targetWorkspace, targetIndex = findWindowIn(snapshot, pending.targetWindowId)
+    if targetWorkspace == nil or targetIndex == nil or targetWorkspace.id ~= pending.workspaceId then
+        return false
+    end
+    if pending.fraction < 0.5 then
+        return sourceIndex + 1 == targetIndex
+    end
+    return sourceIndex == targetIndex + 1
+end
+
 local function onDrop(payload, value, sceneX, sceneY)
     local sourceWindowId = tonumber(payload)
     local workspaceId, targetWindowId, fraction = parseTarget(value)
@@ -88,6 +189,8 @@ local function onDrop(payload, value, sceneX, sceneY)
         noctalia.log("niri-xmb: rejected malformed drop payload")
         return
     end
+
+    applyOptimisticDrop(sourceWindowId, workspaceId, targetWindowId, fraction)
 
     local arguments = "drop --source-window-id " .. idString(sourceWindowId)
         .. " --target-workspace-id " .. idString(workspaceId)
@@ -107,9 +210,38 @@ local function onDrop(payload, value, sceneX, sceneY)
         end
     end
 
-    runAction(arguments, function(_)
-        state.lastGeneration = -1
+    local function commitDrop()
+        runAction(arguments, function(result)
+            local response = tostring(result.stdout or result.stderr or "")
+            if result.exitCode ~= 0 or string.match(response, "^error:") ~= nil then
+                noctalia.log("niri-xmb drop failed: " .. response)
+                state.pendingDrop = nil
+            end
+            state.lastGeneration = -1
+        end)
+    end
+
+    -- barWidget.render() is returned as part of this script callback. Give the
+    -- host one display frame to apply it before Niri starts its multi-step move.
+    local deferred = noctalia.runAsync("sleep 0.016", function(_)
+        commitDrop()
     end)
+    if not deferred then
+        commitDrop()
+    end
+end
+
+local function onSourceDrop(payload, value, _, _)
+    local sourceWindowId = tonumber(payload)
+    local workspaceId, targetWindowId, fraction = parseTarget(value)
+    if sourceWindowId == nil or workspaceId == nil or fraction == nil then
+        return
+    end
+    local target = findWorkspace(workspaceId)
+    if target == nil or target.name == targetOutput() then
+        return
+    end
+    applyOptimisticDrop(sourceWindowId, workspaceId, targetWindowId, fraction)
 end
 
 local function marker(workspaceId, targetWindowId, fraction, key, height, slop)
@@ -126,28 +258,7 @@ local function marker(workspaceId, targetWindowId, fraction, key, height, slop)
     })
 end
 
-local function workspaceWidth(windowCount, iconSize, allowDrag)
-    local workspacePadding = 3 * 2
-    if windowCount == 0 then
-        return 10 + workspacePadding
-    end
-
-    local rowGap = 1
-    local itemWidth = iconSize + 6
-    local childCount = windowCount
-    local contentWidth = windowCount * itemWidth
-    if allowDrag then
-        -- One marker before every window plus one trailing marker.
-        childCount = windowCount * 2 + 1
-        contentWidth = contentWidth + windowCount + 1
-    end
-    if childCount > 1 then
-        contentWidth = contentWidth + (childCount - 1) * rowGap
-    end
-    return contentWidth + workspacePadding
-end
-
-local function windowVisual(window, iconSize)
+local function windowVisual(window, iconSize, showIndicator)
     local path = iconPath(window.app_id, iconSize)
     local children = {}
     if path ~= nil then
@@ -168,11 +279,35 @@ local function windowVisual(window, iconSize)
         }))
     end
 
+    if window.focused and showIndicator then
+        local dotSize = math.max(4, math.floor(iconSize * 0.32 + 0.5))
+        return {
+            ui.column({
+                key = "focused-content",
+                width = iconSize,
+                height = iconSize,
+                align = "center",
+                justify = "center",
+                gap = -dotSize,
+            }, {
+                children[1],
+                ui.box({
+                    key = "active-dot",
+                    width = dotSize,
+                    height = dotSize,
+                    radius = dotSize / 2,
+                    fill = "primary",
+                }),
+            }),
+        }
+    end
+
     return children
 end
 
-local function windowItem(window, iconSize, allowDrag)
+local function windowItem(window, iconSize, allowDrag, showIndicator)
     local windowId = window.id
+    local hovered = state.hoveredWindowId == windowId
     local props = {
         key = "window-" .. idString(windowId),
         width = iconSize + 6,
@@ -180,20 +315,28 @@ local function windowItem(window, iconSize, allowDrag)
         align = "center",
         justify = "center",
         padding = 3,
-        radius = 7,
-        fill = window.focused and "primary/0.20" or "#00000000",
-        border = window.urgent and "error/0.9" or (window.focused and "primary/0.55" or "outline/0.16"),
-        borderWidth = 1,
+        radius = (iconSize + 6) / 2,
+        fill = hovered and "on_surface/0.10" or "#00000000",
+        border = "#00000000",
+        borderWidth = 0,
         opacity = window.floating and 0.78 or 1.0,
         onClick = function()
             focusWindow(windowId)
         end,
+        onHover = function(value)
+            local nextId = tostring(value) == "true" and windowId or nil
+            if state.hoveredWindowId ~= nextId then
+                state.hoveredWindowId = nextId
+                render()
+            end
+        end,
     }
 
-    local children = windowVisual(window, iconSize)
+    local children = windowVisual(window, iconSize, showIndicator)
     if allowDrag then
         props.dragType = "niri-window"
         props.payload = idString(windowId)
+        props.onDragEnd = onSourceDrop
         props.tooltip = tostring(window.title or window.app_id or "")
         props.previewAncestor = 0
         props.liftFromLayout = false
@@ -205,7 +348,9 @@ end
 local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, showIndicator, inactiveOpacity)
     local windows = workspace.windows or {}
     local itemHeight = iconSize + 6
-    local slop = itemHeight * 0.48
+    -- Marker positions are one item plus one marker apart. Use a small overlap
+    -- so every point on an icon resolves to its left or right insertion zone.
+    local slop = (itemHeight + 1) * 0.5 + 0.5
     local leftFraction = allowJoin and 0.5 or 0.25
     local rightFraction = allowJoin and 0.5 or 0.75
     local rowChildren = {}
@@ -221,7 +366,7 @@ local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, showIndi
                 slop
             ))
         end
-        table.insert(rowChildren, windowItem(window, iconSize, allowDrag))
+        table.insert(rowChildren, windowItem(window, iconSize, allowDrag, showIndicator))
         if allowDrag and index == #windows then
             table.insert(rowChildren, marker(
                 workspace.id,
@@ -235,50 +380,69 @@ local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, showIndi
     end
 
     if #windows == 0 then
-        table.insert(rowChildren, ui.box({
+        table.insert(rowChildren, ui.row({
             key = "empty-" .. idString(workspace.id),
-            width = 10,
-            height = 10,
-            radius = 5,
-            fill = workspace.active and "primary/0.85" or "on_surface_variant/0.35",
+            width = itemHeight,
+            height = itemHeight,
+            align = "center",
+            justify = "center",
+            radius = itemHeight / 2,
+            fill = "#00000000",
             onClick = function()
                 focusWorkspace(workspace.id)
             end,
+        }, {
+            ui.row({
+                key = "empty-dot",
+                width = 8,
+                height = 8,
+                radius = 4,
+                fill = workspace.active and "primary" or "on_surface_variant/0.55",
+            }),
         }))
+    end
+
+    local urgent = false
+    for _, window in ipairs(windows) do
+        if window.urgent then
+            urgent = true
+            break
+        end
+    end
+
+    local groupFill = workspace.active and "surface_variant/0.52" or "surface_variant/0.18"
+    local groupBorder = workspace.active and "primary/0.65" or "primary/0.16"
+    if urgent then
+        groupFill = "error/0.18"
+        groupBorder = "error/0.80"
     end
 
     local groupChildren = {
         ui.row({
             key = "windows",
             align = "center",
-            gap = 1,
+            gap = 0,
         }, rowChildren),
     }
-    if showIndicator then
-        table.insert(groupChildren, ui.box({
-            key = "indicator",
-            height = 2,
-            radius = 1,
-            fill = workspace.active and "primary" or "#00000000",
-        }))
-    end
 
     local props = {
-        key = "workspace-" .. idString(workspace.id),
-        width = workspaceWidth(#windows, iconSize, allowDrag),
-        direction = "column",
-        align = "stretch",
-        gap = 1,
+        -- Use a new key so hosts that retained the old fixed-width node create
+        -- a fresh auto-sized node. Flex then tracks window count and order.
+        key = (#windows == 0 and "workspace-empty-" or "workspace-auto-") .. idString(workspace.id),
+        direction = "row",
+        align = "center",
+        justify = "center",
         paddingH = 3,
-        -- Keep the icon row, active indicator, and gap within Noctalia's
-        -- default 34px bar instead of clipping the capsule edges.
-        paddingV = 1,
-        radius = 18,
-        fill = workspace.active and "primary/0.10" or "surface_variant/0.20",
-        border = "#00000000",
-        borderWidth = 0,
+        paddingV = 2,
+        radius = (itemHeight + 4) / 2,
+        fill = groupFill,
+        border = groupBorder,
+        borderWidth = 1,
         opacity = workspace.active and 1.0 or inactiveOpacity,
     }
+    if #windows == 0 then
+        props.width = itemHeight + 6
+    end
 
     if allowDrag then
         props.accepts = { "niri-window" }
@@ -291,9 +455,17 @@ local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, showIndi
     return ui.column(props, groupChildren)
 end
 
-local function render()
+render = function()
     local output = findOutput(targetOutput())
     if output == nil then
+        if config("hide_when_output_missing", false) then
+            state.hoveredWindowId = nil
+            barWidget.render(ui.row({
+                key = "niri-xmb-missing-hidden",
+                visible = false,
+            }))
+            return
+        end
         barWidget.render(ui.row({
             key = "niri-xmb-missing",
             align = "center",
@@ -320,7 +492,7 @@ local function render()
 
     for _, workspace in ipairs(output.workspaces or {}) do
         local windows = workspace.windows or {}
-        if not hideEmpty or workspace.active or #windows > 0 then
+        if not hideEmpty or allowDrag or workspace.active or #windows > 0 then
             table.insert(children, workspaceNode(
                 workspace,
                 iconSize,
@@ -339,7 +511,7 @@ local function render()
     }, children))
 end
 
-local function poll(force)
+poll = function(force)
     if state.polling then
         return
     end
@@ -365,6 +537,17 @@ local function poll(force)
         end
 
         state.lastError = nil
+        if state.pendingDrop ~= nil then
+            if pendingDropMatches(decoded, state.pendingDrop) then
+                state.pendingDrop = nil
+            else
+                state.pendingDrop.pollsRemaining = state.pendingDrop.pollsRemaining - 1
+                if state.pendingDrop.pollsRemaining > 0 then
+                    return
+                end
+                state.pendingDrop = nil
+            end
+        end
         state.snapshot = decoded
         if force or decoded.generation ~= state.lastGeneration then
             state.lastGeneration = decoded.generation

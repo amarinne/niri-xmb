@@ -20,6 +20,10 @@
       "label": "Hide empty workspaces",
       "description": "Keep active workspaces visible while hiding other empty workspaces."
     },
+    "hide_when_output_missing": {
+      "label": "Hide missing output",
+      "description": "Hide this widget when its configured Niri output is not connected."
+    },
     "allow_drag": {
       "label": "Enable drag and drop",
       "description": "Allow tiled windows to be rearranged and moved between workspaces."
@@ -33,8 +37,8 @@
       "description": "Restore the pointer after niri-xmb temporarily focuses a moved window."
     },
     "show_active_indicator": {
-      "label": "Active indicator",
-      "description": "Show a primary-color line under the active workspace."
+      "label": "Active window indicator",
+      "description": "Show a primary-color dot on the focused window icon."
     },
     "icon_size": {
       "label": "Icon size",
@@ -42,7 +46,7 @@
     },
     "group_opacity": {
       "label": "Inactive opacity",
-      "description": "Opacity used for inactive workspace groups."
+      "description": "Opacity used for inactive workspace groups and their icons."
     }
   }
 }

@@ -1,6 +1,6 @@
 id = "amarinne/niri-xmb"
 name = "Niri XMB"
-version = "0.2.3"
+version = "0.3.1"
 description = "Per-output Niri workspace and window strip backed by niri-xmb."
 icon = "layout-grid"
 plugin_api = 16
@@ -49,6 +49,13 @@ description_key = "settings.hide_empty_workspaces.description"
 default = false
 
 [[widget.setting]]
+key = "hide_when_output_missing"
+type = "bool"
+label_key = "settings.hide_when_output_missing.label"
+description_key = "settings.hide_when_output_missing.description"
+default = false
+
+[[widget.setting]]
 key = "allow_drag"
 type = "bool"
 label_key = "settings.allow_drag.label"
@@ -91,7 +98,7 @@ key = "group_opacity"
 type = "double"
 label_key = "settings.group_opacity.label"
 description_key = "settings.group_opacity.description"
-default = 0.72
+default = 0.95
 min = 0.2
 max = 1.0
 step = 0.05

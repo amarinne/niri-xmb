@@ -32,9 +32,10 @@ allow_drag = true
 allow_column_join = false
 preserve_cursor_after_drag = true
 hide_empty_workspaces = false
+hide_when_output_missing = false
 show_active_indicator = true
 icon_size = 22
-group_opacity = 0.72
+group_opacity = 0.95
 poll_interval_ms = 250
 ```
 

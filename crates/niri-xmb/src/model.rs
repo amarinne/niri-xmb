@@ -1,4 +1,4 @@
-use niri_ipc::{Output, Window, Workspace};
+use niri_ipc::{Output, Window, WindowLayout, Workspace};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Default)]
@@ -221,6 +221,18 @@ impl NiriState {
 
     pub fn window_mut(&mut self, id: u64) -> Option<&mut Window> {
         self.windows.get_mut(&id)
+    }
+
+    pub fn set_window_layout(&mut self, id: u64, layout: WindowLayout) -> bool {
+        let Some(window) = self.windows.get_mut(&id) else {
+            return false;
+        };
+        if window.layout == layout {
+            return false;
+        }
+        window.layout = layout;
+        self.generation += 1;
+        true
     }
 
     pub fn remove_window(&mut self, id: u64) {
@@ -456,6 +468,21 @@ mod tests {
         layout_update.layout.pos_in_scrolling_layout = Some((2, 1));
         let before = state.snapshot().generation;
         assert!(state.upsert_window(layout_update));
+        assert_eq!(state.snapshot().generation, before + 1);
+    }
+
+    #[test]
+    fn layout_only_update_bumps_generation() {
+        let mut state = NiriState::default();
+        assert!(state.upsert_window(test_window()));
+        let before = state.snapshot().generation;
+
+        let mut layout = test_window().layout;
+        layout.pos_in_scrolling_layout = Some((2, 1));
+        assert!(state.set_window_layout(10, layout.clone()));
+        assert_eq!(state.snapshot().generation, before + 1);
+
+        assert!(!state.set_window_layout(10, layout));
         assert_eq!(state.snapshot().generation, before + 1);
     }
 
