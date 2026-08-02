@@ -289,6 +289,7 @@ impl SurfaceManager {
             pointer_x: 0.0,
             pointer_y: 0.0,
             pointer_surface: None,
+            keyboard_surface: None,
             _virtual_pointer_manager: virtual_pointer_manager,
             virtual_pointer,
             started_at: Instant::now(),
@@ -533,6 +534,9 @@ impl SurfaceManager {
                 surface.last_damage = None;
                 if self.state.pointer_surface == Some(surface.id) {
                     self.state.pointer_surface = None;
+                }
+                if self.state.keyboard_surface == Some(surface.id) {
+                    self.state.keyboard_surface = None;
                 }
                 // Dropping the layer role also destroys its wl_surface. Keep
                 // the SHM pool and buffers in SurfaceEntry for a cheap remap.
@@ -895,6 +899,13 @@ struct WaylandState {
     pointer_x: f64,
     pointer_y: f64,
     pointer_surface: Option<usize>,
+    /// Where key events go, tracked separately from the pointer.
+    ///
+    /// The two focuses move independently: the pointer leaves the panel while
+    /// the panel still holds the keyboard. Routing keys by pointer instead
+    /// silently dropped them, and an exclusive layer surface holding a keyboard
+    /// it then ignores swallows Escape along with everything else.
+    keyboard_surface: Option<usize>,
     _virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
     virtual_pointer: Option<ZwlrVirtualPointerV1>,
     started_at: Instant,
@@ -1366,16 +1377,19 @@ impl KeyboardHandler for WaylandState {
         _: &[u32],
         _: &[Keysym],
     ) {
-        self.pointer_surface = self.surface_for_wl(surface).map(|surface| surface.id);
+        self.keyboard_surface = self.surface_for_wl(surface).map(|surface| surface.id);
     }
     fn leave(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _: u32,
     ) {
+        if self.surface_for_wl(surface).map(|surface| surface.id) == self.keyboard_surface {
+            self.keyboard_surface = None;
+        }
     }
     fn press_key(
         &mut self,
@@ -1385,7 +1399,7 @@ impl KeyboardHandler for WaylandState {
         _: u32,
         event: KeyEvent,
     ) {
-        if let Some(id) = self.pointer_surface {
+        if let Some(id) = self.keyboard_surface {
             self.emit(
                 id,
                 UiEventKind::Key {
@@ -1422,7 +1436,7 @@ impl KeyboardHandler for WaylandState {
         _: u32,
         event: KeyEvent,
     ) {
-        if let Some(id) = self.pointer_surface {
+        if let Some(id) = self.keyboard_surface {
             self.emit(
                 id,
                 UiEventKind::Key {

@@ -22,6 +22,8 @@ The words **must**, **should**, and **may** state requirement levels.
 | Peek | Niri workspace or window navigation | None | None | Hide after `peek.duration_ms` |
 
 Manual mode must take keyboard focus for navigation. Peek mode must remain passive.
+Pointer focus and keyboard focus must be tracked separately.
+A manual panel must keep answering keys after the pointer leaves it.
 Opening manual mode while peek is visible must promote the existing popup.
 The desktop profile must show peek for deliberate left/right window focus changes.
 Window creation, window removal, and XMB-generated focus changes must not raise peek.
