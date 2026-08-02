@@ -36,9 +36,14 @@
       "label": "Preserve cursor after drag",
       "description": "Restore the pointer after niri-xmb temporarily focuses a moved window."
     },
-    "show_active_indicator": {
+    "active_indicator_mode": {
       "label": "Active window indicator",
-      "description": "Show a primary-color dot on the focused window icon."
+      "description": "Choose how the focused window is marked.",
+      "options": {
+        "dot": "Dot",
+        "underline": "Underline",
+        "none": "None"
+      }
     },
     "icon_size": {
       "label": "Icon size",

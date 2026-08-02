@@ -277,7 +277,7 @@ local function marker(workspaceId, targetWindowId, fraction, key, height, slop)
     })
 end
 
-local function windowVisual(window, iconSize, showIndicator)
+local function windowVisual(window, iconSize, indicatorMode)
     local path = iconPath(window.app_id, iconSize)
     local children = {}
     if path ~= nil then
@@ -298,25 +298,39 @@ local function windowVisual(window, iconSize, showIndicator)
         }))
     end
 
-    if window.focused and showIndicator then
-        local dotSize = math.max(4, math.floor(iconSize * 0.32 + 0.5))
+    if window.focused and indicatorMode ~= "none" then
+        local indicator
+        local indicatorSize
+        if indicatorMode == "underline" then
+            indicatorSize = 2
+            indicator = ui.box({
+                key = "active-underline",
+                width = math.max(8, math.floor(iconSize * 0.62 + 0.5)),
+                height = indicatorSize,
+                radius = indicatorSize / 2,
+                fill = "primary",
+            })
+        else
+            indicatorSize = math.max(4, math.floor(iconSize * 0.32 + 0.5))
+            indicator = ui.box({
+                key = "active-dot",
+                width = indicatorSize,
+                height = indicatorSize,
+                radius = indicatorSize / 2,
+                fill = "primary",
+            })
+        end
         return {
             ui.column({
-                key = "focused-content",
+                key = "focused-content-" .. indicatorMode,
                 width = iconSize,
                 height = iconSize,
                 align = "center",
                 justify = "center",
-                gap = -dotSize,
+                gap = -indicatorSize,
             }, {
                 children[1],
-                ui.box({
-                    key = "active-dot",
-                    width = dotSize,
-                    height = dotSize,
-                    radius = dotSize / 2,
-                    fill = "primary",
-                }),
+                indicator,
             }),
         }
     end
@@ -324,7 +338,7 @@ local function windowVisual(window, iconSize, showIndicator)
     return children
 end
 
-local function windowItem(window, iconSize, allowDrag, showIndicator)
+local function windowItem(window, iconSize, allowDrag, indicatorMode)
     local windowId = window.id
     local hovered = state.hoveredWindowId == windowId
     local props = {
@@ -351,7 +365,7 @@ local function windowItem(window, iconSize, allowDrag, showIndicator)
         end,
     }
 
-    local children = windowVisual(window, iconSize, showIndicator)
+    local children = windowVisual(window, iconSize, indicatorMode)
     if allowDrag then
         props.dragType = "niri-window"
         props.payload = idString(windowId)
@@ -364,7 +378,7 @@ local function windowItem(window, iconSize, allowDrag, showIndicator)
     return ui.row(props, children)
 end
 
-local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, showIndicator, inactiveOpacity)
+local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, indicatorMode, inactiveOpacity)
     local windows = workspace.windows or {}
     local itemHeight = iconSize + 6
     -- Marker positions are one item plus one marker apart. Use a small overlap
@@ -385,7 +399,7 @@ local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, showIndi
                 slop
             ))
         end
-        table.insert(rowChildren, windowItem(window, iconSize, allowDrag, showIndicator))
+        table.insert(rowChildren, windowItem(window, iconSize, allowDrag, indicatorMode))
         if allowDrag and index == #windows then
             table.insert(rowChildren, marker(
                 workspace.id,
@@ -504,7 +518,10 @@ render = function()
     local iconSize = math.floor(config("icon_size", 22))
     local allowDrag = config("allow_drag", true)
     local allowJoin = config("allow_column_join", false)
-    local showIndicator = config("show_active_indicator", true)
+    local indicatorMode = string.lower(tostring(config("active_indicator_mode", "dot")))
+    if indicatorMode ~= "dot" and indicatorMode ~= "underline" and indicatorMode ~= "none" then
+        indicatorMode = "dot"
+    end
     local hideEmpty = config("hide_empty_workspaces", false)
     local inactiveOpacity = config("group_opacity", 0.72)
     local children = {}
@@ -517,7 +534,7 @@ render = function()
                 iconSize,
                 allowDrag,
                 allowJoin,
-                showIndicator,
+                indicatorMode,
                 inactiveOpacity
             ))
         end

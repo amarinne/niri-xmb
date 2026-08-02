@@ -1,6 +1,6 @@
 id = "amarinne/niri-xmb"
 name = "Niri XMB"
-version = "0.3.2"
+version = "0.3.3"
 description = "Per-output Niri workspace and window strip backed by niri-xmb."
 icon = "layout-grid"
 plugin_api = 16
@@ -77,11 +77,16 @@ description_key = "settings.preserve_cursor_after_drag.description"
 default = true
 
 [[widget.setting]]
-key = "show_active_indicator"
-type = "bool"
-label_key = "settings.show_active_indicator.label"
-description_key = "settings.show_active_indicator.description"
-default = true
+key = "active_indicator_mode"
+type = "select"
+label_key = "settings.active_indicator_mode.label"
+description_key = "settings.active_indicator_mode.description"
+default = "dot"
+options = [
+  { value = "dot", label_key = "settings.active_indicator_mode.options.dot" },
+  { value = "underline", label_key = "settings.active_indicator_mode.options.underline" },
+  { value = "none", label_key = "settings.active_indicator_mode.options.none" },
+]
 
 [[widget.setting]]
 key = "icon_size"
