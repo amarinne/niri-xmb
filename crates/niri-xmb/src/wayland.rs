@@ -212,6 +212,35 @@ struct OutputRecord {
     height: i32,
 }
 
+/// Which input classes a popup surface accepts.
+///
+/// Pointer and keyboard are separate because the peek overlay wants exactly one
+/// of them: it may follow the pointer so the panel can be grabbed by hand, while
+/// leaving the keyboard alone so the Niri keybinds that raised it keep working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PopupInput {
+    pub pointer: bool,
+    pub keyboard: bool,
+}
+
+impl PopupInput {
+    /// A passive readout: clicks and keys pass straight through.
+    pub const NONE: Self = Self {
+        pointer: false,
+        keyboard: false,
+    };
+    /// Grabbable by pointer, but still transparent to the keyboard.
+    pub const POINTER: Self = Self {
+        pointer: true,
+        keyboard: false,
+    };
+    /// A session the user drives.
+    pub const FULL: Self = Self {
+        pointer: true,
+        keyboard: true,
+    };
+}
+
 struct SurfaceEntry {
     id: usize,
     kind: SurfaceKind,
@@ -226,7 +255,7 @@ struct SurfaceEntry {
     height: u32,
     configured: bool,
     visible: bool,
-    interactive: bool,
+    input: PopupInput,
     capture_outside: bool,
     input_rect: Option<DamageRect>,
     frame_ready: bool,
@@ -472,19 +501,19 @@ impl SurfaceManager {
     }
 
     pub fn show_popups(&mut self, outputs: &[String], capture_outside: bool) -> Result<()> {
-        self.show_popups_with(outputs, true, capture_outside)
+        self.show_popups_with(outputs, PopupInput::FULL, capture_outside)
     }
 
     /// Show the popup on `outputs`.
     ///
-    /// With `interactive` false the surface takes neither pointer nor keyboard
-    /// input: that is what makes the peek overlay a passive readout, letting
-    /// the compositor keybinds the user is pressing continue to reach Niri and
-    /// clicks pass through to whatever is underneath.
+    /// `input` decides what the surface accepts. `PopupInput::NONE` is what
+    /// makes the peek overlay a passive readout, letting the compositor
+    /// keybinds the user is pressing continue to reach Niri and clicks pass
+    /// through to whatever is underneath.
     pub fn show_popups_with(
         &mut self,
         outputs: &[String],
-        interactive: bool,
+        input: PopupInput,
         capture_outside: bool,
     ) -> Result<()> {
         for index in 0..self.state.surfaces.len() {
@@ -501,7 +530,7 @@ impl SurfaceManager {
                 }
                 let surface = &mut self.state.surfaces[index];
                 surface.visible = true;
-                surface.interactive = interactive;
+                surface.input = input;
                 surface.capture_outside = capture_outside;
                 if remap {
                     // A new layer role needs a fresh configure before the
@@ -514,7 +543,7 @@ impl SurfaceManager {
                 let Some(layer_surface) = &surface.layer_surface else {
                     continue;
                 };
-                layer_surface.set_keyboard_interactivity(if interactive {
+                layer_surface.set_keyboard_interactivity(if input.keyboard {
                     KeyboardInteractivity::Exclusive
                 } else {
                     KeyboardInteractivity::None
@@ -526,7 +555,7 @@ impl SurfaceManager {
             {
                 let surface = &mut self.state.surfaces[index];
                 surface.visible = false;
-                surface.interactive = false;
+                surface.input = PopupInput::NONE;
                 surface.capture_outside = false;
                 surface.input_rect = None;
                 surface.configured = false;
@@ -552,6 +581,43 @@ impl SurfaceManager {
         Ok(())
     }
 
+    /// Change what visible popups accept without re-showing them.
+    ///
+    /// Promotion is the whole point: the surface, its buffers, and its open
+    /// animation stay exactly as they are, so handing a peek overlay over to
+    /// the pointer or keyboard costs an input region and a commit rather than a
+    /// visible close and reopen.
+    pub fn set_popup_input(&mut self, input: PopupInput, capture_outside: bool) -> Result<()> {
+        let mut changed = false;
+        for surface in &mut self.state.surfaces {
+            if surface.kind != SurfaceKind::Popup || !surface.visible {
+                continue;
+            }
+            if surface.input == input && surface.capture_outside == capture_outside {
+                continue;
+            }
+            surface.input = input;
+            surface.capture_outside = capture_outside;
+            apply_input_region(&self.queue.handle(), &self.state.compositor, surface);
+            let Some(layer_surface) = &surface.layer_surface else {
+                continue;
+            };
+            layer_surface.set_keyboard_interactivity(if input.keyboard {
+                KeyboardInteractivity::Exclusive
+            } else {
+                KeyboardInteractivity::None
+            });
+            layer_surface.commit();
+            changed = true;
+        }
+        if changed {
+            self.queue
+                .flush()
+                .context("failed to flush popup input change")?;
+        }
+        Ok(())
+    }
+
     pub fn set_popup_input_rect(&mut self, surface_id: usize, rect: DamageRect) -> Result<()> {
         let Some(surface) = self
             .state
@@ -565,7 +631,7 @@ impl SurfaceManager {
             return Ok(());
         }
         surface.input_rect = Some(rect);
-        if surface.visible && surface.interactive && !surface.capture_outside {
+        if surface.visible && surface.input.pointer && !surface.capture_outside {
             apply_input_region(&self.queue.handle(), &self.state.compositor, surface);
             if let Some(layer_surface) = &surface.layer_surface {
                 layer_surface.commit();
@@ -578,7 +644,7 @@ impl SurfaceManager {
     }
 
     pub fn hide_all_popups(&mut self) -> Result<()> {
-        self.show_popups_with(&[], false, false)
+        self.show_popups_with(&[], PopupInput::NONE, false)
     }
 
     pub fn cursor_restore_available(&self) -> bool {
@@ -862,13 +928,13 @@ fn apply_input_region(
     let Some(layer_surface) = &surface.layer_surface else {
         return;
     };
-    if surface.visible && surface.interactive && surface.capture_outside {
+    if surface.visible && surface.input.pointer && surface.capture_outside {
         layer_surface.wl_surface().set_input_region(None);
         return;
     }
     let region = compositor.wl_compositor().create_region(qh, ());
     if surface.visible
-        && surface.interactive
+        && surface.input.pointer
         && let Some(rect) = surface.input_rect
     {
         region.add(
@@ -1052,7 +1118,7 @@ impl WaylandState {
                 height: 0,
                 configured: false,
                 visible: kind != SurfaceKind::Popup,
-                interactive: false,
+                input: PopupInput::NONE,
                 capture_outside: false,
                 input_rect: None,
                 frame_ready: true,

@@ -550,6 +550,27 @@ pub struct PeekConfig {
     /// retargets on every pointer cross — and an overlay that reacts to all of
     /// it reads as noise rather than as a workspace navigator.
     pub on_window_focus: bool,
+    /// Let the pointer take the overlay over instead of it staying click-through.
+    ///
+    /// The overlay accepts pointer input over the panel rectangle only, and only
+    /// while it is on screen. Moving onto it holds it open; clicking it turns it
+    /// into a full manual session in place. The keyboard is never taken, so the
+    /// keybinds that raised the overlay keep working while the pointer rests on
+    /// it.
+    ///
+    /// Off by default: it trades a click-through panel for a grabbable one, and
+    /// that is a change of character rather than a refinement.
+    pub pointer_promote: bool,
+    /// How long the overlay stays click-through after appearing.
+    ///
+    /// A click already travelling towards whatever the overlay just covered must
+    /// still land there, so the pointer region is withheld for this long.
+    pub arm_grace_ms: u64,
+    /// How long the overlay lingers after the pointer leaves it again.
+    ///
+    /// Shorter than `duration_ms`: the user just declined it by moving away, and
+    /// the full countdown would read as the panel refusing to go.
+    pub demote_ms: u64,
 }
 
 impl Default for PeekConfig {
@@ -558,6 +579,9 @@ impl Default for PeekConfig {
             enabled: false,
             duration_ms: 1200,
             on_window_focus: false,
+            pointer_promote: false,
+            arm_grace_ms: 150,
+            demote_ms: 400,
         }
     }
 }

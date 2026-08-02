@@ -89,7 +89,11 @@ fn clamp_rect(rect: Rect, canvas: Rect) -> Rect {
 }
 
 /// Panel background: soft drop shadow, vertical gradient body, hairline edge.
-fn draw_panel_chrome(pixmap: &mut Pixmap, panel: Rect, config: &Config) {
+///
+/// `live` swaps the hairline for the accent colour. That edge is the whole
+/// difference between a panel that is only reporting and one that is ready to
+/// be clicked, so it is deliberately the same treatment a selection gets.
+fn draw_panel_chrome(pixmap: &mut Pixmap, panel: Rect, config: &Config, live: bool) {
     let radius = config.style.panel_radius;
     let offset = config.style.shadow_offset;
     let spread = config.style.shadow_spread;
@@ -133,7 +137,11 @@ fn draw_panel_chrome(pixmap: &mut Pixmap, panel: Rect, config: &Config) {
         panel.width - 1.0,
         panel.height - 1.0,
         radius,
-        hex_color(&config.style.border),
+        if live {
+            hex_color(&config.style.accent)
+        } else {
+            hex_color(&config.style.border)
+        },
         config.style.border_width,
     );
 }
@@ -280,6 +288,12 @@ pub struct Renderer {
     hovered_surface: Option<usize>,
     hovered_target: Option<HoverTarget>,
     render_surface: Option<usize>,
+    /// The panel takes input and will act on a click.
+    ///
+    /// True for a manual session, and for a peek overlay the pointer has
+    /// reached. Both look the same on purpose: the edge means the same thing in
+    /// both, and a peek promoted by a click keeps it rather than flashing.
+    panel_live: bool,
     anim: Animator,
     /// Scratch buffers reused across frames. A popup surface is output-sized,
     /// so reallocating these per frame is the dominant cost of animating.
@@ -300,6 +314,7 @@ impl Renderer {
             hovered_surface: None,
             hovered_target: None,
             render_surface: None,
+            panel_live: false,
             anim: Animator::new(),
             canvas: None,
             layer: None,
@@ -428,6 +443,13 @@ impl Renderer {
         let changed = self.hovered_surface != Some(surface_id) || self.hovered_target != target;
         self.hovered_surface = Some(surface_id);
         self.hovered_target = target;
+        changed
+    }
+
+    /// Mark the panel as ready to act on a click. Returns whether it changed.
+    pub fn set_panel_live(&mut self, live: bool) -> bool {
+        let changed = self.panel_live != live;
+        self.panel_live = live;
         changed
     }
 
@@ -892,7 +914,7 @@ impl Renderer {
             height: panel_height,
         };
 
-        draw_panel_chrome(pixmap, panel, config);
+        draw_panel_chrome(pixmap, panel, config, self.panel_live);
         zones.push(HitZone {
             rect: panel,
             target: HitTarget::Panel,

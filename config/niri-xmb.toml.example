@@ -80,6 +80,13 @@ margin = 48.0
 enabled = false         # automatically show on matching Niri focus changes
 duration_ms = 1200      # linger time; restarts while navigation continues
 on_window_focus = false # workspace switches only; ignores dialogs and pointer focus
+# The overlay is click-through by default. With pointer_promote the panel
+# rectangle takes pointer input while the overlay is up: moving onto it holds it
+# open, and clicking it becomes a full manual session in place. The keyboard is
+# never taken, so navigation keybinds keep working while the pointer rests on it.
+pointer_promote = false # let the pointer grab the overlay instead of passing through
+arm_grace_ms = 150      # stay click-through this long so an in-flight click still passes
+demote_ms = 400         # linger this long after the pointer moves off again
 
 [behavior]
 # "deferred": arrows stage a selection, Enter or a click applies it.

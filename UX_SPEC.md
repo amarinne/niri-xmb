@@ -19,7 +19,8 @@ The words **must**, **should**, and **may** state requirement levels.
 | --- | --- | --- | --- | --- |
 | Hidden | Startup or explicit hide | None | None | Not applicable |
 | Manual | `Mod+Z`, `show`, or `toggle` | Panel only | Yes | Behavior settings control closure |
-| Peek | Niri workspace or window navigation | None | None | Hide after `peek.duration_ms` |
+| Peek | Niri workspace or window navigation | None, or panel only with `peek.pointer_promote` | None | Hide after `peek.duration_ms` |
+| Peek armed | Pointer moves onto a visible peek panel | Panel only | None | Hide `peek.demote_ms` after the pointer leaves |
 
 Manual mode must take keyboard focus for navigation. Peek mode must remain passive.
 Pointer focus and keyboard focus must be tracked separately.
@@ -29,6 +30,24 @@ The desktop profile must show peek for deliberate left/right window focus change
 Window creation, window removal, and XMB-generated focus changes must not raise peek.
 Each qualifying focus move must extend the active peek without hiding it first.
 Peek expiry must pause while a focus event burst settles.
+
+## Peek promotion
+
+`peek.pointer_promote = false` keeps the overlay click-through. Promotion is then
+keybind-only, and every pointer event passes to whatever is underneath.
+
+`peek.pointer_promote = true` adds the pointer handover:
+
+- The overlay must stay click-through for `peek.arm_grace_ms` after appearing.
+- After that grace, the panel rectangle must accept pointer input. Nothing outside it may.
+- Peek must never take the keyboard, so the keybinds that raised it keep working.
+- Pointer motion over the panel must arm the overlay. A pointer that has not moved must not.
+- An armed overlay must not expire while the pointer rests on it.
+- An armed overlay must take the accent border. An unarmed one must not, whether or not it holds the rectangle.
+- Pointer exit must disarm and hide the overlay after `peek.demote_ms`.
+- A click on an armed or unarmed peek must promote it to manual mode and act on the same click.
+- Promotion must reuse the mapped surface, so no reopen animation may play.
+- Peek must never capture the whole output, whatever `close_on_outside_click` says.
 
 ## Panel placement and outputs
 
@@ -55,6 +74,7 @@ Panel size must shrink to visible content and stop at configured maximum sizes.
 ## Pointer behavior
 
 Manual mode must advertise only the visible panel as its pointer input region.
+Armed peek mode must use the same region and no more.
 Windows, bars, and docks outside the panel must receive normal pointer motion.
 Dock magnification and drag operations must work while the popup is open.
 
@@ -175,6 +195,11 @@ Niri does not set urgency on the focused window. Select a non-focused window ID.
 
 ## Visual treatment
 
+A panel that is taking input must draw its border in `style.accent`. Any other panel must draw it in `style.border`.
+A manual panel is always accented: it holds the keyboard whatever the pointer is doing.
+A peek overlay is accented only while the pointer is on it, which is the only input it can receive.
+Promotion must not change the border, because an armed overlay is already accented when the click lands.
+
 The desktop profile uses a translucent warm glass theme.
 The panel gradient should remain between approximately 66 and 72 percent opacity.
 Panel borders and shadows should remain softer than application icons.
@@ -205,3 +230,10 @@ Fields absent from the theme must keep main configuration or built-in values.
 6. Confirm the pointer and focus stay at the interaction source after the drop.
 7. Connect `Virtual-1` and confirm its map and taskbar widget appear.
 8. Set urgency on a non-focused window and confirm the configured indicator appears.
+9. With `peek.pointer_promote = true`, navigate with a keybind, move the pointer onto the
+   overlay, and confirm it stops counting down and takes the accent border.
+10. Move the pointer off the overlay and confirm it leaves shortly afterwards.
+11. Click a window icon on an armed overlay and confirm the click focuses that window
+    without a second click and without a reopen animation.
+12. Navigate with a keybind while the pointer rests on the armed overlay and confirm the
+    keybind still reaches Niri.

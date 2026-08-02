@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
-use wayland::{SurfaceKind, SurfaceManager, UiEvent, UiEventKind, WakePipe};
+use wayland::{PopupInput, SurfaceKind, SurfaceManager, UiEvent, UiEventKind, WakePipe};
 
 /// How long after niri-xmb moves focus itself that the resulting snapshot is
 /// treated as our own echo rather than as external navigation.
@@ -120,6 +120,18 @@ enum PopupMode {
     Manual,
     /// Opened by itself to mirror Niri navigation; takes no input.
     Peek,
+    /// A peek overlay the pointer has moved onto.
+    ///
+    /// Still a peek — no keyboard, no staged session — but it holds itself open
+    /// under the pointer and highlights what is under it, so reaching for it and
+    /// clicking is one continuous movement instead of a race against expiry.
+    PeekArmed,
+}
+
+impl PopupMode {
+    fn is_peek(self) -> bool {
+        matches!(self, Self::Peek | Self::PeekArmed)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -441,6 +453,15 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut peek_deadline: Option<Instant> = None;
     // Focus changes we caused ourselves must not bounce back as a peek.
     let mut peek_suppressed_until = Instant::now();
+    // When the peek overlay stops being click-through. The pointer region is
+    // withheld for a moment after it appears so that a click already on its way
+    // to whatever the overlay just covered still lands there.
+    let mut peek_pointer_at: Option<Instant> = None;
+    // Whether the peek overlay is currently claiming the panel rectangle. It
+    // outlives arming, and following focus to another output has to carry it
+    // across: re-showing the overlay as passive would drop the region with
+    // nothing left to hand it back.
+    let mut peek_pointer_live = false;
     let mut window_first_seen: HashMap<u64, Instant> = HashMap::new();
     // Focus state as last observed, versus as last acted on. The gap between
     // them is the burst of events still settling.
@@ -548,6 +569,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     && !focused_is_new
                     && now >= peek_suppressed_until
                 {
+                    let was_hidden = popup_mode == PopupMode::Hidden;
                     peek_deadline = trigger_peek(
                         &mut surfaces,
                         &snapshot,
@@ -556,7 +578,12 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                         &mut popup_mode,
                         &mut selection,
                         peek_suppressed_until,
+                        peek_pointer_live,
                     )?;
+                    if was_hidden && popup_mode == PopupMode::Peek && config.peek.pointer_promote {
+                        peek_pointer_at =
+                            Some(Instant::now() + Duration::from_millis(config.peek.arm_grace_ms));
+                    }
                     dirty = true;
                 }
                 acted_focus = Some(signature);
@@ -566,14 +593,32 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         // Guarded on Peek: a manual session must never inherit this expiry.
         // The overview opening counts as an expiry, so an overlay already up
         // gets out of the way immediately.
-        if popup_mode == PopupMode::Peek
+        // An armed overlay has no deadline to reach: the pointer resting on it
+        // holds it open. The overview still clears it either way.
+        if popup_mode.is_peek()
             && (snapshot.overview_open
-                || peek_deadline_reached(peek_deadline, pending_focus_since, Instant::now()))
+                || (popup_mode == PopupMode::Peek
+                    && peek_deadline_reached(peek_deadline, pending_focus_since, Instant::now())))
         {
             surfaces.hide_all_popups()?;
             popup_outputs.clear();
             popup_mode = PopupMode::Hidden;
             peek_deadline = None;
+            peek_pointer_at = None;
+            peek_pointer_live = false;
+            dirty = true;
+        }
+
+        // Hand the overlay to the pointer once the grace has passed. It keeps
+        // the panel rectangle only, and never the keyboard, so everything
+        // outside the panel — and every keybind — behaves as before.
+        if let Some(at) = peek_pointer_at
+            && popup_mode.is_peek()
+            && Instant::now() >= at
+        {
+            peek_pointer_at = None;
+            peek_pointer_live = true;
+            surfaces.set_popup_input(PopupInput::POINTER, false)?;
             dirty = true;
         }
 
@@ -583,10 +628,18 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     if popup_mode != PopupMode::Manual {
                         popup_origin_focus = snapshot.focused_window;
                     }
-                    show_popup(&mut surfaces, &snapshot, &config, &mut popup_outputs, true)?;
+                    show_popup(
+                        &mut surfaces,
+                        &snapshot,
+                        &config,
+                        &mut popup_outputs,
+                        PopupInput::FULL,
+                    )?;
                     popup_mode = PopupMode::Manual;
                     // Taking control cancels the peek countdown.
                     peek_deadline = None;
+                    peek_pointer_at = None;
+                    peek_pointer_live = false;
                     follow_candidate = None;
                     reset_selection(&mut selection, &snapshot);
                     dirty = true;
@@ -614,9 +667,17 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                         press = None;
                     } else {
                         popup_origin_focus = snapshot.focused_window;
-                        show_popup(&mut surfaces, &snapshot, &config, &mut popup_outputs, true)?;
+                        show_popup(
+                            &mut surfaces,
+                            &snapshot,
+                            &config,
+                            &mut popup_outputs,
+                            PopupInput::FULL,
+                        )?;
                         popup_mode = PopupMode::Manual;
                         peek_deadline = None;
+                        peek_pointer_at = None;
+                        peek_pointer_live = false;
                         follow_candidate = None;
                         reset_selection(&mut selection, &snapshot);
                     }
@@ -630,6 +691,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                             PopupMode::Hidden => "hidden",
                             PopupMode::Manual => "manual",
                             PopupMode::Peek => "peek",
+                            PopupMode::PeekArmed => "peek_armed",
                         },
                         "selection": selection_visual(&selection, &snapshot).map(|visual| {
                             serde_json::json!({
@@ -785,6 +847,59 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         }
 
         while let Ok(event) = ui_rx.try_recv() {
+            // A peek overlay decides what a pointer event means to it before
+            // the event is handled as panel input, so the click that promotes
+            // it is also the click that acts.
+            if popup_mode.is_peek() {
+                match classify_peek_pointer(&event) {
+                    PeekPointer::Promote => {
+                        popup_origin_focus = snapshot.focused_window;
+                        let capture = popup_capture_outside(
+                            &config,
+                            surfaces.cursor_restore_available(),
+                            PopupInput::FULL,
+                        );
+                        surfaces.set_popup_input(PopupInput::FULL, capture)?;
+                        popup_mode = PopupMode::Manual;
+                        peek_deadline = None;
+                        peek_pointer_at = None;
+                        peek_pointer_live = false;
+                        follow_candidate = None;
+                        reset_selection(&mut selection, &snapshot);
+                        dirty = true;
+                    }
+                    PeekPointer::Arm => {
+                        if popup_mode != PopupMode::PeekArmed {
+                            popup_mode = PopupMode::PeekArmed;
+                            dirty = true;
+                        }
+                        peek_deadline = None;
+                    }
+                    PeekPointer::Disarm => {
+                        if popup_mode == PopupMode::PeekArmed {
+                            popup_mode = PopupMode::Peek;
+                            // Moving away is a refusal, so the overlay leaves
+                            // sooner than the countdown it never started would.
+                            peek_deadline = Some(
+                                Instant::now()
+                                    + Duration::from_millis(config.peek.demote_ms.max(1)),
+                            );
+                            dirty = true;
+                        }
+                    }
+                    PeekPointer::Ignore => {}
+                }
+                // The pointer region going live produces an enter, and a
+                // cursor-positioned panel re-anchors itself on one. An overlay
+                // that jumped out from under the hand reaching for it would
+                // undo the whole point, so peek ignores enter entirely.
+                if popup_mode.is_peek()
+                    && matches!(event.kind, SurfaceKind::Popup)
+                    && matches!(event.event, UiEventKind::Enter)
+                {
+                    continue;
+                }
+            }
             dirty |= handle_ui_event(
                 event,
                 &mut surfaces,
@@ -822,11 +937,24 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             selection.clear_session();
             popup_mode = PopupMode::Hidden;
             peek_deadline = None;
+            peek_pointer_at = None;
+            peek_pointer_live = false;
             // Confirming a pick moves Niri's focus, which would otherwise come
             // straight back as a peek for the move just made.
             peek_suppressed_until = Instant::now() + SELF_FOCUS_GRACE;
         }
         popup_was_open = popup_open;
+
+        // The accent edge means "this panel is taking your input now". A manual
+        // session always is, pointer or not, because it holds the keyboard. A
+        // peek overlay only takes the pointer, and only the pointer that is on
+        // it: an overlay across the screen from the cursor is claiming a
+        // rectangle, not receiving anything, and no click can reach it without
+        // arming it first.
+        dirty |= renderer.set_panel_live(matches!(
+            popup_mode,
+            PopupMode::Manual | PopupMode::PeekArmed
+        ));
 
         // Animation targets are recomputed every iteration, not only on
         // redraw, so a settled UI stops requesting frames entirely.
@@ -838,6 +966,15 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             &popup_outputs,
         );
         dirty |= animating;
+
+        // The panel rectangle is what a pointer region is built from. A peek
+        // overlay needs it too, and needs it before the pointer arrives, so it
+        // is published from the same place whichever mode asks for it.
+        let panel_input_rect_wanted = match popup_mode {
+            PopupMode::Manual => !config.behavior.close_on_outside_click,
+            PopupMode::Peek | PopupMode::PeekArmed => config.peek.pointer_promote,
+            PopupMode::Hidden => false,
+        };
 
         if dirty {
             let surface_infos = surfaces.surfaces();
@@ -866,8 +1003,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                         surfaces.present(surface.id, frame.pixels, frame.damage)?;
                     }
                     if surface.kind == SurfaceKind::Popup
-                        && popup_mode == PopupMode::Manual
-                        && !config.behavior.close_on_outside_click
+                        && panel_input_rect_wanted
                         && let Some(rect) =
                             renderer.panel_input_rect(surface.id, surface.width, surface.height)
                     {
@@ -892,6 +1028,9 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         }
         if let Some(deadline) = peek_deadline {
             wait_timeout = wait_timeout.min(deadline.saturating_duration_since(now));
+        }
+        if let Some(at) = peek_pointer_at {
+            wait_timeout = wait_timeout.min(at.saturating_duration_since(now));
         }
         if let Some((_, since)) = &follow_candidate {
             let delay = Duration::from_millis(config.popup.follow_delay_ms);
@@ -988,6 +1127,36 @@ fn peek_deadline_reached(
     pending_focus_since.is_none() && deadline.is_some_and(|deadline| now >= deadline)
 }
 
+/// What a pointer event over a peek overlay means for the overlay itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeekPointer {
+    /// The pointer is on the panel: hold the overlay open under it.
+    Arm,
+    /// The pointer left the panel: hand the countdown back.
+    Disarm,
+    /// The pointer clicked the panel: the user wants to drive it.
+    Promote,
+    Ignore,
+}
+
+/// Read a UI event as an intention towards the peek overlay.
+///
+/// Motion is the arming signal rather than enter: the input region becoming
+/// live under a resting pointer also produces an enter, and an overlay that
+/// pinned itself open merely because it appeared under the cursor would never
+/// go away on its own.
+fn classify_peek_pointer(event: &UiEvent) -> PeekPointer {
+    if !matches!(event.kind, SurfaceKind::Popup) {
+        return PeekPointer::Ignore;
+    }
+    match event.event {
+        UiEventKind::Motion | UiEventKind::Scroll { .. } => PeekPointer::Arm,
+        UiEventKind::Leave => PeekPointer::Disarm,
+        UiEventKind::Press { button } if button == BTN_LEFT => PeekPointer::Promote,
+        _ => PeekPointer::Ignore,
+    }
+}
+
 /// Raise (or extend) the passive peek overlay after Niri focus moved.
 ///
 /// Returns the new expiry, or `None` when peek should not be showing. A manual
@@ -1001,6 +1170,7 @@ fn trigger_peek(
     mode: &mut PopupMode,
     selection: &mut Selection,
     suppressed_until: Instant,
+    pointer_live: bool,
 ) -> Result<Option<Instant>> {
     if peek_should_skip(config, snapshot, *mode) || Instant::now() < suppressed_until {
         return Ok(None);
@@ -1010,11 +1180,26 @@ fn trigger_peek(
     let targets = popup_output_targets(snapshot, config);
     let same_outputs =
         targets.len() == visible.len() && targets.iter().all(|output| visible.contains(output));
+    let armed = *mode == PopupMode::PeekArmed;
     if *mode == PopupMode::Hidden || !same_outputs {
-        show_popup(surfaces, snapshot, config, visible, false)?;
-        *mode = PopupMode::Peek;
+        // An overlay that already claimed the panel rectangle keeps it across
+        // the move. Re-showing it as passive would silently drop the region,
+        // and nothing would hand it back until the overlay hid and rose again.
+        let input = if pointer_live {
+            PopupInput::POINTER
+        } else {
+            PopupInput::NONE
+        };
+        show_popup(surfaces, snapshot, config, visible, input)?;
+        if !armed {
+            *mode = PopupMode::Peek;
+        }
     }
     reset_selection(selection, snapshot);
+    if armed {
+        // The pointer owns the countdown while it rests on the panel.
+        return Ok(None);
+    }
     Ok(Some(
         Instant::now() + Duration::from_millis(config.peek.duration_ms.max(1)),
     ))
@@ -1057,16 +1242,29 @@ fn should_close_on_external_focus_change(
         && now >= self_focus_suppressed_until
 }
 
+/// Whether the popup should swallow the whole output to catch outside clicks.
+///
+/// Only a manual session may do this. A peek overlay claiming the full output
+/// would turn a passive readout into a modal one, so it is held to the panel
+/// rectangle whatever the outside-click settings say.
+fn popup_capture_outside(
+    config: &Config,
+    virtual_pointer_available: bool,
+    input: PopupInput,
+) -> bool {
+    input.keyboard && should_capture_outside_click(config, virtual_pointer_available)
+}
+
 fn show_popup(
     surfaces: &mut SurfaceManager,
     snapshot: &Snapshot,
     config: &Config,
     visible: &mut HashSet<String>,
-    interactive: bool,
+    input: PopupInput,
 ) -> Result<()> {
     let outputs = popup_output_targets(snapshot, config);
-    let capture_outside = should_capture_outside_click(config, surfaces.cursor_restore_available());
-    surfaces.show_popups_with(&outputs, interactive, capture_outside)?;
+    let capture_outside = popup_capture_outside(config, surfaces.cursor_restore_available(), input);
+    surfaces.show_popups_with(&outputs, input, capture_outside)?;
     visible.clear();
     visible.extend(outputs);
     Ok(())
@@ -2002,6 +2200,69 @@ mod selection_tests {
             !peek_should_skip(&config, &snapshot, PopupMode::Hidden),
             "with the overview closed peek should be allowed"
         );
+    }
+
+    fn popup_event(event: UiEventKind) -> UiEvent {
+        UiEvent {
+            surface_id: 1,
+            kind: SurfaceKind::Popup,
+            output: "DP-1".into(),
+            x: 10.0,
+            y: 10.0,
+            global_x: 10.0,
+            global_y: 10.0,
+            event,
+        }
+    }
+
+    /// The input region becoming live under a resting pointer produces an
+    /// enter. Arming on that would pin the overlay open for a pointer that
+    /// never moved, so only real movement counts as reaching for it.
+    #[test]
+    fn a_resting_pointer_does_not_arm_the_peek_overlay() {
+        assert_eq!(
+            classify_peek_pointer(&popup_event(UiEventKind::Enter)),
+            PeekPointer::Ignore
+        );
+        assert_eq!(
+            classify_peek_pointer(&popup_event(UiEventKind::Motion)),
+            PeekPointer::Arm
+        );
+    }
+
+    #[test]
+    fn pointer_intent_maps_to_overlay_transitions() {
+        assert_eq!(
+            classify_peek_pointer(&popup_event(UiEventKind::Leave)),
+            PeekPointer::Disarm
+        );
+        assert_eq!(
+            classify_peek_pointer(&popup_event(UiEventKind::Press { button: BTN_LEFT })),
+            PeekPointer::Promote
+        );
+        assert_eq!(
+            classify_peek_pointer(&popup_event(UiEventKind::Press {
+                button: BTN_LEFT + 1
+            })),
+            PeekPointer::Ignore
+        );
+        let mut bar = popup_event(UiEventKind::Motion);
+        bar.kind = SurfaceKind::Bar(0);
+        assert_eq!(classify_peek_pointer(&bar), PeekPointer::Ignore);
+    }
+
+    /// Full-output click capture turns a passive readout into a modal one, so
+    /// an overlay that only holds the pointer stays inside its panel however
+    /// the outside-click settings are configured.
+    #[test]
+    fn only_a_manual_session_may_capture_the_whole_output() {
+        let mut config = Config::default();
+        config.behavior.close_on_outside_click = true;
+        config.behavior.replay_outside_click = false;
+
+        assert!(popup_capture_outside(&config, true, PopupInput::FULL));
+        assert!(!popup_capture_outside(&config, true, PopupInput::POINTER));
+        assert!(!popup_capture_outside(&config, true, PopupInput::NONE));
     }
 
     #[test]
