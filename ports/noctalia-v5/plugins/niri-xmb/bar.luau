@@ -4,6 +4,7 @@ local state = {
     lastGeneration = -1,
     lastError = nil,
     icons = {},
+    iconRetryAt = {},
     hoveredWindowId = nil,
     pendingDrop = nil,
 }
@@ -111,10 +112,28 @@ local function iconPath(appId, size)
     local key = tostring(appId or "") .. ":" .. tostring(size)
     local cached = state.icons[key]
     if cached ~= nil then
-        return cached ~= false and cached or nil
+        return cached
     end
-    local resolved = noctalia.appIconPath(tostring(appId or ""), size)
-    state.icons[key] = resolved or false
+
+    local now = noctalia.nowMs()
+    local retryAt = state.iconRetryAt[key]
+    if retryAt ~= nil and now < retryAt then
+        return nil
+    end
+
+    -- Resolve a larger source than the logical display size. Noctalia then
+    -- downsamples the image instead of enlarging a low-resolution icon on a
+    -- fractional-scale output.
+    local decodeSize = math.max(64, size * 2)
+    local resolved = noctalia.appIconPath(tostring(appId or ""), decodeSize)
+    if resolved ~= nil then
+        state.icons[key] = resolved
+        state.iconRetryAt[key] = nil
+    else
+        -- Desktop entries can finish loading after the first plugin frame.
+        -- Retry misses slowly instead of keeping a startup placeholder forever.
+        state.iconRetryAt[key] = now + 5000
+    end
     return resolved
 end
 
@@ -576,6 +595,7 @@ end
 
 function onConfigChanged()
     state.icons = {}
+    state.iconRetryAt = {}
     state.lastGeneration = -1
     noctalia.setUpdateInterval(config("poll_interval_ms", 250))
     poll(true)

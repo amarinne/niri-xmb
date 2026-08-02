@@ -205,19 +205,40 @@ fn app_id_candidates(app_id: &str) -> Vec<String> {
 
 // ── .desktop file scanning ─────────────────────────────────────────────────────
 
+fn xdg_data_dirs(home: &str) -> Vec<String> {
+    let mut dirs = Vec::new();
+    let mut push = |dir: String| {
+        if !dir.is_empty() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    };
+
+    match std::env::var("XDG_DATA_HOME") {
+        Ok(dir) if !dir.is_empty() => push(dir),
+        _ => push(format!("{home}/.local/share")),
+    }
+    push(format!("{home}/.local/share/flatpak/exports/share"));
+
+    if let Ok(value) = std::env::var("XDG_DATA_DIRS") {
+        for dir in value.split(':').filter(|dir| !dir.is_empty()) {
+            push(dir.into());
+        }
+    }
+
+    push("/var/lib/flatpak/exports/share".into());
+    push("/usr/local/share".into());
+    push("/usr/share".into());
+    dirs
+}
+
 fn scan_desktop_files() -> HashMap<String, DesktopApp> {
     let mut map: HashMap<String, DesktopApp> = HashMap::new();
 
     let home = home_dir();
-    let mut search_dirs = vec![format!("{home}/.local/share/applications")];
-
-    let xdg_dirs =
-        std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
-    for d in xdg_dirs.split(':') {
-        if !d.is_empty() {
-            search_dirs.push(format!("{d}/applications"));
-        }
-    }
+    let search_dirs: Vec<String> = xdg_data_dirs(&home)
+        .into_iter()
+        .map(|dir| format!("{dir}/applications"))
+        .collect();
 
     for dir in &search_dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -331,17 +352,8 @@ fn find_icon_file(icon_name: &str) -> Option<PathBuf> {
     themes.extend(["hicolor".into(), "Adwaita".into(), "HighContrast".into()]);
     themes.dedup();
 
-    let mut roots = vec![
-        format!("{home}/.local/share/icons"),
-        "/usr/local/share/icons".into(),
-        "/usr/share/icons".into(),
-    ];
-    let xdg_dirs =
-        std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
-    for directory in xdg_dirs
-        .split(':')
-        .filter(|directory| !directory.is_empty())
-    {
+    let mut roots = Vec::new();
+    for directory in xdg_data_dirs(&home) {
         let icons = PathBuf::from(directory).join("icons");
         let icons = icons.to_string_lossy().into_owned();
         if !roots.contains(&icons) {
@@ -373,10 +385,10 @@ fn find_icon_file(icon_name: &str) -> Option<PathBuf> {
         }
     }
 
-    for directory in [
-        format!("{home}/.local/share/pixmaps"),
-        "/usr/share/pixmaps".into(),
-    ] {
+    for directory in xdg_data_dirs(&home)
+        .into_iter()
+        .map(|directory| format!("{directory}/pixmaps"))
+    {
         for name in &names {
             for extension in ["png", "svg"] {
                 let path = PathBuf::from(&directory).join(format!("{name}.{extension}"));
@@ -529,5 +541,15 @@ mod tests {
             Some("btop")
         );
         assert_eq!(cache.app_label("btop-terminal").as_deref(), Some("btop++"));
+    }
+
+    #[test]
+    fn data_dirs_include_flatpak_exports_and_system_fallbacks() {
+        let dirs = xdg_data_dirs("/home/test");
+
+        assert!(dirs.contains(&"/home/test/.local/share/flatpak/exports/share".into()));
+        assert!(dirs.contains(&"/var/lib/flatpak/exports/share".into()));
+        assert!(dirs.contains(&"/usr/local/share".into()));
+        assert!(dirs.contains(&"/usr/share".into()));
     }
 }
