@@ -58,8 +58,8 @@ navigation, and a passive workspace-change peek overlay.
 - The same top-centre placement applies to Sunshine's `Virtual-1` output in
   the Moonlight view.
 - The animated wave background was rejected for this panel and is not compiled.
-  Its CPU prototype is retained at `reference/xmb_wave.rs` for possible reuse in
-  a wallpaper/background engine.
+  Its CPU prototype is archived outside this repository at
+  `/home/ez/Projects/niri-xmb-references/reference/xmb_wave.rs`.
 
 ## Completed implementation
 
@@ -122,7 +122,8 @@ navigation, and a passive workspace-change peek overlay.
   font, system icon-theme, and desktop-entry resolution.
 - `config/niri-xmb.toml.example`, `README.md`: public configuration/docs.
 - `themes/`: shipped theme examples.
-- `reference/xmb_wave.rs`: archived, non-compiled wave prototype.
+- External archive: `/home/ez/Projects/niri-xmb-references/reference/xmb_wave.rs`
+  is the non-compiled wave prototype.
 
 ## Verification
 
@@ -161,7 +162,8 @@ Verified on 2026-07-28:
 
 - `target-overview-fix/` is an untracked generated build directory (~854 MiB).
   It is excluded by `.gitignore` and is not part of the checkpoint.
-- `reference/` and `themes/` are intentional checkpoint source directories.
+- `themes/` is an intentional checkpoint source directory.
+- Archived prototypes live in `/home/ez/Projects/niri-xmb-references/`.
 
 ## Remaining tasks
 
