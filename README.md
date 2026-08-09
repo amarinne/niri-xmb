@@ -12,8 +12,6 @@ themes, window urgency, and Noctalia taskbar integration.
 - A Rust toolchain that supports edition 2024.
 - Niri IPC access from the process that runs `niri-xmb`.
 
-Noctalia v5 is the primary integration. The Noctalia v4 plugin remains available for older setups.
-
 ## Build
 
 Build an optimized binary:
