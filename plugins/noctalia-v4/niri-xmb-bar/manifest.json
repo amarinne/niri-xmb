@@ -17,7 +17,7 @@
   "metadata": {
     "targetOutput": "",
     "defaultSettings": {
-      "backendCommand": "/home/ez/.local/bin/niri-xmb",
+      "backendCommand": "niri-xmb",
       "hideEmptyWorkspaces": false,
       "allowDrag": true,
       "showActiveIndicator": true,

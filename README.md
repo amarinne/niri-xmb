@@ -1,29 +1,55 @@
 # niri-xmb
 
-`niri-xmb` provides a workspace navigator for Niri. It keeps Niri state in a persistent daemon, so the panel opens without a new startup delay.
+`niri-xmb` is a workspace navigator and bar integration for [Niri](https://github.com/YaLTeR/niri).
+It keeps Niri state in a persistent daemon, so the panel opens without a new startup delay.
 
-Noctalia v5 is the primary integration. The Noctalia v4 port is legacy compatibility code.
+The project supports workspace and window navigation, drag and drop, passive workspace peek,
+themes, window urgency, and Noctalia taskbar integration.
 
-## Current scope
+## Requirements
 
-`niri-xmb` owns these functions:
+- A Linux Wayland session that runs Niri.
+- A Rust toolchain that supports edition 2024.
+- Niri IPC access from the process that runs `niri-xmb`.
 
-- The daemon reads Niri IPC events and stores output, workspace, window, focus, and urgency state.
-- The panel shows an icon map for all configured outputs.
-- The panel supports window focus, workspace focus, drag and drop, peek, pinning, and themes.
-- The CLI sends low-cost commands to the running daemon.
-- The Noctalia plugins show per-output workspace and window strips in the bar.
-- The icon resolver loads application icons from desktop files and system icon themes.
-- The configuration controls panel layout, monitor rules, interaction, and visual style.
+Noctalia v5 is the primary integration. The Noctalia v4 plugin remains available for older setups.
 
-`niri-xmb` does not own these functions:
+## Build
 
-- The Niri fork owns smart workspace movement.
-- The Noctalia fork owns the native dock and taskbar.
-- The dotfiles repository owns machine configuration and deployment.
-- The Moonlight stack owns virtual monitor setup.
+Build an optimized binary:
 
-## Main commands
+```sh
+cargo build --release -p niri-xmb
+```
+
+The binary is `target/release/niri-xmb`.
+
+## Install
+
+Install the binary in a directory on your `PATH`:
+
+```sh
+install -Dm755 target/release/niri-xmb ~/.local/bin/niri-xmb
+```
+
+Create a user configuration from the example. Review output names, placement, and theme settings
+before you use it:
+
+```sh
+mkdir -p ~/.config/niri-xmb
+cp config/niri-xmb.toml.example ~/.config/niri-xmb/config.toml
+```
+
+Start the daemon from the Niri session. The daemon needs `NIRI_SOCKET`, which Niri provides to
+commands that it starts:
+
+```sh
+niri-xmb daemon
+```
+
+Use `niri-xmb restart` only from an environment that has `NIRI_SOCKET`.
+
+## Commands
 
 ```sh
 niri-xmb daemon
@@ -35,9 +61,7 @@ niri-xmb print-default-config
 
 The default configuration path is `~/.config/niri-xmb/config.toml`.
 
-## Current repository
-
-The repository currently uses this layout:
+## Repository layout
 
 ```text
 crates/niri-xmb/       Rust daemon, CLI, panel, model, and icon code
@@ -45,17 +69,9 @@ plugins/noctalia-v4/   Legacy Noctalia integration
 ports/noctalia-v5/     Maintained Noctalia integration
 config/                Example configuration
 themes/                Optional panel themes
-docs/                  Focused design documents
-niri-xmb.service       User service
+UX_SPEC.md             Interaction specification
+niri-xmb.service       Optional user-service unit
 ```
-
-## Suggested cleanup
-
-Use one `integrations/noctalia/` tree for both Noctalia versions. Move `niri-xmb.service` to `packaging/systemd/`.
-
-Keep shared behavior in the Rust crate. Keep Noctalia code as a small adapter. Keep machine deployment in the dotfiles repository.
-
-Do not move the Niri fork, Moonlight setup, or research clones into this repository.
 
 ## More information
 

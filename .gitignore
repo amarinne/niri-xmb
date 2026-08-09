@@ -3,7 +3,7 @@
 /target-*
 **/*.rs.bk
 
-# aur shit
+# Arch Linux package build files
 PKGBUILD
 .SRCINFO
 
@@ -12,7 +12,7 @@ PKGBUILD
 *.tar.xz
 *.tar.zst
 
-# useless stuff
+# Package build directories
 *.lock
 /src/
 /pkg/
@@ -31,3 +31,13 @@ Thumbs.db
 
 # Local archive
 .archive/
+
+# Local agent and automation state
+.agents/
+.codex/
+.claude/
+.cursor/
+.opencode/
+AGENTS.md
+CLAUDE.md
+AI-DECLARATION.md

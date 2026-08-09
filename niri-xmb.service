@@ -1,6 +1,6 @@
 [Unit]
 Description=Niri XMB workspace bar and navigator
-Documentation=file://%h/Projects/niri-xmb/README.md
+Documentation=https://github.com/amarinne/niri-xmb
 PartOf=graphical-session.target
 After=graphical-session.target
 
