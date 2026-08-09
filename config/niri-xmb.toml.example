@@ -18,9 +18,10 @@ show_workspace_labels = false # show workspace names/numbers beside icons
 hide_empty_workspaces = false # omit empty workspaces when true
 show_capsule = true          # draw each workspace as its own pill
 show_active_indicator = true # mark the active window in each workspace
-scroll_to_switch = true      # mouse wheel changes workspace
+scroll_to_switch = true      # one ratchet click changes one workspace
 scroll_wrap = true           # wheel navigation wraps at the ends
 scroll_reverse = false       # reverse the wheel direction
+scroll_repeat_ms = 75        # free-spin limit in milliseconds
 
 # Additional bars use the same parameters and can differ per monitor. A
 # portrait output can opt into the center join zone independently.
@@ -40,6 +41,7 @@ show_active_indicator = true
 scroll_to_switch = true
 scroll_wrap = true
 scroll_reverse = false
+scroll_repeat_ms = 75
 
 [popup]
 outputs = "combined" # "focused", "all", or "combined"
@@ -79,7 +81,8 @@ margin = 48.0
 [peek]
 enabled = false         # automatically show on matching Niri focus changes
 duration_ms = 1200      # linger time; restarts while navigation continues
-on_window_focus = false # workspace switches only; ignores dialogs and pointer focus
+# Peek only follows Niri focused-workspace changes. Window focus, dialogs, and
+# pointer crossings do not show it.
 # The overlay is click-through by default. With pointer_promote the panel
 # rectangle takes pointer input while the overlay is up: moving onto it holds it
 # open, and clicking it becomes a full manual session in place. The keyboard is
@@ -101,8 +104,8 @@ close_on_window_click = true # close after activating a window
 close_on_workspace_click = false # close after activating a workspace
 close_on_drop = false        # close after a successful drag-and-drop
 close_on_external_focus_change = false # close after another surface changes Niri focus
-close_on_outside_click = false # true captures the full monitor; false lets outside clicks pass through
-replay_outside_click = false # send a captured outside click to the surface below after closing
+close_on_outside_click = true # click outside the panel closes the XMB
+replay_outside_click = true # replay the captured click when virtual pointer support exists
 close_on_escape = true       # Escape closes the popup
 
 [animation]
@@ -120,7 +123,7 @@ surface = "#661d2022"           # secondary surface/floating backing colour
 surface_hover = "#266ed2ff"     # pointer-hover overlay
 border = "#5c8aa5c0"            # primary outline
 border_soft = "#2a8aa5c0"      # canvas dividers, inactive marks
-accent = "#ff6ed2ff"            # active/focused accent
+accent = "#ff6ed2ff"            # manual or armed-peek input border
 selection_border = "#666ed2ff" # retained selection-outline colour
 text = "#ffe1e2e5"              # primary labels and selected title
 muted = "#ffc0c7cd"             # secondary labels

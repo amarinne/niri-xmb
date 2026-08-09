@@ -104,10 +104,53 @@ pub enum UiEventKind {
     Enter,
     Leave,
     Motion,
-    Press { button: u32 },
-    Release { button: u32 },
-    Scroll { dy: f64 },
-    Key { keysym: u32 },
+    Press {
+        button: u32,
+    },
+    Release {
+        button: u32,
+    },
+    /// One complete wheel step. High-resolution packet values are accumulated
+    /// before this event reaches the UI.
+    Scroll {
+        steps: i32,
+    },
+    Key {
+        keysym: u32,
+    },
+}
+
+/// Convert high-resolution Wayland wheel data into complete wheel steps.
+///
+/// A G502X ratchet click can arrive as `30 + 6 * 15` value120 units. Do not
+/// act on a partial value, because that makes one physical click move several
+/// workspace rows. Free-spin still emits completed 120-unit steps rapidly.
+#[derive(Debug, Default)]
+struct WheelStepAccumulator {
+    value120_remainder: i32,
+}
+
+impl WheelStepAccumulator {
+    fn steps(&mut self, value120: i32, discrete: i32, absolute: f64) -> i32 {
+        if value120 != 0 {
+            self.value120_remainder += value120;
+            if self.value120_remainder >= 120 {
+                self.value120_remainder -= 120;
+                1
+            } else if self.value120_remainder <= -120 {
+                self.value120_remainder += 120;
+                -1
+            } else {
+                0
+            }
+        } else if discrete != 0 {
+            discrete.signum()
+        } else if absolute.abs() > f64::EPSILON {
+            absolute.signum() as i32
+        } else {
+            0
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -318,6 +361,7 @@ impl SurfaceManager {
             pointer_x: 0.0,
             pointer_y: 0.0,
             pointer_surface: None,
+            wheel_steps: WheelStepAccumulator::default(),
             keyboard_surface: None,
             _virtual_pointer_manager: virtual_pointer_manager,
             virtual_pointer,
@@ -850,7 +894,7 @@ fn copy_rgba_to_argb8888(destination: &mut [u8], source: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DamageRect, SurfaceSpecKind, alpha_bounds, copy_rgba_to_argb8888,
+        DamageRect, SurfaceSpecKind, WheelStepAccumulator, alpha_bounds, copy_rgba_to_argb8888,
         copy_rgba_to_argb8888_region, ensure_popup_spec,
     };
 
@@ -918,6 +962,26 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(popup_outputs, ["Virtual-1", "HDMI-A-1"]);
     }
+
+    #[test]
+    fn high_resolution_wheel_waits_for_a_full_value120_step() {
+        let mut wheel = WheelStepAccumulator::default();
+        assert_eq!(wheel.steps(30, 0, 3.75), 0);
+        for _ in 0..5 {
+            assert_eq!(wheel.steps(15, 0, 1.88), 0);
+        }
+        assert_eq!(wheel.steps(15, 0, 1.88), 1);
+        assert_eq!(wheel.steps(-120, 0, -15.0), -1);
+    }
+
+    #[test]
+    fn legacy_wheel_data_keeps_its_step_count() {
+        let mut wheel = WheelStepAccumulator::default();
+        assert_eq!(wheel.steps(0, 2, 0.0), 1);
+        assert_eq!(wheel.steps(0, -1, 0.0), -1);
+        assert_eq!(wheel.steps(0, 0, 8.0), 1);
+        assert_eq!(wheel.steps(0, 0, -8.0), -1);
+    }
 }
 
 fn apply_input_region(
@@ -965,6 +1029,7 @@ struct WaylandState {
     pointer_x: f64,
     pointer_y: f64,
     pointer_surface: Option<usize>,
+    wheel_steps: WheelStepAccumulator,
     /// Where key events go, tracked separately from the pointer.
     ///
     /// The two focuses move independently: the pointer leaves the panel while
@@ -1417,13 +1482,15 @@ impl PointerHandler for WaylandState {
                     vertical,
                     ..
                 } => {
-                    if let Some(id) = self.pointer_surface.or(surface_id) {
-                        self.emit(
-                            id,
-                            UiEventKind::Scroll {
-                                dy: vertical.absolute,
-                            },
-                        );
+                    let steps = self.wheel_steps.steps(
+                        vertical.value120,
+                        vertical.discrete,
+                        vertical.absolute,
+                    );
+                    if steps != 0
+                        && let Some(id) = self.pointer_surface.or(surface_id)
+                    {
+                        self.emit(id, UiEventKind::Scroll { steps });
                     }
                     let _ = horizontal;
                 }

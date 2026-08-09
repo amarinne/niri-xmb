@@ -19,14 +19,14 @@ The words **must**, **should**, and **may** state requirement levels.
 | --- | --- | --- | --- | --- |
 | Hidden | Startup or explicit hide | None | None | Not applicable |
 | Manual | `Mod+Z`, `show`, or `toggle` | Panel only | Yes | Behavior settings control closure |
-| Peek | Niri workspace or window navigation | None, or panel only with `peek.pointer_promote` | None | Hide after `peek.duration_ms` |
+| Peek | Niri workspace navigation | None, or panel only with `peek.pointer_promote` | None | Hide after `peek.duration_ms` |
 | Peek armed | Pointer moves onto a visible peek panel | Panel only | None | Hide `peek.demote_ms` after the pointer leaves |
 
 Manual mode must take keyboard focus for navigation. Peek mode must remain passive.
 Pointer focus and keyboard focus must be tracked separately.
 A manual panel must keep answering keys after the pointer leaves it.
 Opening manual mode while peek is visible must promote the existing popup.
-The desktop profile must show peek for deliberate left/right window focus changes.
+The desktop profile must show peek for deliberate workspace changes.
 Window creation, window removal, and XMB-generated focus changes must not raise peek.
 Each qualifying focus move must extend the active peek without hiding it first.
 Peek expiry must pause while a focus event burst settles.
@@ -43,7 +43,7 @@ keybind-only, and every pointer event passes to whatever is underneath.
 - Peek must never take the keyboard, so the keybinds that raised it keep working.
 - Pointer motion over the panel must arm the overlay. A pointer that has not moved must not.
 - An armed overlay must not expire while the pointer rests on it.
-- An armed overlay must take the accent border. An unarmed one must not, whether or not it holds the rectangle.
+- An armed overlay must use `style.accent` after it claims the pointer input region.
 - Pointer exit must disarm and hide the overlay after `peek.demote_ms`.
 - A click on an armed or unarmed peek must promote it to manual mode and act on the same click.
 - Promotion must reuse the mapped surface, so no reopen animation may play.
@@ -82,16 +82,14 @@ The desktop profile uses these settings:
 
 ```toml
 close_on_external_focus_change = false
-close_on_outside_click = false
-replay_outside_click = false
+close_on_outside_click = true
+replay_outside_click = true
 ```
 
 External focus changes must keep a manual popup open.
-This rule gives hotkey navigation and pass-through clicks the same result.
-Use `Escape` or `Mod+Z` to close a manual popup after an outside interaction.
+An outside click must close a manual popup without confirmation. When virtual pointer support exists, the click must reach the surface below.
 
-Full-output click capture must remain optional. Click replay cannot reproduce hover or drag motion.
-Do not enable capture and replay for the desktop profile.
+Full-output click capture is required while the manual popup is open. Click replay cannot reproduce hover or drag motion.
 
 ## Popup lifetime
 
@@ -100,7 +98,7 @@ Do not enable capture and replay for the desktop profile.
 | Click a window icon | Focus window and close | `close_on_window_click = true` |
 | Click a workspace | Focus workspace and keep open | `close_on_workspace_click = false` |
 | Complete drag and drop | Move window and keep open | `close_on_drop = false` |
-| Click outside and change focus | Pass click through and keep open | `close_on_external_focus_change = false` |
+| Click outside | Close and replay the click when available | `close_on_outside_click = true` |
 | Press `Escape` | Close | `close_on_escape = true` |
 | Press `Mod+Z` while open | Close | Toggle command |
 
@@ -154,6 +152,11 @@ The bar must contain independent taskbar widgets for these output targets:
 Each taskbar widget must call `niri-xmb drop` for window drag and drop.
 Each taskbar widget must route window and workspace focus through `niri-xmb`.
 Taskbar focus changes must not raise peek. Niri keybind focus changes can raise peek.
+Wheel input must start from the workspace row under the pointer on the bar's output.
+Each wheel request must keep that row as its gesture target until the pointer moves to another workspace row.
+Each later request in the same gesture must start from the previous queued target until Niri updates its workspace state.
+Ratchet wheel input must move one workspace per complete 120-unit wheel step.
+Free-spin wheel input must use the bar `scroll_repeat_ms` limit.
 Each desktop taskbar widget must set `middle_click_command` to `niri-xmb toggle`.
 A configured middle-click command must replace the native window-close action.
 An omitted or empty command must keep the native window-close action.
@@ -195,10 +198,13 @@ Niri does not set urgency on the focused window. Select a non-focused window ID.
 
 ## Visual treatment
 
-A panel that is taking input must draw its border in `style.accent`. Any other panel must draw it in `style.border`.
-A manual panel is always accented: it holds the keyboard whatever the pointer is doing.
-A peek overlay is accented only while the pointer is on it, which is the only input it can receive.
-Promotion must not change the border, because an armed overlay is already accented when the click lands.
+Manual panels must draw their border in `style.accent` while XMB owns keyboard input.
+An armed peek panel must draw its border in `style.accent` after it claims pointer input.
+A normal peek panel must draw its border in `style.border`.
+The fixed focal icon, scale, and opacity indicate selection.
+
+When `popup.show_titles` is true, each icon in a vertical window stack must show its window title on the right.
+The title must fit inside the canvas. The selected-title position below an icon applies only outside vertical stacks.
 
 The desktop profile uses a translucent warm glass theme.
 The panel gradient should remain between approximately 66 and 72 percent opacity.

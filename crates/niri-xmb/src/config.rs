@@ -141,6 +141,9 @@ pub struct BarConfig {
     pub scroll_to_switch: bool,
     pub scroll_wrap: bool,
     pub scroll_reverse: bool,
+    /// Minimum time between workspace moves from one bar's wheel input.
+    /// This keeps a free-spinning wheel smooth without losing ratchet clicks.
+    pub scroll_repeat_ms: u64,
 }
 
 impl Default for BarConfig {
@@ -161,6 +164,7 @@ impl Default for BarConfig {
             scroll_to_switch: true,
             scroll_wrap: true,
             scroll_reverse: false,
+            scroll_repeat_ms: 75,
         }
     }
 }
@@ -371,19 +375,14 @@ impl Default for PopupPlacement {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UrgentIndicator {
     None,
     Ring,
+    #[default]
     Glow,
     Badge,
-}
-
-impl Default for UrgentIndicator {
-    fn default() -> Self {
-        Self::Glow
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -542,14 +541,6 @@ pub struct PeekConfig {
     /// How long the overlay lingers after the last focus change. Each further
     /// change restarts the countdown, so it stays up while you keep moving.
     pub duration_ms: u64,
-    /// Also peek when focus moves between windows, not only between
-    /// workspaces.
-    ///
-    /// Off by default. Window focus moves constantly for reasons that are not
-    /// navigation — a dialog closing hands focus back, and focus-follows-mouse
-    /// retargets on every pointer cross — and an overlay that reacts to all of
-    /// it reads as noise rather than as a workspace navigator.
-    pub on_window_focus: bool,
     /// Let the pointer take the overlay over instead of it staying click-through.
     ///
     /// The overlay accepts pointer input over the panel rectangle only, and only
@@ -578,7 +569,6 @@ impl Default for PeekConfig {
         Self {
             enabled: false,
             duration_ms: 1200,
-            on_window_focus: false,
             pointer_promote: false,
             arm_grace_ms: 150,
             demote_ms: 400,
@@ -630,8 +620,8 @@ impl Default for BehaviorConfig {
             close_on_workspace_click: false,
             close_on_drop: false,
             close_on_external_focus_change: false,
-            close_on_outside_click: false,
-            replay_outside_click: false,
+            close_on_outside_click: true,
+            replay_outside_click: true,
             close_on_escape: true,
         }
     }

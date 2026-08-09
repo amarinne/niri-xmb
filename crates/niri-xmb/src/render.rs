@@ -89,11 +89,7 @@ fn clamp_rect(rect: Rect, canvas: Rect) -> Rect {
 }
 
 /// Panel background: soft drop shadow, vertical gradient body, hairline edge.
-///
-/// `live` swaps the hairline for the accent colour. That edge is the whole
-/// difference between a panel that is only reporting and one that is ready to
-/// be clicked, so it is deliberately the same treatment a selection gets.
-fn draw_panel_chrome(pixmap: &mut Pixmap, panel: Rect, config: &Config, live: bool) {
+fn draw_panel_chrome(pixmap: &mut Pixmap, panel: Rect, config: &Config, panel_input_active: bool) {
     let radius = config.style.panel_radius;
     let offset = config.style.shadow_offset;
     let spread = config.style.shadow_spread;
@@ -137,7 +133,7 @@ fn draw_panel_chrome(pixmap: &mut Pixmap, panel: Rect, config: &Config, live: bo
         panel.width - 1.0,
         panel.height - 1.0,
         radius,
-        if live {
+        if panel_input_active {
             hex_color(&config.style.accent)
         } else {
             hex_color(&config.style.border)
@@ -251,18 +247,20 @@ pub struct SelectionVisual {
     pub output: String,
     pub workspace_id: u64,
     pub window_id: Option<u64>,
-    /// Staged cursor position per workspace id, for workspaces the popup
-    /// session has already visited. Absent entries fall back to the
-    /// workspace's own active window.
-    pub anchors: HashMap<u64, usize>,
+    /// Staged window id per workspace, for workspaces the popup session has
+    /// already visited. Ids survive a window reorder. Absent or missing ids
+    /// fall back to the workspace's own active window.
+    pub anchors: HashMap<u64, u64>,
 }
 
 impl SelectionVisual {
     /// Index that should sit on the focal column for `workspace`.
     pub fn anchor(&self, workspace: &WorkspaceModel) -> usize {
-        let count = workspace.windows().count();
         match self.anchors.get(&workspace.id) {
-            Some(&staged) if staged < count => staged,
+            Some(staged) => workspace
+                .windows()
+                .position(|window| window.id == *staged)
+                .unwrap_or_else(|| workspace.active_index()),
             _ => workspace.active_index(),
         }
     }
@@ -288,12 +286,7 @@ pub struct Renderer {
     hovered_surface: Option<usize>,
     hovered_target: Option<HoverTarget>,
     render_surface: Option<usize>,
-    /// The panel takes input and will act on a click.
-    ///
-    /// True for a manual session, and for a peek overlay the pointer has
-    /// reached. Both look the same on purpose: the edge means the same thing in
-    /// both, and a peek promoted by a click keeps it rather than flashing.
-    panel_live: bool,
+    panel_input_active: bool,
     anim: Animator,
     /// Scratch buffers reused across frames. A popup surface is output-sized,
     /// so reallocating these per frame is the dominant cost of animating.
@@ -314,13 +307,23 @@ impl Renderer {
             hovered_surface: None,
             hovered_target: None,
             render_surface: None,
-            panel_live: false,
+            panel_input_active: false,
             anim: Animator::new(),
             canvas: None,
             layer: None,
             canvas_damage: None,
             blanked: std::collections::HashSet::new(),
         }
+    }
+
+    /// Set whether the popup is in an input-owning mode. Returns true when a
+    /// redraw is needed to update the panel border.
+    pub fn set_panel_input_active(&mut self, active: bool) -> bool {
+        if self.panel_input_active == active {
+            return false;
+        }
+        self.panel_input_active = active;
+        true
     }
 
     /// Recompute every animation target from current state and advance the
@@ -415,6 +418,20 @@ impl Renderer {
             .find(|zone| zone.rect.contains(x, y))
             .map(|zone| &zone.target)
     }
+
+    /// Workspace under the pointer on a bar or popup canvas.
+    ///
+    /// A bar window icon belongs to its workspace too. Wheel navigation uses
+    /// this id as its gesture start, so scrolling an icon and scrolling the
+    /// empty part of the same workspace cell have the same target.
+    pub fn workspace_at(&self, surface_id: usize, x: f64, y: f64) -> Option<u64> {
+        match self.hit_test(surface_id, x, y)? {
+            HitTarget::Workspace { workspace_id, .. }
+            | HitTarget::Canvas { workspace_id, .. }
+            | HitTarget::Window { workspace_id, .. } => Some(*workspace_id),
+            HitTarget::Panel => None,
+        }
+    }
     pub fn panel_input_rect(
         &self,
         surface_id: usize,
@@ -443,13 +460,6 @@ impl Renderer {
         let changed = self.hovered_surface != Some(surface_id) || self.hovered_target != target;
         self.hovered_surface = Some(surface_id);
         self.hovered_target = target;
-        changed
-    }
-
-    /// Mark the panel as ready to act on a click. Returns whether it changed.
-    pub fn set_panel_live(&mut self, live: bool) -> bool {
-        let changed = self.panel_live != live;
-        self.panel_live = live;
         changed
     }
 
@@ -914,7 +924,7 @@ impl Renderer {
             height: panel_height,
         };
 
-        draw_panel_chrome(pixmap, panel, config, self.panel_live);
+        draw_panel_chrome(pixmap, panel, config, self.panel_input_active);
         zones.push(HitZone {
             rect: panel,
             target: HitTarget::Panel,
@@ -1165,7 +1175,32 @@ impl Renderer {
                 },
             });
         }
-        if config.popup.show_titles && selected_window == Some(window.id) {
+        let stacked_titles =
+            config.popup.show_titles && !window.floating && workspace.max_stack() > 1;
+        if stacked_titles {
+            // A vertical column needs a label on every row. A label below the
+            // icon only describes the selected row and overlaps the next icon
+            // on compact portrait-output canvases.
+            let label = if window.title.trim().is_empty() {
+                self.icons
+                    .app_label(&window.app_id)
+                    .unwrap_or_else(|| window.app_id.clone())
+            } else {
+                window.title.clone()
+            };
+            let size = config.style.title_font_size;
+            let x = rect.x + rect.width + 5.0;
+            let title = truncate_label_to_width(
+                &mut self.text,
+                &label,
+                (canvas.x + canvas.width - x).max(0.0),
+                size,
+            );
+            let mut color = hex_color(&config.style.text);
+            color.set_alpha(color.alpha() * alpha);
+            self.text
+                .draw(pixmap, &title, x, center_y - size * 0.42, size, color);
+        } else if config.popup.show_titles && selected_window == Some(window.id) {
             let label = self
                 .icons
                 .app_label(&window.app_id)
@@ -1451,4 +1486,41 @@ fn truncate_label(label: &str, max_chars: usize) -> String {
         truncated.push('…');
     }
     truncated
+}
+
+/// Truncate a title to the space available beside a vertically stacked icon.
+/// Text is measured with the active font because character count alone does
+/// not keep wide glyphs inside a compact portrait canvas.
+fn truncate_label_to_width(
+    text: &mut TextRenderer,
+    label: &str,
+    max_width: f32,
+    size: f32,
+) -> String {
+    if max_width <= 0.0 || label.is_empty() {
+        return String::new();
+    }
+    if text.measure(label, size) <= max_width {
+        return label.to_string();
+    }
+    const ELLIPSIS: &str = "…";
+    if text.measure(ELLIPSIS, size) > max_width {
+        return String::new();
+    }
+    let mut shortened = String::new();
+    for character in label.chars() {
+        let mut candidate = shortened.clone();
+        candidate.push(character);
+        candidate.push_str(ELLIPSIS);
+        if text.measure(&candidate, size) > max_width {
+            break;
+        }
+        shortened.push(character);
+    }
+    if shortened.is_empty() {
+        ELLIPSIS.into()
+    } else {
+        shortened.push_str(ELLIPSIS);
+        shortened
+    }
 }
