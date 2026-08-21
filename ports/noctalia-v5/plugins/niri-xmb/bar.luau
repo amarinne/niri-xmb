@@ -7,6 +7,7 @@ local state = {
     iconRetryAt = {},
     hoveredWindowId = nil,
     pendingDrop = nil,
+    dropErrorUntil = nil,
 }
 
 local render
@@ -31,6 +32,38 @@ end
 
 local function backend()
     return tostring(config("backend_command", "niri-xmb"))
+end
+
+local function command(arguments)
+    local parts = { shellQuote(backend()) }
+    for _, argument in ipairs(arguments or {}) do
+        table.insert(parts, shellQuote(argument))
+    end
+    return table.concat(parts, " ")
+end
+
+local function finiteNumber(value)
+    local number = tonumber(value)
+    if number == nil or number ~= number or number == math.huge or number == -math.huge then
+        return nil
+    end
+    return number
+end
+
+local function positiveId(value)
+    local number = finiteNumber(value)
+    if number == nil or number <= 0 or number ~= math.floor(number) then
+        return nil
+    end
+    return number
+end
+
+local function optionalId(value)
+    local number = finiteNumber(value)
+    if number == nil or number < 0 or number ~= math.floor(number) then
+        return nil
+    end
+    return number
 end
 
 local function targetOutput()
@@ -92,24 +125,95 @@ local function findWindow(windowId)
 end
 
 local function runAction(arguments, callback)
-    local command = backend() .. " " .. arguments
+    local invocation = command(arguments)
     if callback == nil then
-        noctalia.runAsync(command)
+        noctalia.runAsync(invocation)
     else
-        noctalia.runAsync(command, callback)
+        noctalia.runAsync(invocation, callback)
     end
 end
 
 local function focusWindow(windowId)
-    runAction("focus-window --window-id " .. idString(windowId))
+    local validatedId = positiveId(windowId)
+    if validatedId == nil then
+        noctalia.log("niri-xmb: rejected invalid window ID")
+        return
+    end
+    runAction({ "focus-window", "--window-id", idString(validatedId) })
 end
 
 local function focusWorkspace(workspaceId)
-    runAction("focus-workspace --workspace-id " .. idString(workspaceId))
+    local validatedId = positiveId(workspaceId)
+    if validatedId == nil then
+        noctalia.log("niri-xmb: rejected invalid workspace ID")
+        return
+    end
+    runAction({ "focus-workspace", "--workspace-id", idString(validatedId) })
 end
 
-local function iconPath(appId, size)
-    local key = tostring(appId or "") .. ":" .. tostring(size)
+local function trim(value)
+    return string.match(tostring(value or ""), "^%s*(.-)%s*$") or ""
+end
+
+local function addIconCandidate(candidates, seen, value)
+    local candidate = trim(value)
+    if candidate == "" then
+        return
+    end
+
+    if not seen[candidate] then
+        seen[candidate] = true
+        table.insert(candidates, candidate)
+    end
+
+    local desktopStem = string.match(candidate, "([^/]+)%.desktop$")
+    if desktopStem ~= nil and not seen[desktopStem] then
+        seen[desktopStem] = true
+        table.insert(candidates, desktopStem)
+    end
+end
+
+local function iconCandidates(window)
+    local candidates = {}
+    local seen = {}
+
+    -- Accept common field names so richer snapshots can provide desktop
+    -- metadata without another plugin rewrite.
+    addIconCandidate(candidates, seen, window.icon_name)
+    addIconCandidate(candidates, seen, window.iconName)
+    addIconCandidate(candidates, seen, window.desktop_entry)
+    addIconCandidate(candidates, seen, window.desktopEntry)
+    addIconCandidate(candidates, seen, window.desktop_id)
+    addIconCandidate(candidates, seen, window.desktopId)
+    addIconCandidate(candidates, seen, window.desktop_file)
+    addIconCandidate(candidates, seen, window.desktopFile)
+
+    local appId = trim(window.app_id or window.appId)
+    addIconCandidate(candidates, seen, appId)
+
+    local lowerAppId = string.lower(appId)
+    for _, suffix in ipairs({ "-terminal", "_terminal", ".terminal", "-window", "_window" }) do
+        if string.sub(lowerAppId, -#suffix) == suffix then
+            addIconCandidate(candidates, seen, string.sub(appId, 1, #appId - #suffix))
+        end
+    end
+
+    local tail = string.match(appId, "([^./]+)$")
+    if tail ~= appId then
+        addIconCandidate(candidates, seen, tail)
+    end
+
+    -- Use a title only when it is a stable icon-like token. Dynamic browser
+    -- and terminal titles must not create an unbounded negative cache.
+    local title = trim(window.title)
+    if #title <= 64 and string.match(title, "^[%w._+%-]+$") ~= nil then
+        addIconCandidate(candidates, seen, title)
+    end
+    return candidates
+end
+
+local function resolveIconCandidate(candidate, size)
+    local key = candidate .. ":" .. tostring(size)
     local cached = state.icons[key]
     if cached ~= nil then
         return cached
@@ -125,7 +229,7 @@ local function iconPath(appId, size)
     -- downsamples the image instead of enlarging a low-resolution icon on a
     -- fractional-scale output.
     local decodeSize = math.max(64, size * 2)
-    local resolved = noctalia.appIconPath(tostring(appId or ""), decodeSize)
+    local resolved = noctalia.appIconPath(candidate, decodeSize)
     if resolved ~= nil then
         state.icons[key] = resolved
         state.iconRetryAt[key] = nil
@@ -137,10 +241,20 @@ local function iconPath(appId, size)
     return resolved
 end
 
+local function iconPath(window, size)
+    for _, candidate in ipairs(iconCandidates(window)) do
+        local resolved = resolveIconCandidate(candidate, size)
+        if resolved ~= nil then
+            return resolved
+        end
+    end
+    return nil
+end
+
 local function parseTarget(value)
     local workspaceId, targetWindowId, fraction =
         string.match(tostring(value or ""), "^([^|]+)|([^|]+)|([^|]+)$")
-    return tonumber(workspaceId), tonumber(targetWindowId), tonumber(fraction)
+    return positiveId(workspaceId), optionalId(targetWindowId), finiteNumber(fraction)
 end
 
 local function applyOptimisticDrop(sourceWindowId, workspaceId, targetWindowId, fraction)
@@ -171,12 +285,16 @@ local function applyOptimisticDrop(sourceWindowId, workspaceId, targetWindowId, 
     sourceWindow.workspace_id = workspaceId
     sourceWindow.floating = false
     table.insert(targetWorkspace.windows, insertIndex, sourceWindow)
+    -- The optimistic order is a preview, not the truth. It holds only until
+    -- the daemon answers for this drop or this deadline passes; whichever
+    -- comes first restores canonical state.
     state.pendingDrop = {
         sourceWindowId = sourceWindowId,
         workspaceId = workspaceId,
         targetWindowId = targetWindowId,
         fraction = fraction,
-        pollsRemaining = 12,
+        submittedAt = noctalia.nowMs(),
+        deadline = noctalia.nowMs() + 3000,
     }
     state.lastGeneration = -1
     render()
@@ -202,58 +320,86 @@ local function pendingDropMatches(snapshot, pending)
 end
 
 local function onDrop(payload, value, sceneX, sceneY)
-    local sourceWindowId = tonumber(payload)
+    local sourceWindowId = positiveId(payload)
     local workspaceId, targetWindowId, fraction = parseTarget(value)
-    if sourceWindowId == nil or workspaceId == nil or fraction == nil then
+    if sourceWindowId == nil or workspaceId == nil or targetWindowId == nil
+        or fraction == nil or fraction < 0 or fraction > 1 then
         noctalia.log("niri-xmb: rejected malformed drop payload")
         return
     end
 
     applyOptimisticDrop(sourceWindowId, workspaceId, targetWindowId, fraction)
 
-    local arguments = "drop --source-window-id " .. idString(sourceWindowId)
-        .. " --target-workspace-id " .. idString(workspaceId)
-        .. " --fraction " .. tostring(fraction)
-    if targetWindowId ~= nil and targetWindowId > 0 then
-        arguments = arguments .. " --target-window-id " .. idString(targetWindowId)
+    local arguments = {
+        "drop",
+        "--source-window-id", idString(sourceWindowId),
+        "--target-workspace-id", idString(workspaceId),
+        "--fraction", tostring(fraction),
+    }
+    if targetWindowId > 0 then
+        table.insert(arguments, "--target-window-id")
+        table.insert(arguments, idString(targetWindowId))
     end
 
     if config("preserve_cursor_after_drag", true) then
         local host = findOutput(barWidget.outputName() or "")
-        local localX = tonumber(sceneX)
-        local localY = tonumber(sceneY)
+        local localX = finiteNumber(sceneX)
+        local localY = finiteNumber(sceneY)
         if host ~= nil and localX ~= nil and localY ~= nil then
-            arguments = arguments
-                .. " --cursor-x " .. tostring((host.x or 0) + localX)
-                .. " --cursor-y " .. tostring((host.y or 0) + localY)
+            local hostX = finiteNumber(host.x) or 0
+            local hostY = finiteNumber(host.y) or 0
+            local cursorX = finiteNumber(hostX + localX)
+            local cursorY = finiteNumber(hostY + localY)
+            if cursorX ~= nil and cursorY ~= nil then
+                table.insert(arguments, "--cursor-x")
+                table.insert(arguments, tostring(cursorX))
+                table.insert(arguments, "--cursor-y")
+                table.insert(arguments, tostring(cursorY))
+            end
         end
     end
 
     local function commitDrop()
         runAction(arguments, function(result)
-            local response = tostring(result.stdout or result.stderr or "")
-            if result.exitCode ~= 0 or string.match(response, "^error:") ~= nil then
-                noctalia.log("niri-xmb drop failed: " .. response)
-                state.pendingDrop = nil
+            local response = trim(tostring(result.stdout or result.stderr or ""))
+            -- The daemon answers only after the move is confirmed, the action
+            -- fails, or confirmation times out. Either way this reply ends the
+            -- optimistic preview and pulls canonical state immediately.
+            local pending = state.pendingDrop
+            local pendingAge = nil
+            if pending ~= nil and finiteNumber(pending.submittedAt) ~= nil then
+                pendingAge = math.max(0, math.floor(noctalia.nowMs() - pending.submittedAt))
             end
+            state.pendingDrop = nil
             state.lastGeneration = -1
+            if result.exitCode ~= 0 or string.match(response, "^error:") ~= nil then
+                -- One line carries every field needed to reproduce the
+                -- rejection against daemon logs: ids and numbers only.
+                noctalia.log(string.format(
+                    "niri-xmb drop failed: source=%s workspace=%s target=%s fraction=%s generation=%s pendingAgeMs=%s response=%s",
+                    idString(sourceWindowId),
+                    idString(workspaceId),
+                    idString(targetWindowId),
+                    tostring(fraction),
+                    idString(state.snapshot ~= nil and state.snapshot.generation or nil),
+                    pendingAge ~= nil and tostring(pendingAge) or "unknown",
+                    response ~= "" and response or "(empty)"
+                ))
+                state.dropErrorUntil = noctalia.nowMs() + 2500
+                render()
+            end
+            poll(true)
         end)
     end
 
-    -- barWidget.render() is returned as part of this script callback. Give the
-    -- host one display frame to apply it before Niri starts its multi-step move.
-    local deferred = noctalia.runAsync("sleep 0.016", function(_)
-        commitDrop()
-    end)
-    if not deferred then
-        commitDrop()
-    end
+    commitDrop()
 end
 
 local function onSourceDrop(payload, value, _, _)
-    local sourceWindowId = tonumber(payload)
+    local sourceWindowId = positiveId(payload)
     local workspaceId, targetWindowId, fraction = parseTarget(value)
-    if sourceWindowId == nil or workspaceId == nil or fraction == nil then
+    if sourceWindowId == nil or workspaceId == nil or targetWindowId == nil
+        or fraction == nil or fraction < 0 or fraction > 1 then
         return
     end
     local target = findWorkspace(workspaceId)
@@ -278,7 +424,7 @@ local function marker(workspaceId, targetWindowId, fraction, key, height, slop)
 end
 
 local function windowVisual(window, iconSize, indicatorMode)
-    local path = iconPath(window.app_id, iconSize)
+    local path = iconPath(window, iconSize)
     local children = {}
     if path ~= nil then
         table.insert(children, ui.image({
@@ -540,6 +686,19 @@ render = function()
         end
     end
 
+    if state.dropErrorUntil ~= nil then
+        if noctalia.nowMs() < state.dropErrorUntil then
+            table.insert(children, ui.glyph({
+                key = "drop-error",
+                name = "alert-circle",
+                size = math.max(12, iconSize - 8),
+                color = "error",
+            }))
+        else
+            state.dropErrorUntil = nil
+        end
+    end
+
     barWidget.render(ui.row({
         key = "niri-xmb-root",
         align = "center",
@@ -552,7 +711,7 @@ poll = function(force)
         return
     end
     state.polling = true
-    local started = noctalia.runAsync(backend() .. " snapshot", function(result)
+    local started = noctalia.runAsync(command({ "snapshot" }), function(result)
         state.polling = false
         if result.exitCode ~= 0 then
             local message = tostring(result.stderr or result.stdout or "snapshot failed")
@@ -574,18 +733,27 @@ poll = function(force)
 
         state.lastError = nil
         if state.pendingDrop ~= nil then
-            if pendingDropMatches(decoded, state.pendingDrop) then
+            local now = noctalia.nowMs()
+            if now >= state.pendingDrop.deadline then
+                -- The daemon never answered in time; stop trusting the
+                -- preview and show whatever canonical state arrived.
+                state.pendingDrop = nil
+            elseif pendingDropMatches(decoded, state.pendingDrop) then
                 state.pendingDrop = nil
             else
-                state.pendingDrop.pollsRemaining = state.pendingDrop.pollsRemaining - 1
-                if state.pendingDrop.pollsRemaining > 0 then
-                    return
-                end
-                state.pendingDrop = nil
+                -- A drop is in flight and Niri reports intermediate layout.
+                -- Hold the optimistic order until the reply or the deadline;
+                -- unrelated updates are delayed by at most that window.
+                return
             end
         end
         state.snapshot = decoded
-        if force or decoded.generation ~= state.lastGeneration then
+        local dropErrorExpired = state.dropErrorUntil ~= nil
+            and noctalia.nowMs() >= state.dropErrorUntil
+        if dropErrorExpired then
+            state.dropErrorUntil = nil
+        end
+        if force or dropErrorExpired or decoded.generation ~= state.lastGeneration then
             state.lastGeneration = decoded.generation
             render()
         end
@@ -603,11 +771,12 @@ function update()
 end
 
 function onScroll(axis, steps, startsGesture)
-    if axis ~= "vertical" or steps == 0 then
+    local validatedSteps = finiteNumber(steps)
+    if axis ~= "vertical" or validatedSteps == nil or validatedSteps == 0 then
         return
     end
-    local delta = steps > 0 and 1 or -1
-    runAction("cycle-workspace --output " .. shellQuote(targetOutput()) .. " --delta " .. tostring(delta))
+    local delta = validatedSteps > 0 and 1 or -1
+    runAction({ "cycle-workspace", "--output", targetOutput(), "--delta", tostring(delta) })
 end
 
 function onConfigChanged()

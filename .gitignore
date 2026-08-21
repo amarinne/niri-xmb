@@ -41,3 +41,10 @@ Thumbs.db
 AGENTS.md
 CLAUDE.md
 AI-DECLARATION.md
+
+# Local review, design, and machine-profile documents
+DESLOPPIFY.md
+INTERACTION_DESIGN.md
+STATE_STREAM_DESIGN.md
+MACHINE_PROFILE.md
+HANDOVER.md

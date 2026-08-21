@@ -10,8 +10,8 @@ The Noctalia fork adds only the generic host support the plugin API was missing:
 bar-side declarative drag/drop, click-without-drag callbacks, and optional drop
 coordinates. Window/workspace state and all Niri actions remain in `niri-xmb`.
 
-The desktop profile uses native Noctalia taskbar widgets. Set this field on
-each taskbar instance to replace middle-click window close with XMB toggle:
+The example machine profile uses native Noctalia taskbar widgets. Set this
+field on each taskbar instance to replace middle-click close with XMB toggle:
 
 ```toml
 middle_click_command = "$HOME/.local/bin/niri-xmb toggle"
@@ -27,7 +27,11 @@ bars_enabled = false
 ```
 
 The daemon is also still responsible for the cursor-positioned `Mod+Z` popup.
-Build both projects on the desktop; do not compile Noctalia on the laptop.
+Build `niri-xmb` and the required Noctalia fork on the target machine.
+
+The old Noctalia v4 plugin is in
+[`archive/noctalia-v4/`](../../archive/noctalia-v4/). Use it only as a
+reference for other Quickshell integrations.
 
 Validate the deployed v5 configuration before restarting:
 

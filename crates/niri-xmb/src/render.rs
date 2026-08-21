@@ -210,19 +210,14 @@ pub enum HitTarget {
     Panel,
     Workspace {
         workspace_id: u64,
-        column_count: usize,
     },
     Canvas {
-        output: String,
         workspace_id: u64,
         rect: Rect,
     },
     Window {
-        output: String,
         workspace_id: u64,
         window_id: u64,
-        column: Option<usize>,
-        floating: bool,
         rect: Rect,
         canvas: Option<Rect>,
     },
@@ -288,13 +283,38 @@ pub struct Renderer {
     render_surface: Option<usize>,
     panel_input_active: bool,
     anim: Animator,
-    /// Scratch buffers reused across frames. A popup surface is output-sized,
-    /// so reallocating these per frame is the dominant cost of animating.
+    /// Scratch buffers and damage history belong to one Wayland surface.
+    ///
+    /// Bars and popups normally have different sizes. Sharing one canvas made
+    /// the render loop replace that canvas each time it crossed a surface-size
+    /// boundary, which was especially expensive during popup animation.
+    surfaces: HashMap<usize, SurfaceRenderState>,
+    /// Surfaces already presented blank, so they can be skipped.
+    blanked: std::collections::HashSet<usize>,
+}
+
+#[derive(Default)]
+struct SurfaceRenderState {
     canvas: Option<Pixmap>,
     layer: Option<Pixmap>,
     canvas_damage: Option<DamageRect>,
-    /// Surfaces already presented blank, so they can be skipped.
-    blanked: std::collections::HashSet<usize>,
+    bar_key: Option<BarRenderKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BarRenderKey {
+    generation: u64,
+    width: u32,
+    height: u32,
+    hover: Option<HoverTarget>,
+    drag: Option<DragRenderKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DragRenderKey {
+    window_id: u64,
+    x_bits: u64,
+    y_bits: u64,
 }
 
 impl Renderer {
@@ -309,9 +329,7 @@ impl Renderer {
             render_surface: None,
             panel_input_active: false,
             anim: Animator::new(),
-            canvas: None,
-            layer: None,
-            canvas_damage: None,
+            surfaces: HashMap::new(),
             blanked: std::collections::HashSet::new(),
         }
     }
@@ -509,6 +527,21 @@ impl Renderer {
         None
     }
 
+    /// Drop render state for surfaces that are no longer visible.
+    ///
+    /// Popup canvases are output-sized. A follow-active popup can visit many
+    /// outputs during one daemon lifetime, so retaining every old canvas would
+    /// turn the per-surface CPU fix into steady memory growth.
+    pub fn retain_surfaces(&mut self, surfaces: &[SurfaceInfo]) {
+        let live = surfaces
+            .iter()
+            .map(|surface| surface.id)
+            .collect::<std::collections::HashSet<_>>();
+        self.surfaces.retain(|id, _| live.contains(id));
+        self.hit_zones.retain(|id, _| live.contains(id));
+        self.blanked.retain(|id| live.contains(id));
+    }
+
     /// Render `surface`, returning its pixels, or `None` when there is nothing
     /// new to present.
     ///
@@ -526,6 +559,30 @@ impl Renderer {
         selection: Option<&SelectionVisual>,
     ) -> Option<RenderedFrame<'_>> {
         let (width, height) = (surface.width.max(1), surface.height.max(1));
+        let bar_key = matches!(surface.kind, SurfaceKind::Bar(_)).then(|| BarRenderKey {
+            generation: snapshot.generation,
+            width,
+            height,
+            hover: (self.hovered_surface == Some(surface.id))
+                .then_some(self.hovered_target)
+                .flatten(),
+            drag: drag.map(|drag| DragRenderKey {
+                window_id: drag.window_id,
+                x_bits: drag.global_x.to_bits(),
+                y_bits: drag.global_y.to_bits(),
+            }),
+        });
+        if let Some(key) = bar_key
+            && self
+                .surfaces
+                .get(&surface.id)
+                .is_some_and(|state| state.bar_key == Some(key))
+        {
+            // Popup animation marks the controller dirty every frame. A bar
+            // whose model, hover, size, and drag state did not change has no
+            // reason to join that work.
+            return None;
+        }
         let progress = match surface.kind {
             SurfaceKind::Bar(_) => 1.0,
             SurfaceKind::Popup => self.anim.panel(&surface.output),
@@ -539,16 +596,20 @@ impl Renderer {
             self.blanked.remove(&surface.id);
         }
 
-        let reusable = self
+        let mut state = self.surfaces.remove(&surface.id).unwrap_or_default();
+        let reusable = state
             .canvas
             .as_ref()
             .is_some_and(|pixmap| pixmap.width() == width && pixmap.height() == height);
         if !reusable {
-            self.canvas = Pixmap::new(width, height);
-            self.canvas_damage = None;
+            state.canvas = Pixmap::new(width, height);
+            state.canvas_damage = None;
         }
-        let mut pixmap = self.canvas.take()?;
-        if let Some(previous) = self.canvas_damage.take() {
+        let Some(mut pixmap) = state.canvas.take() else {
+            self.surfaces.insert(surface.id, state);
+            return None;
+        };
+        if let Some(previous) = state.canvas_damage.take() {
             clear_damage(&mut pixmap, previous);
         }
         self.render_surface = Some(surface.id);
@@ -574,6 +635,7 @@ impl Renderer {
                 if progress > 0.004 {
                     let panel = self.render_popup_layer(
                         &mut pixmap,
+                        &mut state.layer,
                         &surface.output,
                         snapshot,
                         config,
@@ -597,12 +659,18 @@ impl Renderer {
             damage = Some(damage.map_or(ghost, |current| current.union(ghost)));
         }
         self.hit_zones.insert(surface.id, zones);
-        self.canvas_damage = damage;
-        self.canvas = Some(pixmap);
-        self.canvas.as_ref().map(|pixmap| RenderedFrame {
-            pixels: pixmap.data(),
-            damage,
-        })
+        state.canvas_damage = damage;
+        state.canvas = Some(pixmap);
+        state.bar_key = bar_key;
+        self.surfaces.insert(surface.id, state);
+        self.surfaces
+            .get(&surface.id)?
+            .canvas
+            .as_ref()
+            .map(|pixmap| RenderedFrame {
+                pixels: pixmap.data(),
+                damage,
+            })
     }
 
     fn render_bar(
@@ -691,7 +759,6 @@ impl Renderer {
                 rect,
                 target: HitTarget::Workspace {
                     workspace_id: workspace.id,
-                    column_count: workspace.columns.len(),
                 },
             });
 
@@ -724,11 +791,8 @@ impl Renderer {
                 zones.push(HitZone {
                     rect: icon_rect,
                     target: HitTarget::Window {
-                        output: output.name.clone(),
                         workspace_id: workspace.id,
                         window_id: window.id,
-                        column: window.column,
-                        floating: window.floating,
                         rect: icon_rect,
                         canvas: None,
                     },
@@ -765,6 +829,7 @@ impl Renderer {
     fn render_popup_layer(
         &mut self,
         pixmap: &mut Pixmap,
+        layer: &mut Option<Pixmap>,
         host_output: &str,
         snapshot: &Snapshot,
         config: &Config,
@@ -781,15 +846,14 @@ impl Renderer {
         let panel = self.render_popup(pixmap, host_output, snapshot, config, selection, zones)?;
         let padding = config.style.shadow_spread + config.style.shadow_offset.abs() + 4.0;
         let damage = damage_for_rect(panel, padding, pixmap.width(), pixmap.height())?;
-        let reusable = self
-            .layer
+        let reusable = layer
             .as_ref()
             .is_some_and(|layer| layer.width() == damage.width && layer.height() == damage.height);
         if !reusable {
-            self.layer = Pixmap::new(damage.width, damage.height);
+            *layer = Pixmap::new(damage.width, damage.height);
         }
-        let mut layer = self.layer.take()?;
-        copy_damage(pixmap, &mut layer, damage);
+        let mut animation_layer = layer.take()?;
+        copy_damage(pixmap, &mut animation_layer, damage);
         clear_damage(pixmap, damage);
         // Grow into place from slightly small, pivoting on the panel centre.
         let scale = lerp(config.animation.open_scale, 1.0, progress);
@@ -806,12 +870,12 @@ impl Renderer {
         pixmap.draw_pixmap(
             damage.x as i32,
             damage.y as i32,
-            layer.as_ref(),
+            animation_layer.as_ref(),
             &paint,
             transform,
             None,
         );
-        self.layer = Some(layer);
+        *layer = Some(animation_layer);
         Some(panel)
     }
 
@@ -1026,13 +1090,11 @@ impl Renderer {
                 rect: clamp_rect(row, canvas),
                 target: HitTarget::Workspace {
                     workspace_id: workspace.id,
-                    column_count: workspace.columns.len(),
                 },
             });
             zones.push(HitZone {
                 rect: clamp_rect(row, canvas),
                 target: HitTarget::Canvas {
-                    output: output.name.clone(),
                     workspace_id: workspace.id,
                     rect: canvas,
                 },
@@ -1092,7 +1154,6 @@ impl Renderer {
                 let center_y = row_y + stack_row as f32 * metrics.stack_step;
                 self.draw_canvas_window(
                     pixmap,
-                    output,
                     workspace,
                     window,
                     canvas,
@@ -1111,7 +1172,6 @@ impl Renderer {
         for (index, window) in workspace.floating.iter().enumerate() {
             self.draw_canvas_window(
                 pixmap,
-                output,
                 workspace,
                 window,
                 canvas,
@@ -1130,7 +1190,6 @@ impl Renderer {
     fn draw_canvas_window(
         &mut self,
         pixmap: &mut Pixmap,
-        output: &OutputModel,
         workspace: &WorkspaceModel,
         window: &WindowModel,
         canvas: Rect,
@@ -1165,11 +1224,8 @@ impl Renderer {
             zones.push(HitZone {
                 rect,
                 target: HitTarget::Window {
-                    output: output.name.clone(),
                     workspace_id: workspace.id,
                     window_id: window.id,
-                    column: window.column,
-                    floating: window.floating,
                     rect,
                     canvas: Some(canvas),
                 },
@@ -1375,7 +1431,7 @@ impl Renderer {
         let urgent = hex_color(&config.style.urgent);
         match config.style.urgent_indicator {
             UrgentIndicator::None => {}
-            UrgentIndicator::Ring if config.style.show_urgent_ring => {
+            UrgentIndicator::Ring => {
                 let width = config.style.urgent_ring_width.max(0.0);
                 let padding = config.style.urgent_ring_padding.max(0.0);
                 if width > 0.0 {
@@ -1391,7 +1447,6 @@ impl Renderer {
                     );
                 }
             }
-            UrgentIndicator::Ring => {}
             UrgentIndicator::Glow => {
                 let spread = config.style.urgent_glow_spread.max(0.0);
                 let alpha = config.style.urgent_glow_alpha.clamp(0.0, 1.0);
@@ -1522,5 +1577,141 @@ fn truncate_label_to_width(
     } else {
         shortened.push_str(ELLIPSIS);
         shortened
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::OutputModel;
+    use std::collections::BTreeMap;
+
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            outputs: BTreeMap::from([
+                (
+                    "eDP-1".into(),
+                    OutputModel {
+                        name: "eDP-1".into(),
+                        x: 0,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
+                        workspaces: Vec::new(),
+                    },
+                ),
+                (
+                    "HDMI-A-1".into(),
+                    OutputModel {
+                        name: "HDMI-A-1".into(),
+                        x: 1920,
+                        y: 0,
+                        width: 2560,
+                        height: 1440,
+                        workspaces: Vec::new(),
+                    },
+                ),
+            ]),
+            generation: 7,
+            ..Snapshot::default()
+        }
+    }
+
+    fn bar_surface(id: usize, index: usize, output: &str, width: u32) -> SurfaceInfo {
+        SurfaceInfo {
+            id,
+            kind: SurfaceKind::Bar(index),
+            output: output.into(),
+            global_x: 0.0,
+            global_y: 0.0,
+            width,
+            height: 38,
+            configured: true,
+            frame_ready: true,
+        }
+    }
+
+    #[test]
+    fn unchanged_bar_is_not_redrawn_for_unrelated_dirty_frames() {
+        let mut renderer = Renderer::new();
+        let config = Config {
+            bars: vec![BarConfig {
+                output: "eDP-1".into(),
+                ..BarConfig::default()
+            }],
+            ..Config::default()
+        };
+        let snapshot = snapshot();
+        let surface = bar_surface(1, 0, "eDP-1", 420);
+
+        assert!(
+            renderer
+                .render(&surface, &snapshot, &config, None, None)
+                .is_some()
+        );
+        assert!(
+            renderer
+                .render(&surface, &snapshot, &config, None, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn each_surface_keeps_its_own_sized_canvas() {
+        let mut renderer = Renderer::new();
+        let config = Config {
+            bars: vec![
+                BarConfig {
+                    output: "eDP-1".into(),
+                    ..BarConfig::default()
+                },
+                BarConfig {
+                    output: "HDMI-A-1".into(),
+                    ..BarConfig::default()
+                },
+            ],
+            ..Config::default()
+        };
+        let snapshot = snapshot();
+        let laptop = bar_surface(1, 0, "eDP-1", 420);
+        let desktop = bar_surface(2, 1, "HDMI-A-1", 640);
+
+        assert!(
+            renderer
+                .render(&laptop, &snapshot, &config, None, None)
+                .is_some()
+        );
+        assert!(
+            renderer
+                .render(&desktop, &snapshot, &config, None, None)
+                .is_some()
+        );
+
+        assert_eq!(renderer.surfaces[&1].canvas.as_ref().unwrap().width(), 420);
+        assert_eq!(renderer.surfaces[&2].canvas.as_ref().unwrap().width(), 640);
+    }
+
+    #[test]
+    fn hidden_surface_releases_its_render_buffers() {
+        let mut renderer = Renderer::new();
+        let config = Config {
+            bars: vec![BarConfig {
+                output: "eDP-1".into(),
+                ..BarConfig::default()
+            }],
+            ..Config::default()
+        };
+        let snapshot = snapshot();
+        let surface = bar_surface(1, 0, "eDP-1", 420);
+
+        assert!(
+            renderer
+                .render(&surface, &snapshot, &config, None, None)
+                .is_some()
+        );
+        renderer.retain_surfaces(&[]);
+
+        assert!(renderer.surfaces.is_empty());
+        assert!(renderer.hit_zones.is_empty());
     }
 }

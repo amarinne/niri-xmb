@@ -32,13 +32,6 @@ pub struct IconCache {
     desktop_map: HashMap<String, DesktopApp>,
     desktop_scanned: bool,
     icon_size: u32,
-    /// Plugin-registered overrides: class (lowercase) → absolute file path.
-    /// Checked before the XDG scan — highest priority.
-    overrides: HashMap<String, String>,
-    /// Optional default icon path for classes not in `overrides` or XDG.
-    override_default: Option<String>,
-    /// Decoded cache for override paths (keyed by file path, not class).
-    override_cache: HashMap<String, Option<IconData>>,
 }
 
 impl Default for IconCache {
@@ -49,9 +42,6 @@ impl Default for IconCache {
             desktop_map: HashMap::new(),
             desktop_scanned: false,
             icon_size: 128,
-            overrides: HashMap::new(),
-            override_default: None,
-            override_cache: HashMap::new(),
         }
     }
 }
@@ -61,38 +51,9 @@ impl IconCache {
         Self::default()
     }
 
-    /// Register a plugin icon override.  `class` is matched case-insensitively.
-    /// `path` may be absolute or relative to the process working directory.
-    #[allow(dead_code)]
-    pub fn register_override(&mut self, class: String, path: String) {
-        // Invalidate any cached result for this class so it re-resolves.
-        self.cache.remove(&class.to_lowercase());
-        self.overrides.insert(class.to_lowercase(), path);
-    }
-
-    /// Register a fallback icon used when no class-specific override matches
-    /// and the XDG scan also finds nothing.
-    #[allow(dead_code)]
-    pub fn register_override_default(&mut self, path: String) {
-        self.override_default = Some(path);
-        // Clear all confirmed misses so they get a second chance with the new default.
-        self.cache.retain(|_, v| v.is_some());
-    }
-
-    fn load_override(&mut self, path: &str) -> Option<IconData> {
-        if let Some(cached) = self.override_cache.get(path) {
-            return cached.clone();
-        }
-        let result = load_icon_rgba(std::path::Path::new(path), self.icon_size);
-        self.override_cache.insert(path.to_string(), result.clone());
-        result
-    }
-
     /// Return RGBA bytes for the best available icon for `app_id`, or `None`.
     /// Resolution order:
-    ///   1. Plugin override for this specific class
-    ///   2. XDG .desktop + hicolor + pixmaps
-    ///   3. Plugin override default (if set)
+    ///   1. XDG .desktop + hicolor + pixmaps
     pub fn get(&mut self, app_id: &str) -> Option<&IconData> {
         let key = app_id.to_lowercase();
 
@@ -101,28 +62,9 @@ impl IconCache {
             return self.cache.get(&key).and_then(|v| v.as_ref());
         }
 
-        // 1. Plugin override — highest priority.
-        if let Some(path) = self.overrides.get(&key).cloned() {
-            let data = self.load_override(&path);
-            self.cache.insert(key.clone(), data);
-            return self.cache.get(&key).and_then(|v| v.as_ref());
-        }
-
-        // 2. XDG scan.
         self.ensure_desktop_scanned();
         let icon_name = self.resolve_icon_name(&key);
-        let data = if let Some(ref name) = icon_name {
-            self.load_icon(name)
-        } else {
-            None
-        };
-
-        // 3. Fall through to plugin default if XDG found nothing.
-        let data = data.or_else(|| {
-            self.override_default
-                .clone()
-                .and_then(|p| self.load_override(&p))
-        });
+        let data = icon_name.and_then(|name| self.load_icon(&name));
 
         self.cache.insert(key.clone(), data);
         self.cache.get(&key).and_then(|v| v.as_ref())

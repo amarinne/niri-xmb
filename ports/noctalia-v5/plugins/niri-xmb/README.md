@@ -18,16 +18,16 @@ enabled = ["amarinne/niri-xmb"]
 [[plugins.source]]
 name = "niri-xmb-local"
 kind = "path"
-location = "/home/eza/Projects/niri-xmb/ports/noctalia-v5/plugins"
+location = "/path/to/niri-xmb/ports/noctalia-v5/plugins"
 
 [bar.main]
-start = ["niri-xmb-laptop"]
+start = ["niri-xmb-main"]
 
-[widget.niri-xmb-laptop]
+[widget.niri-xmb-main]
 type = "amarinne/niri-xmb:workspace-strip"
 target_output = "eDP-1"
 capsule = false
-backend_command = "/home/eza/.local/bin/niri-xmb"
+backend_command = "niri-xmb"
 allow_drag = true
 allow_column_join = false
 preserve_cursor_after_drag = true
@@ -46,3 +46,12 @@ entire strip.
 Keep `bars_enabled = false` in the standalone XMB configuration. The daemon
 must be running for snapshots, clicks, wheel switching, drops, and the
 `Mod+Z` popup.
+
+## Application icons
+
+The plugin sends several identity candidates to Noctalia's application icon
+resolver. It checks explicit desktop metadata, the Niri application ID,
+common terminal-class suffixes, and stable icon-like window titles. This lets
+a class such as `btop-terminal` resolve the `btop.desktop` icon.
+
+Noctalia remains responsible for desktop-entry matching and icon-theme lookup.

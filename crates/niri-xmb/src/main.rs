@@ -1,11 +1,14 @@
 mod anim;
 mod config;
 mod draw;
+mod drop_plan;
 mod icons;
 mod ipc;
 mod model;
 mod niri;
 mod render;
+mod selection;
+mod subscribe;
 mod text;
 mod wayland;
 
@@ -13,15 +16,25 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::{BarConfig, Config, NavigationMode, PopupOutputs, PopupPosition, PopupSurfaceMode};
 use crossbeam_channel::unbounded;
+use drop_plan::{DropPoint, DropPolicy, DropRequest, DropTarget, plan_drop};
 use ipc::{ControlCommand, ControlRequest};
 use model::Snapshot;
-use niri::{NiriCommand, spawn as spawn_niri};
+use niri::{
+    ActionStep, ActionTransactionResult, NiriCommand, NiriHealth, NiriRequest, RestorationStatus,
+    spawn as spawn_niri,
+};
 use niri_ipc::socket::Socket;
 use niri_ipc::{Request, Response};
 use render::{DragVisual, HitTarget, Renderer, SelectionVisual};
+use selection::{
+    Selection, move_output as move_output_selection, move_within as move_selection,
+    normalize as normalize_selection, reset as reset_selection, selected_window,
+    selected_workspace, visual as selection_visual, wrap_index,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wayland::{PopupInput, SurfaceKind, SurfaceManager, UiEvent, UiEventKind, WakePipe};
 
@@ -46,6 +59,12 @@ const FOCUS_SETTLE: Duration = Duration::from_millis(120);
 /// any fixed grace period, and the focus event on its own is indistinguishable
 /// from navigation unless the window's age is known.
 const NEW_WINDOW_GRACE: Duration = Duration::from_millis(1200);
+
+/// Maximum time to wait for the event stream after all Niri actions complete.
+const DROP_CONFIRM_TIMEOUT: Duration = Duration::from_millis(1200);
+
+/// Let events from a failed partial action sequence reach the canonical model.
+const DROP_FAILURE_RECONCILE: Duration = Duration::from_millis(120);
 
 /// Keep a bar wheel burst on its queued workspace target while Niri catches
 /// up. Without this, each high-resolution packet starts from an old snapshot
@@ -74,6 +93,10 @@ const KEY_SHIFT_TAB: u32 = 0xfe20;
 struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// Raise daemon log verbosity: -v logs debug, -vv logs trace.
+    /// A set RUST_LOG always wins over this flag.
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -122,6 +145,8 @@ enum Command {
     Restart,
     /// Print the fully commented configuration template.
     PrintDefaultConfig,
+    /// Stream daemon state as NDJSON frames until interrupted.
+    Subscribe,
 }
 
 /// Why the popup is currently on screen.
@@ -173,70 +198,270 @@ struct BarScrollState {
     free_spin_until: Option<Instant>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct Selection {
-    output: String,
-    workspace: usize,
-    window: usize,
-    /// Stable workspace identity for `workspace`.
-    ///
-    /// Niri can insert, remove, or reorder workspaces while a popup is open.
-    /// Keep the id so the selection stays on the same workspace.
-    workspace_id: Option<u64>,
-    /// Stable window identity for `window`.
-    ///
-    /// Window positions are display positions, not identities. A drag or a
-    /// Niri column move can change the position without changing focus, so an
-    /// index alone would make the focal icon jump to a different window.
-    window_id: Option<u64>,
-    /// Where the cursor was left in each workspace, keyed by workspace id and
-    /// stored as a window id rather than a display index.
-    ///
-    /// The popup is a staging area, not a live view: navigating away from a
-    /// workspace and back must return to where you were, not to whatever Niri
-    /// is focusing right now. Discarded when the popup closes or a move is
-    /// confirmed, so a fresh popup always starts from live state.
-    visited: HashMap<u64, u64>,
+#[derive(Default)]
+struct DropTransactionState {
+    next_request_id: u64,
+    pending: Option<PendingDropTransaction>,
+    last: Option<CompletedDropTransaction>,
 }
 
-impl Selection {
-    /// Record the current position so returning to this workspace restores it.
-    fn remember(&mut self, snapshot: &Snapshot) {
-        if let (Some(workspace), Some(window)) = (
-            selected_workspace(self, snapshot),
-            selected_window(self, snapshot),
-        ) {
-            self.visited.insert(workspace, window);
+struct PendingDropTransaction {
+    request_id: u64,
+    plan: drop_plan::DropPlan,
+    submitted_at: Instant,
+    action_result: Option<ActionTransactionResult>,
+    action_result_at: Option<Instant>,
+    reply: Option<crossbeam_channel::Sender<String>>,
+}
+
+struct CompletedDropTransaction {
+    request_id: u64,
+    base_generation: u64,
+    final_generation: u64,
+    outcome: DropOutcome,
+    action_result: Option<ActionTransactionResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DropOutcome {
+    Confirmed,
+    ActionFailed(String),
+    ConfirmationTimedOut,
+    EventStreamUnavailable,
+}
+
+impl DropTransactionState {
+    fn submit(
+        &mut self,
+        plan: drop_plan::DropPlan,
+        snapshot: &Snapshot,
+        reply: Option<crossbeam_channel::Sender<String>>,
+        niri_tx: &crossbeam_channel::Sender<NiriRequest>,
+    ) -> std::result::Result<u64, &'static str> {
+        if self.pending.is_some() {
+            return Err("drop transaction already active");
+        }
+        if plan.base_generation != snapshot.generation {
+            return Err("stale drop plan");
+        }
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        let request_id = self.next_request_id;
+        tracing::info!(
+            request_id,
+            source = plan.source_window_id,
+            base_generation = plan.base_generation,
+            postcondition = %plan.confirmation.describe(),
+            "drop transaction submitted"
+        );
+        let command = plan.clone().into_command();
+        niri_tx
+            .send(NiriRequest::Transaction {
+                request_id,
+                command,
+            })
+            .map_err(|_| "Niri command worker unavailable")?;
+        self.pending = Some(PendingDropTransaction {
+            request_id,
+            plan,
+            submitted_at: Instant::now(),
+            action_result: None,
+            action_result_at: None,
+            reply,
+        });
+        Ok(request_id)
+    }
+
+    fn record_action_result(&mut self, result: ActionTransactionResult, now: Instant) {
+        let Some(pending) = self.pending.as_mut() else {
+            tracing::warn!(
+                request_id = result.request_id,
+                "orphan Niri transaction result"
+            );
+            return;
+        };
+        if pending.request_id != result.request_id {
+            tracing::warn!(
+                expected = pending.request_id,
+                received = result.request_id,
+                "out-of-order Niri transaction result"
+            );
+            return;
+        }
+        let steps = result
+            .completed_steps
+            .iter()
+            .map(|step| action_step_name(*step))
+            .collect::<Vec<_>>()
+            .join(",");
+        if let Some(failure) = &result.failure {
+            tracing::warn!(
+                request_id = result.request_id,
+                completed_steps = %steps,
+                failed_step = action_step_name(failure.step),
+                error = %failure.error,
+                "drop action step failed"
+            );
+        } else {
+            tracing::debug!(
+                request_id = result.request_id,
+                completed_steps = %steps,
+                "drop action steps completed"
+            );
+        }
+        pending.action_result = Some(result);
+        pending.action_result_at = Some(now);
+    }
+
+    fn reconcile(&mut self, snapshot: &Snapshot, event_stream_connected: bool, now: Instant) {
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        let Some(result) = pending.action_result.as_ref() else {
+            return;
+        };
+        let result_at = pending.action_result_at.unwrap_or(pending.submitted_at);
+        let outcome = if let Some(failure) = &result.failure {
+            (now.duration_since(result_at) >= DROP_FAILURE_RECONCILE).then(|| {
+                DropOutcome::ActionFailed(format!(
+                    "{}: {}",
+                    action_step_name(failure.step),
+                    failure.error
+                ))
+            })
+        } else if pending.plan.postcondition_matches(snapshot) {
+            Some(DropOutcome::Confirmed)
+        } else if !event_stream_connected {
+            Some(DropOutcome::EventStreamUnavailable)
+        } else if now.duration_since(result_at) >= DROP_CONFIRM_TIMEOUT {
+            Some(DropOutcome::ConfirmationTimedOut)
+        } else {
+            None
+        };
+        if let Some(outcome) = outcome {
+            self.finish(snapshot.generation, outcome);
         }
     }
 
-    /// Where to land when entering `workspace`: the remembered position if
-    /// this popup session has one, otherwise the window Niri would focus.
-    fn entry_index(&self, workspace: &model::WorkspaceModel) -> usize {
-        match self.visited.get(&workspace.id) {
-            Some(remembered) => workspace
-                .windows()
-                .position(|window| window.id == *remembered)
-                .unwrap_or_else(|| workspace.active_index()),
-            _ => workspace.active_index(),
+    fn finish(&mut self, final_generation: u64, outcome: DropOutcome) {
+        let Some(mut pending) = self.pending.take() else {
+            return;
+        };
+        tracing::info!(
+            request_id = pending.request_id,
+            base_generation = pending.plan.base_generation,
+            final_generation,
+            outcome = drop_outcome_name(&outcome),
+            "drop transaction finished"
+        );
+        let response = match &outcome {
+            DropOutcome::Confirmed => "ok\n".to_string(),
+            DropOutcome::ActionFailed(error) => format!("error: drop action failed: {error}\n"),
+            DropOutcome::ConfirmationTimedOut => "error: drop confirmation timeout\n".to_string(),
+            DropOutcome::EventStreamUnavailable => {
+                "error: Niri event stream unavailable\n".to_string()
+            }
+        };
+        if let Some(reply) = pending.reply.take() {
+            let _ = reply.send(response);
         }
+        self.last = Some(CompletedDropTransaction {
+            request_id: pending.request_id,
+            base_generation: pending.plan.base_generation,
+            final_generation,
+            outcome,
+            action_result: pending.action_result,
+        });
     }
 
-    /// End the staging session. The next popup starts from live state again.
-    fn clear_session(&mut self) {
-        self.visited.clear();
+    fn next_deadline(&self) -> Option<Instant> {
+        let pending = self.pending.as_ref()?;
+        pending.action_result_at.map(|result_at| {
+            if pending
+                .action_result
+                .as_ref()
+                .is_some_and(|result| result.failure.is_some())
+            {
+                result_at + DROP_FAILURE_RECONCILE
+            } else {
+                result_at + DROP_CONFIRM_TIMEOUT
+            }
+        })
+    }
+
+    fn status_json(&self) -> serde_json::Value {
+        if let Some(pending) = &self.pending {
+            return serde_json::json!({
+                "state": if pending.action_result.is_some() { "confirming" } else { "executing" },
+                "request_id": pending.request_id,
+                "base_generation": pending.plan.base_generation,
+                "completed_steps": pending.action_result.as_ref().map(|result| {
+                    result.completed_steps.iter().map(|step| action_step_name(*step)).collect::<Vec<_>>()
+                }).unwrap_or_default(),
+                "failed_step": pending.action_result.as_ref().and_then(|result| result.failure.as_ref())
+                    .map(|failure| action_step_name(failure.step)),
+            });
+        }
+        if let Some(last) = &self.last {
+            return serde_json::json!({
+                "state": drop_outcome_name(&last.outcome),
+                "request_id": last.request_id,
+                "base_generation": last.base_generation,
+                "final_generation": last.final_generation,
+                "completed_steps": last.action_result.as_ref().map(|result| {
+                    result.completed_steps.iter().map(|step| action_step_name(*step)).collect::<Vec<_>>()
+                }).unwrap_or_default(),
+                "failed_step": last.action_result.as_ref().and_then(|result| result.failure.as_ref())
+                    .map(|failure| action_step_name(failure.step)),
+                "focus_restoration": last.action_result.as_ref().map(|result| restoration_name(&result.focus_restoration)),
+                "cursor_restoration": last.action_result.as_ref().map(|result| restoration_name(&result.cursor_restoration)),
+            });
+        }
+        serde_json::json!({ "state": "idle" })
+    }
+}
+
+fn action_step_name(step: ActionStep) -> &'static str {
+    match step {
+        ActionStep::FocusWindow => "focus-window",
+        ActionStep::FocusWorkspace => "focus-workspace",
+        ActionStep::DetachJoinedSource => "detach-joined-source",
+        ActionStep::MoveToTiling => "move-to-tiling",
+        ActionStep::MoveToFloating => "move-to-floating",
+        ActionStep::MoveToWorkspace => "move-to-workspace",
+        ActionStep::FocusMovedWindow => "focus-moved-window",
+        ActionStep::MoveColumn => "move-column",
+        ActionStep::JoinLeft => "join-left",
+        ActionStep::MoveFloatingWindow => "move-floating-window",
+        ActionStep::RestoreFocus => "restore-focus",
+    }
+}
+
+fn drop_outcome_name(outcome: &DropOutcome) -> &'static str {
+    match outcome {
+        DropOutcome::Confirmed => "confirmed",
+        DropOutcome::ActionFailed(_) => "action_failed",
+        DropOutcome::ConfirmationTimedOut => "confirmation_timeout",
+        DropOutcome::EventStreamUnavailable => "event_stream_unavailable",
+    }
+}
+
+fn restoration_name(status: &RestorationStatus) -> &'static str {
+    match status {
+        RestorationStatus::NotRequested => "not_requested",
+        RestorationStatus::Completed => "completed",
+        RestorationStatus::Failed(_) => "failed",
     }
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "niri_xmb=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+    let filter = match effective_rust_log(std::env::var("RUST_LOG").ok().as_deref()) {
+        Some(explicit) => tracing_subscriber::EnvFilter::try_new(explicit)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_filter(cli.verbose))),
+        None => tracing_subscriber::EnvFilter::new(log_filter(cli.verbose)),
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
     match cli.command.unwrap_or(Command::Daemon) {
         Command::Daemon => run_daemon(cli.config.unwrap_or_else(Config::default_path)),
         Command::Show => print_control(ControlCommand::Show),
@@ -269,7 +494,12 @@ fn main() -> Result<()> {
             cursor_y,
         }),
         Command::Quit => print_control(ControlCommand::Quit),
-        Command::Restart => restart_daemon(cli.config.unwrap_or_else(Config::default_path)),
+        Command::Restart => {
+            restart_daemon(cli.config.unwrap_or_else(Config::default_path), cli.verbose)
+        }
+        Command::Subscribe => {
+            subscribe::run_subscribe_client();
+        }
         Command::PrintDefaultConfig => {
             print!("{}", include_str!("../../../config/niri-xmb.toml.example"));
             Ok(())
@@ -282,7 +512,43 @@ fn print_control(command: ControlCommand) -> Result<()> {
     Ok(())
 }
 
-fn restart_daemon(config_path: PathBuf) -> Result<()> {
+/// The log filter a daemon runs at for the given `-v` count. A set RUST_LOG
+/// overrides this, so the mapping only has to cover the flag's own levels.
+fn log_filter(verbosity: u8) -> String {
+    let level = match verbosity {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    };
+    format!("niri_xmb={level}")
+}
+
+/// An explicit RUST_LOG value, or None when it is unset or blank.
+///
+/// A blank-but-set RUST_LOG parses as an empty filter and silences every
+/// level, so an environment that clears the variable must not also defeat
+/// `-v`/`-vv`.
+fn effective_rust_log(rust_log: Option<&str>) -> Option<String> {
+    rust_log
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Arguments for the daemon Niri is asked to spawn.
+///
+/// Verbosity must travel with the restart, or the replacement daemon silently
+/// drops back to info no matter how the old one was running.
+fn daemon_spawn_args(config_path: &std::path::Path, verbosity: u8) -> Vec<String> {
+    let mut args = vec!["--config".to_string(), config_path.display().to_string()];
+    for _ in 0..verbosity.min(2) {
+        args.push("-v".to_string());
+    }
+    args.push("daemon".to_string());
+    args
+}
+
+fn restart_daemon(config_path: PathBuf, verbosity: u8) -> Result<()> {
     let config_path = if config_path.is_absolute() {
         config_path
     } else {
@@ -312,9 +578,7 @@ fn restart_daemon(config_path: PathBuf) -> Result<()> {
     let output = ProcessCommand::new("niri")
         .args(["msg", "action", "spawn", "--"])
         .arg(&executable)
-        .arg("--config")
-        .arg(&config_path)
-        .arg("daemon")
+        .args(daemon_spawn_args(&config_path, verbosity))
         .output()
         .context("failed to ask Niri to launch the daemon")?;
     if !output.status.success() {
@@ -436,6 +700,58 @@ fn snapshot_json(snapshot: &Snapshot, output_filter: Option<&str>) -> String {
         "outputs": outputs,
     })
     .to_string()
+}
+
+fn snapshot_response(snapshot: &Snapshot, output_filter: Option<&str>) -> String {
+    if output_filter.is_some_and(|name| !snapshot.outputs.contains_key(name)) {
+        return "error: unknown output\n".into();
+    }
+    snapshot_json(snapshot, output_filter) + "\n"
+}
+
+fn popup_mode_name(mode: PopupMode) -> &'static str {
+    match mode {
+        PopupMode::Hidden => "hidden",
+        PopupMode::Manual => "manual",
+        PopupMode::Peek => "peek",
+        PopupMode::PeekArmed => "peek_armed",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn status_response(
+    popup_outputs: &HashSet<String>,
+    popup_mode: PopupMode,
+    selection: Option<SelectionVisual>,
+    snapshot: &Snapshot,
+    cursor_restore: bool,
+    niri_health: &NiriHealth,
+    drop_transactions: &DropTransactionState,
+    subscribers: usize,
+) -> String {
+    serde_json::json!({
+        "visible": !popup_outputs.is_empty(),
+        "mode": popup_mode_name(popup_mode),
+        "selection": selection.map(|visual| {
+            serde_json::json!({
+                "output": visual.output,
+                "workspace_id": visual.workspace_id,
+                "window_id": visual.window_id,
+            })
+        }),
+        "outputs": popup_outputs,
+        "generation": snapshot.generation,
+        "socket": ipc::socket_path(),
+        "cursor_restore": cursor_restore,
+        "niri": {
+            "event_stream_connected": niri_health.event_stream_connected,
+            "last_event_error": niri_health.last_event_error,
+            "last_action_error": niri_health.last_action_error,
+        },
+        "drop_transaction": drop_transactions.status_json(),
+        "subscribers": subscribers,
+    })
+    .to_string()
         + "\n"
 }
 
@@ -466,11 +782,15 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     let (snapshot_tx, snapshot_rx) = unbounded();
     let (niri_command_tx, niri_command_rx) = unbounded();
     let (cursor_restore_tx, cursor_restore_rx) = unbounded();
+    let (niri_health_tx, niri_health_rx) = unbounded();
+    let (niri_transaction_tx, niri_transaction_rx) = unbounded();
     let wake = WakePipe::new()?;
     spawn_niri(
         snapshot_tx,
         niri_command_rx,
         cursor_restore_tx,
+        niri_health_tx,
+        niri_transaction_tx,
         wake.handle(),
     );
 
@@ -485,9 +805,14 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut renderer = Renderer::new();
 
     let (control_tx, control_rx) = unbounded::<ControlRequest>();
-    ipc::serve(control_tx, wake.handle())?;
+    let subscriptions = std::sync::Arc::new(subscribe::SubscriptionHub::new());
+    let _control_server =
+        ipc::serve_with_subscriptions(control_tx, wake.handle(), Arc::clone(&subscriptions))?;
 
     let mut snapshot = wait_for_snapshot(&snapshot_rx).unwrap_or_default();
+    subscriptions.publish(snapshot.generation, &snapshot_json(&snapshot, None));
+    let mut niri_health = NiriHealth::default();
+    let mut drop_transactions = DropTransactionState::default();
     let mut popup_outputs = HashSet::new();
     let mut popup_origin_focus: Option<u64> = None;
     let mut follow_candidate: Option<(String, Instant)> = None;
@@ -534,8 +859,13 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             }
         }
 
+        while let Ok(update) = niri_health_rx.try_recv() {
+            niri_health.apply(update);
+        }
+
         while let Ok(next) = snapshot_rx.try_recv() {
             snapshot = next;
+            subscriptions.publish(snapshot.generation, &snapshot_json(&snapshot, None));
             normalize_selection(&mut selection, &snapshot);
             let now = Instant::now();
             let windows = live_window_ids(&snapshot);
@@ -586,6 +916,16 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             }
             dirty = true;
         }
+
+        let now = Instant::now();
+        while let Ok(result) = niri_transaction_rx.try_recv() {
+            drop_transactions.record_action_result(result, now);
+        }
+        drop_transactions.reconcile(
+            &snapshot,
+            niri_health.event_stream_connected,
+            Instant::now(),
+        );
 
         if let Some(since) = pending_focus_since {
             let now = Instant::now();
@@ -730,31 +1070,19 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     dirty = true;
                     "ok\n".into()
                 }
-                ControlCommand::Status => {
-                    serde_json::json!({
-                        "visible": !popup_outputs.is_empty(),
-                        "mode": match popup_mode {
-                            PopupMode::Hidden => "hidden",
-                            PopupMode::Manual => "manual",
-                            PopupMode::Peek => "peek",
-                            PopupMode::PeekArmed => "peek_armed",
-                        },
-                        "selection": selection_visual(&selection, &snapshot).map(|visual| {
-                            serde_json::json!({
-                                "output": visual.output,
-                                "workspace_id": visual.workspace_id,
-                                "window_id": visual.window_id,
-                            })
-                        }),
-                        "outputs": popup_outputs,
-                        "generation": snapshot.generation,
-                        "socket": ipc::socket_path(),
-                        "cursor_restore": surfaces.cursor_restore_available(),
-                    })
-                    .to_string()
-                        + "\n"
+                ControlCommand::Status => status_response(
+                    &popup_outputs,
+                    popup_mode,
+                    selection_visual(&selection, &snapshot),
+                    &snapshot,
+                    surfaces.cursor_restore_available(),
+                    &niri_health,
+                    &drop_transactions,
+                    subscriptions.subscriber_count(),
+                ),
+                ControlCommand::Snapshot { output } => {
+                    snapshot_response(&snapshot, output.as_deref())
                 }
-                ControlCommand::Snapshot { output } => snapshot_json(&snapshot, output.as_deref()),
                 ControlCommand::FocusWindow { window_id } => {
                     if snapshot.window(window_id).is_none() {
                         "error: unknown window\n".into()
@@ -764,7 +1092,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                         // the worker can deliver the focus event back to us.
                         peek_suppressed_until = Instant::now() + SELF_FOCUS_GRACE;
                         if niri_command_tx
-                            .send(NiriCommand::FocusWindow(window_id))
+                            .send(NiriCommand::FocusWindow(window_id).into())
                             .is_ok()
                         {
                             "ok\n".into()
@@ -779,7 +1107,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     } else {
                         peek_suppressed_until = Instant::now() + SELF_FOCUS_GRACE;
                         if niri_command_tx
-                            .send(NiriCommand::FocusWorkspace(workspace_id))
+                            .send(NiriCommand::FocusWorkspace(workspace_id).into())
                             .is_ok()
                         {
                             "ok\n".into()
@@ -806,7 +1134,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                         Some(workspace_id) => {
                             peek_suppressed_until = Instant::now() + SELF_FOCUS_GRACE;
                             if niri_command_tx
-                                .send(NiriCommand::FocusWorkspace(workspace_id))
+                                .send(NiriCommand::FocusWorkspace(workspace_id).into())
                                 .is_ok()
                             {
                                 "ok\n".into()
@@ -825,64 +1153,61 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     cursor_x,
                     cursor_y,
                 } => {
-                    let output = snapshot.outputs.values().find(|output| {
-                        output
-                            .workspaces
-                            .iter()
-                            .any(|workspace| workspace.id == target_workspace_id)
-                    });
-                    let target = output.map(|output| {
-                        target_window_id
-                            .and_then(|window_id| snapshot.window(window_id))
-                            .map(|window| HitTarget::Window {
-                                output: output.name.clone(),
-                                workspace_id: target_workspace_id,
-                                window_id: window.id,
-                                column: window.column,
-                                floating: window.floating,
-                                rect: render::Rect {
-                                    x: 0.0,
-                                    y: 0.0,
-                                    width: 1.0,
-                                    height: 1.0,
-                                },
-                                canvas: None,
-                            })
-                            .unwrap_or_else(|| HitTarget::Canvas {
-                                output: output.name.clone(),
-                                workspace_id: target_workspace_id,
-                                rect: render::Rect {
-                                    x: 0.0,
-                                    y: 0.0,
-                                    width: 1.0,
-                                    height: 1.0,
-                                },
-                            })
-                    });
-                    let dropped = target.is_some_and(|target| {
-                        dispatch_drop(
-                            source_window_id,
-                            &target,
-                            fraction as f64,
-                            0.5,
-                            &snapshot,
-                            &config,
-                            None,
-                            if config.behavior.snap_cursor_after_drop {
-                                None
-                            } else {
-                                cursor_x
-                                    .zip(cursor_y)
-                                    .filter(|(x, y)| x.is_finite() && y.is_finite())
+                    // The planner owns every rejection reason, so the target is
+                    // built unconditionally and an unknown workspace surfaces
+                    // as its own exact error instead of a generic refusal.
+                    let target = target_window_id
+                        .map(|window_id| HitTarget::Window {
+                            workspace_id: target_workspace_id,
+                            window_id,
+                            rect: render::Rect {
+                                x: 0.0,
+                                y: 0.0,
+                                width: 1.0,
+                                height: 1.0,
                             },
-                            &niri_command_tx,
-                        )
-                    });
-                    if dropped {
-                        "ok\n".into()
-                    } else {
-                        "error: drop rejected\n".into()
-                    }
+                            canvas: None,
+                        })
+                        .unwrap_or_else(|| HitTarget::Canvas {
+                            workspace_id: target_workspace_id,
+                            rect: render::Rect {
+                                x: 0.0,
+                                y: 0.0,
+                                width: 1.0,
+                                height: 1.0,
+                            },
+                        });
+                    // A drop is answered by its transaction, not here: the
+                    // reply is staged until Niri confirms the move, the action
+                    // fails, or the confirmation times out. Rejections before a
+                    // transaction exists also go out through that channel.
+                    dispatch_drop(
+                        source_window_id,
+                        &target,
+                        fraction as f64,
+                        0.5,
+                        &snapshot,
+                        &config,
+                        None,
+                        if config.behavior.snap_cursor_after_drop {
+                            None
+                        } else {
+                            cursor_x
+                                .zip(cursor_y)
+                                .filter(|(x, y)| x.is_finite() && y.is_finite())
+                        },
+                        &mut drop_transactions,
+                        Some(request.reply),
+                        &niri_command_tx,
+                        popup_mode,
+                        !popup_outputs.is_empty(),
+                    );
+                    continue;
+                }
+                // Subscribe connections never reach the daemon loop: the
+                // control worker hands them straight to the hub.
+                ControlCommand::Subscribe { .. } => {
+                    unreachable!("subscribe requests are handled by the control worker")
                 }
                 ControlCommand::Quit => {
                     running = false;
@@ -953,7 +1278,9 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 &snapshot,
                 &config,
                 &niri_command_tx,
+                &mut drop_transactions,
                 &mut popup_outputs,
+                popup_mode,
                 popup_origin_focus,
                 &mut press,
                 &mut bar_scrolls,
@@ -1018,6 +1345,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
 
         if dirty {
             let surface_infos = surfaces.surfaces();
+            renderer.retain_surfaces(&surface_infos);
             let all_ready = surface_infos
                 .iter()
                 .all(|surface| surface.configured && surface.frame_ready);
@@ -1077,11 +1405,12 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             wait_timeout =
                 wait_timeout.min(delay.saturating_sub(now.saturating_duration_since(*since)));
         }
+        if let Some(deadline) = drop_transactions.next_deadline() {
+            wait_timeout = wait_timeout.min(deadline.saturating_duration_since(now));
+        }
     }
 
-    let result = surfaces.hide_all_popups();
-    ipc::cleanup();
-    result
+    surfaces.hide_all_popups()
 }
 
 fn connected_outputs() -> Result<Vec<String>> {
@@ -1372,8 +1701,7 @@ fn update_following_popup(
     surfaces.show_popups(std::slice::from_ref(&active_output), capture_outside)?;
     visible.clear();
     visible.insert(active_output.clone());
-    selection.output = active_output;
-    select_active_workspace(selection, snapshot);
+    selection.select_output(active_output, snapshot);
     Ok(true)
 }
 
@@ -1384,8 +1712,10 @@ fn handle_ui_event(
     renderer: &mut Renderer,
     snapshot: &Snapshot,
     config: &Config,
-    niri_tx: &crossbeam_channel::Sender<NiriCommand>,
+    niri_tx: &crossbeam_channel::Sender<NiriRequest>,
+    transactions: &mut DropTransactionState,
     popup_outputs: &mut HashSet<String>,
+    popup_mode: PopupMode,
     popup_origin_focus: Option<u64>,
     press: &mut Option<PressState>,
     bar_scrolls: &mut HashMap<String, BarScrollState>,
@@ -1421,9 +1751,13 @@ fn handle_ui_event(
                         }
                     }
                     HitTarget::Workspace { workspace_id, .. } => {
-                        let _ = niri_tx.send(NiriCommand::FocusWorkspace(workspace_id));
-                        *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
-                        if matches!(event.kind, SurfaceKind::Popup)
+                        let submitted =
+                            submit_niri_command(niri_tx, NiriCommand::FocusWorkspace(workspace_id));
+                        if submitted {
+                            *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
+                        }
+                        if submitted
+                            && matches!(event.kind, SurfaceKind::Popup)
                             && config.behavior.close_on_workspace_click
                         {
                             surfaces.hide_all_popups()?;
@@ -1484,7 +1818,11 @@ fn handle_ui_event(
                         } else {
                             Some((released.current_x, released.current_y))
                         },
+                        transactions,
+                        None,
                         niri_tx,
+                        popup_mode,
+                        !popup_outputs.is_empty(),
                     );
                     if dropped {
                         *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
@@ -1495,9 +1833,14 @@ fn handle_ui_event(
                     }
                 }
             } else {
-                let _ = niri_tx.send(NiriCommand::FocusWindow(released.window_id));
-                *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
-                if matches!(event.kind, SurfaceKind::Popup) && config.behavior.close_on_window_click
+                let submitted =
+                    submit_niri_command(niri_tx, NiriCommand::FocusWindow(released.window_id));
+                if submitted {
+                    *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
+                }
+                if submitted
+                    && matches!(event.kind, SurfaceKind::Popup)
+                    && config.behavior.close_on_window_click
                 {
                     surfaces.hide_all_popups()?;
                     popup_outputs.clear();
@@ -1538,20 +1881,29 @@ fn handle_ui_event(
                     follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
                 }
                 KEY_RETURN => {
-                    let close = if let Some(window_id) = selected_window(selection, snapshot) {
-                        let _ = niri_tx.send(NiriCommand::FocusWindow(window_id));
-                        config.behavior.close_on_window_click
+                    let (submitted, close) = if let Some(window_id) =
+                        selected_window(selection, snapshot)
+                    {
+                        (
+                            submit_niri_command(niri_tx, NiriCommand::FocusWindow(window_id)),
+                            config.behavior.close_on_window_click,
+                        )
                     } else if let Some(workspace_id) = selected_workspace(selection, snapshot) {
-                        let _ = niri_tx.send(NiriCommand::FocusWorkspace(workspace_id));
-                        config.behavior.close_on_workspace_click
+                        (
+                            submit_niri_command(niri_tx, NiriCommand::FocusWorkspace(workspace_id)),
+                            config.behavior.close_on_workspace_click,
+                        )
                     } else {
-                        false
+                        (false, false)
                     };
-                    // The queued move is resolved either way; a popup left open
-                    // after confirming should track live state again.
-                    selection.clear_session();
-                    *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
-                    if close {
+                    if submitted {
+                        // The queued move is resolved after successful
+                        // submission. If the worker is unavailable, preserve
+                        // the staged selection so the user can retry.
+                        selection.clear_session();
+                        *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
+                    }
+                    if submitted && close {
                         surfaces.hide_all_popups()?;
                         popup_outputs.clear();
                     }
@@ -1604,7 +1956,7 @@ fn focus_adjacent_workspace(
     wrap: bool,
     repeat: Duration,
     scroll: &mut BarScrollState,
-    niri_tx: &crossbeam_channel::Sender<NiriCommand>,
+    niri_tx: &crossbeam_channel::Sender<NiriRequest>,
 ) -> bool {
     let now = Instant::now();
     let Some(workspace_id) = queue_workspace_scroll(
@@ -1620,7 +1972,9 @@ fn focus_adjacent_workspace(
         return false;
     };
     niri_tx
-        .send(NiriCommand::FocusWorkspace(workspace_id))
+        .send(NiriRequest::Command(NiriCommand::FocusWorkspace(
+            workspace_id,
+        )))
         .is_ok()
 }
 
@@ -1717,410 +2071,119 @@ fn dispatch_drop(
     config: &Config,
     preserved_focus: Option<u64>,
     restore_cursor: Option<(f64, f64)>,
-    niri_tx: &crossbeam_channel::Sender<NiriCommand>,
+    transactions: &mut DropTransactionState,
+    reply: Option<crossbeam_channel::Sender<String>>,
+    niri_tx: &crossbeam_channel::Sender<NiriRequest>,
+    panel_mode: PopupMode,
+    panel_visible: bool,
 ) -> bool {
-    let Some(source_window) = snapshot.window(source_window_id) else {
-        return false;
-    };
-    let source_workspace_id = source_window.workspace_id;
-    let source_joined = source_window.column.is_some_and(|column| {
-        snapshot
-            .workspace(source_workspace_id)
-            .and_then(|workspace| workspace.columns.get(&column))
-            .is_some_and(|windows| windows.len() > 1)
-    });
-    let restore_focus = if config.behavior.focus_after_drop {
-        None
-    } else {
-        preserved_focus.or(snapshot.focused_window)
-    };
-    match target {
-        HitTarget::Window {
-            output,
-            workspace_id,
-            window_id,
-            column,
-            floating,
-            rect,
-            canvas,
-            ..
-        } => {
-            if *window_id == source_window_id {
-                return false;
-            }
-            if *floating {
-                if let Some(canvas) = canvas {
-                    return dispatch_floating_drop(
-                        source_window_id,
-                        output,
-                        *workspace_id,
-                        *canvas,
-                        local_x,
-                        local_y,
-                        snapshot,
-                        restore_focus,
-                        restore_cursor,
-                        niri_tx,
-                    );
-                }
-                return false;
-            }
-            if snapshot
-                .window(source_window_id)
-                .is_some_and(|window| window.floating)
-                && !config.behavior.floating_drop_tiles
-            {
-                return dispatch_preserved_floating_drop(
-                    source_window_id,
-                    output,
-                    *workspace_id,
-                    snapshot,
-                    restore_focus,
-                    restore_cursor,
-                    niri_tx,
-                );
-            }
-            let allow_join = config
-                .bars
-                .iter()
-                .find(|bar| &bar.output == output)
-                .map(|bar| bar.allow_column_join)
-                .unwrap_or(false);
-            let fraction = ((local_x as f32 - rect.x) / rect.width.max(1.0)).clamp(0.0, 1.0);
-            let target_column = column.unwrap_or_else(|| {
-                snapshot
-                    .workspace(*workspace_id)
-                    .map(|workspace| workspace.columns.len().max(1))
-                    .unwrap_or(1)
-            });
-            let (column, join) =
-                tiled_drop_position(target_column, fraction, allow_join && !floating);
-            let column = adjust_same_workspace_index(
-                column,
-                source_window.column,
-                source_workspace_id == *workspace_id,
-            );
-            niri_tx
-                .send(NiriCommand::MoveTiled {
-                    window_id: source_window_id,
-                    source_workspace_id,
-                    workspace_id: *workspace_id,
-                    column,
-                    join,
-                    source_joined,
-                    restore_focus,
-                    restore_cursor,
-                })
-                .is_ok()
-        }
-        HitTarget::Workspace {
-            workspace_id,
-            column_count,
-            ..
-        } => niri_tx
-            .send(NiriCommand::MoveTiled {
-                window_id: source_window_id,
-                source_workspace_id,
+    let (target, allow_column_join) = match target {
+        HitTarget::Panel => (DropTarget::Panel, false),
+        HitTarget::Workspace { workspace_id, .. } => (
+            DropTarget::Workspace {
                 workspace_id: *workspace_id,
-                column: column_count + 1,
-                join: None,
-                source_joined,
-                restore_focus,
-                restore_cursor,
-            })
-            .is_ok(),
-        HitTarget::Canvas {
-            output,
-            workspace_id,
-            rect,
-        } if source_window.floating || config.behavior.empty_drop_floats => dispatch_floating_drop(
-            source_window_id,
-            output,
-            *workspace_id,
-            *rect,
-            local_x,
-            local_y,
-            snapshot,
-            restore_focus,
-            restore_cursor,
-            niri_tx,
+            },
+            false,
         ),
         HitTarget::Canvas {
             workspace_id, rect, ..
-        } => {
-            let column_count = snapshot
-                .workspace(*workspace_id)
-                .map(|workspace| workspace.columns.len())
-                .unwrap_or(0);
-            let fraction = ((local_x as f32 - rect.x) / rect.width.max(1.0)).clamp(0.0, 1.0);
-            let insertion_slots = column_count + 1;
-            let column = (fraction * insertion_slots as f32).floor() as usize + 1;
-            let column = column.min(insertion_slots);
-            let column = adjust_same_workspace_index(
-                column,
-                source_window.column,
-                source_workspace_id == *workspace_id,
-            );
-            niri_tx
-                .send(NiriCommand::MoveTiled {
-                    window_id: source_window_id,
-                    source_workspace_id,
-                    workspace_id: *workspace_id,
-                    column,
-                    join: None,
-                    source_joined,
-                    restore_focus,
-                    restore_cursor,
+        } => (
+            DropTarget::Canvas {
+                workspace_id: *workspace_id,
+                point: normalized_drop_point(*rect, local_x, local_y),
+            },
+            false,
+        ),
+        HitTarget::Window {
+            workspace_id,
+            window_id,
+            rect,
+            canvas,
+            ..
+        } => (
+            DropTarget::Window {
+                workspace_id: *workspace_id,
+                window_id: *window_id,
+                fraction: normalized_fraction(local_x as f32, rect.x, rect.width),
+                canvas_point: canvas.map(|canvas| normalized_drop_point(canvas, local_x, local_y)),
+            },
+            snapshot
+                .outputs
+                .values()
+                .find(|output| {
+                    output
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.id == *workspace_id)
                 })
-                .is_ok()
-        }
-        HitTarget::Panel => false,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn dispatch_floating_drop(
-    source_window_id: u64,
-    output: &str,
-    workspace_id: u64,
-    canvas: render::Rect,
-    local_x: f64,
-    local_y: f64,
-    snapshot: &Snapshot,
-    restore_focus: Option<u64>,
-    restore_cursor: Option<(f64, f64)>,
-    niri_tx: &crossbeam_channel::Sender<NiriCommand>,
-) -> bool {
-    let Some(output_model) = snapshot.outputs.get(output) else {
-        return false;
+                .and_then(|output| config.bars.iter().find(|bar| bar.output == output.name))
+                .is_some_and(|bar| bar.allow_column_join),
+        ),
     };
-    let source = snapshot.window(source_window_id);
-    let width = source.map(|window| window.tile_width).unwrap_or(0.0);
-    let height = source.map(|window| window.tile_height).unwrap_or(0.0);
-    let center_x = ((local_x as f32 - canvas.x) / canvas.width.max(1.0)).clamp(0.0, 1.0)
-        * output_model.width as f32;
-    let center_y = ((local_y as f32 - canvas.y) / canvas.height.max(1.0)).clamp(0.0, 1.0)
-        * output_model.height as f32;
-    let x =
-        (center_x as f64 - width * 0.5).clamp(0.0, (output_model.width as f64 - width).max(0.0));
-    let y =
-        (center_y as f64 - height * 0.5).clamp(0.0, (output_model.height as f64 - height).max(0.0));
-    niri_tx
-        .send(NiriCommand::MoveFloating {
-            window_id: source_window_id,
-            source_workspace_id: source
-                .map(|window| window.workspace_id)
-                .unwrap_or(workspace_id),
-            workspace_id,
-            x,
-            y,
-            make_floating: true,
-            restore_focus,
-            restore_cursor,
-        })
-        .is_ok()
-}
-
-fn dispatch_preserved_floating_drop(
-    source_window_id: u64,
-    output: &str,
-    workspace_id: u64,
-    snapshot: &Snapshot,
-    restore_focus: Option<u64>,
-    restore_cursor: Option<(f64, f64)>,
-    niri_tx: &crossbeam_channel::Sender<NiriCommand>,
-) -> bool {
-    let Some(source) = snapshot.window(source_window_id) else {
-        return false;
-    };
-    let Some(source_output) = snapshot.outputs.values().find(|output| {
-        output
-            .workspaces
-            .iter()
-            .flat_map(|workspace| workspace.windows())
-            .any(|window| window.id == source_window_id)
-    }) else {
-        return false;
-    };
-    let Some(target_output) = snapshot.outputs.get(output) else {
-        return false;
-    };
-    let normalized_x = source.x.unwrap_or(0.0) / source_output.width.max(1) as f64;
-    let normalized_y = source.y.unwrap_or(0.0) / source_output.height.max(1) as f64;
-    let x = (normalized_x * target_output.width as f64).clamp(
-        0.0,
-        (target_output.width as f64 - source.tile_width).max(0.0),
+    tracing::info!(
+        source = source_window_id,
+        target = %target.describe(),
+        generation = snapshot.generation,
+        panel = %popup_mode_name(panel_mode),
+        panel_visible,
+        "drop requested"
     );
-    let y = (normalized_y * target_output.height as f64).clamp(
-        0.0,
-        (target_output.height as f64 - source.tile_height).max(0.0),
-    );
-    niri_tx
-        .send(NiriCommand::MoveFloating {
-            window_id: source_window_id,
-            source_workspace_id: source.workspace_id,
-            workspace_id,
-            x,
-            y,
-            make_floating: false,
-            restore_focus,
-            restore_cursor,
-        })
-        .is_ok()
-}
-
-fn normalize_selection(selection: &mut Selection, snapshot: &Snapshot) {
-    if selection.output.is_empty() || !snapshot.outputs.contains_key(&selection.output) {
-        selection.output = snapshot
-            .focused_output()
-            .or_else(|| snapshot.outputs.keys().next().map(String::as_str))
-            .unwrap_or_default()
-            .to_string();
-    }
-    if let Some(output) = snapshot.outputs.get(&selection.output) {
-        if let Some(workspace_id) = selection.workspace_id
-            && let Some(index) = output
-                .workspaces
-                .iter()
-                .position(|workspace| workspace.id == workspace_id)
-        {
-            selection.workspace = index;
-        }
-        selection.workspace = selection
-            .workspace
-            .min(output.workspaces.len().saturating_sub(1));
-        let Some(workspace) = output.workspaces.get(selection.workspace) else {
-            selection.workspace_id = None;
-            selection.window_id = None;
-            selection.window = 0;
-            return;
-        };
-        selection.workspace_id = Some(workspace.id);
-        if let Some(window_id) = selection.window_id
-            && let Some(index) = workspace
-                .windows()
-                .position(|window| window.id == window_id)
-        {
-            selection.window = index;
-            return;
-        }
-        selection.window = selection
-            .window
-            .min(workspace.windows().count().saturating_sub(1));
-        selection.window_id = workspace
-            .windows()
-            .nth(selection.window)
-            .map(|window| window.id);
-    }
-}
-
-fn reset_selection(selection: &mut Selection, snapshot: &Snapshot) {
-    // Opening the popup starts a fresh session against live state.
-    selection.clear_session();
-    selection.output = snapshot
-        .focused_output()
-        .or_else(|| snapshot.outputs.keys().next().map(String::as_str))
-        .unwrap_or_default()
-        .to_string();
-    selection.workspace_id = None;
-    selection.window_id = None;
-    select_active_workspace(selection, snapshot);
-}
-
-fn select_active_workspace(selection: &mut Selection, snapshot: &Snapshot) {
-    let Some(output) = snapshot.outputs.get(&selection.output) else {
-        selection.workspace = 0;
-        selection.window = 0;
-        selection.workspace_id = None;
-        selection.window_id = None;
-        return;
+    let request = DropRequest {
+        source_window_id,
+        target,
+        policy: DropPolicy {
+            allow_column_join,
+            empty_drop_floats: config.behavior.empty_drop_floats,
+            floating_drop_tiles: config.behavior.floating_drop_tiles,
+            focus_after_drop: config.behavior.focus_after_drop,
+        },
+        preserved_focus,
+        restore_cursor,
     };
-    selection.workspace = output
-        .workspaces
-        .iter()
-        .position(|workspace| workspace.focused)
-        .or_else(|| {
-            output
-                .workspaces
-                .iter()
-                .position(|workspace| workspace.active)
-        })
-        .unwrap_or(0);
-    if let Some(workspace) = output.workspaces.get(selection.workspace) {
-        // Land on the window Niri would focus, not on the first one. `focused`
-        // is only ever set for the globally focused window, so searching for it
-        // would fall back to index 0 on every other workspace.
-        selection.workspace_id = Some(workspace.id);
-        selection.window = selection.entry_index(workspace);
-        selection.window_id = workspace
-            .windows()
-            .nth(selection.window)
-            .map(|window| window.id);
+    let outcome = match plan_drop(snapshot, request) {
+        Ok(plan) => {
+            // The full plan is a trace-level structure dump; ids and columns
+            // only, never titles.
+            tracing::debug!(
+                plan = ?plan,
+                postcondition = %plan.confirmation.describe(),
+                "drop plan built"
+            );
+            transactions
+                .submit(plan, snapshot, reply.clone(), niri_tx)
+                .map_err(|error| {
+                    tracing::warn!(%error, "drop transaction rejected");
+                    format!("error: {error}\n")
+                })
+        }
+        Err(error) => {
+            tracing::info!(source = source_window_id, reason = %error, "drop rejected");
+            Err(format!("error: drop rejected: {error}\n"))
+        }
+    };
+    // A reply staged for the transaction outcome must still arrive when the
+    // drop never became a transaction.
+    if let Some(reply) = reply
+        && let Err(response) = &outcome
+    {
+        let _ = reply.send(response.clone());
+    }
+    outcome.is_ok()
+}
+
+fn normalized_drop_point(rect: render::Rect, local_x: f64, local_y: f64) -> DropPoint {
+    DropPoint {
+        x: normalized_fraction(local_x as f32, rect.x, rect.width),
+        y: normalized_fraction(local_y as f32, rect.y, rect.height),
+    }
+}
+
+fn normalized_fraction(value: f32, origin: f32, length: f32) -> f32 {
+    let fraction = (value - origin) / length.max(1.0);
+    if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
     } else {
-        selection.workspace_id = None;
-        selection.window = 0;
-        selection.window_id = None;
-    }
-}
-
-fn move_output_selection(selection: &mut Selection, snapshot: &Snapshot, delta: i32) {
-    if snapshot.outputs.is_empty() {
-        return;
-    }
-    let outputs = snapshot.outputs.keys().collect::<Vec<_>>();
-    let current = outputs
-        .iter()
-        .position(|output| output.as_str() == selection.output)
-        .unwrap_or(0);
-    selection.output = outputs[wrap_index(current, delta, outputs.len())].to_string();
-    select_active_workspace(selection, snapshot);
-}
-
-fn move_selection(
-    selection: &mut Selection,
-    snapshot: &Snapshot,
-    workspace_delta: i32,
-    window_delta: i32,
-) {
-    normalize_selection(selection, snapshot);
-    let Some(output) = snapshot.outputs.get(&selection.output) else {
-        return;
-    };
-    if workspace_delta != 0 && !output.workspaces.is_empty() {
-        // Leaving a workspace stores the cursor so coming back restores it.
-        selection.remember(snapshot);
-        selection.workspace = wrap_index(
-            selection.workspace,
-            workspace_delta,
-            output.workspaces.len(),
-        );
-        // Arrive on the entry window. The popup parks that window on the focal
-        // column, so moving between workspaces travels straight up or down
-        // instead of also sliding the row sideways.
-        if let Some(workspace) = output.workspaces.get(selection.workspace) {
-            selection.workspace_id = Some(workspace.id);
-            selection.window = selection.entry_index(workspace);
-            selection.window_id = workspace
-                .windows()
-                .nth(selection.window)
-                .map(|window| window.id);
-        }
-    }
-    if window_delta != 0 {
-        let count = output
-            .workspaces
-            .get(selection.workspace)
-            .map(|workspace| workspace.windows().count())
-            .unwrap_or(0);
-        if count > 0 {
-            selection.window = wrap_index(selection.window, window_delta, count);
-            selection.window_id = output
-                .workspaces
-                .get(selection.workspace)
-                .and_then(|workspace| workspace.windows().nth(selection.window))
-                .map(|window| window.id);
-            selection.remember(snapshot);
-        }
+        fraction
     }
 }
 
@@ -2132,105 +2195,277 @@ fn follow_selection(
     config: &Config,
     selection: &Selection,
     snapshot: &Snapshot,
-    niri_tx: &crossbeam_channel::Sender<NiriCommand>,
+    niri_tx: &crossbeam_channel::Sender<NiriRequest>,
     suppress_peek: &mut Instant,
 ) {
     if config.behavior.navigation != NavigationMode::Live {
         return;
     }
-    if let Some(window_id) = selected_window(selection, snapshot) {
-        let _ = niri_tx.send(NiriCommand::FocusWindow(window_id));
+    let submitted = if let Some(window_id) = selected_window(selection, snapshot) {
+        submit_niri_command(niri_tx, NiriCommand::FocusWindow(window_id))
     } else if let Some(workspace_id) = selected_workspace(selection, snapshot) {
         // An empty workspace has nothing to focus, but is still reachable.
-        let _ = niri_tx.send(NiriCommand::FocusWorkspace(workspace_id));
+        submit_niri_command(niri_tx, NiriCommand::FocusWorkspace(workspace_id))
     } else {
         return;
-    }
-    *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
-}
-
-fn wrap_index(current: usize, delta: i32, length: usize) -> usize {
-    (current as i32 + delta).rem_euclid(length as i32) as usize
-}
-
-fn selected_workspace(selection: &Selection, snapshot: &Snapshot) -> Option<u64> {
-    let output = snapshot.outputs.get(&selection.output)?;
-    selection
-        .workspace_id
-        .filter(|id| {
-            output
-                .workspaces
-                .iter()
-                .any(|workspace| workspace.id == *id)
-        })
-        .or_else(|| {
-            output
-                .workspaces
-                .get(selection.workspace)
-                .map(|workspace| workspace.id)
-        })
-}
-
-fn selected_window(selection: &Selection, snapshot: &Snapshot) -> Option<u64> {
-    let workspace_id = selected_workspace(selection, snapshot)?;
-    let workspace = snapshot.workspace(workspace_id)?;
-    selection
-        .window_id
-        .filter(|id| workspace.windows().any(|window| window.id == *id))
-        .or_else(|| {
-            workspace
-                .windows()
-                .nth(selection.window)
-                .map(|window| window.id)
-        })
-}
-
-fn selection_visual(selection: &Selection, snapshot: &Snapshot) -> Option<SelectionVisual> {
-    Some(SelectionVisual {
-        output: selection.output.clone(),
-        workspace_id: selected_workspace(selection, snapshot)?,
-        window_id: selected_window(selection, snapshot),
-        // The renderer parks these on the focal column. They must match where
-        // navigation will actually land, or arriving on a row makes it slide.
-        anchors: selection.visited.clone(),
-    })
-}
-
-fn tiled_drop_position(
-    target_column: usize,
-    fraction: f32,
-    allow_join: bool,
-) -> (usize, Option<niri::JoinDirection>) {
-    let target_index = target_column.max(1);
-    if allow_join && (1.0 / 3.0..=2.0 / 3.0).contains(&fraction) {
-        (target_index + 1, Some(niri::JoinDirection::Left))
-    } else if fraction < 0.5 {
-        (target_index, None)
-    } else {
-        (target_index + 1, None)
+    };
+    if submitted {
+        *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
     }
 }
 
-fn adjust_same_workspace_index(
-    insertion_index: usize,
-    source_column: Option<usize>,
-    same_workspace: bool,
-) -> usize {
-    if same_workspace && source_column.is_some_and(|source| source < insertion_index) {
-        insertion_index.saturating_sub(1).max(1)
+fn submit_niri_command(
+    niri_tx: &crossbeam_channel::Sender<NiriRequest>,
+    command: NiriCommand,
+) -> bool {
+    if niri_tx.send(command.into()).is_ok() {
+        true
     } else {
-        insertion_index.max(1)
+        tracing::error!("Niri action worker unavailable");
+        false
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{OutputModel, WindowModel, WorkspaceModel};
+    use std::collections::BTreeMap;
+
+    fn protocol_snapshot() -> Snapshot {
+        let window = WindowModel {
+            id: 42,
+            workspace_id: 7,
+            app_id: "org.example.App".into(),
+            title: "Example".into(),
+            focused: true,
+            urgent: false,
+            floating: false,
+            column: Some(2),
+            tile_width: 800.0,
+            tile_height: 600.0,
+            x: Some(10.0),
+            y: Some(20.0),
+        };
+        Snapshot {
+            outputs: BTreeMap::from([(
+                "eDP-1".into(),
+                OutputModel {
+                    name: "eDP-1".into(),
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    workspaces: vec![WorkspaceModel {
+                        id: 7,
+                        index: 1,
+                        name: Some("main".into()),
+                        active: true,
+                        focused: true,
+                        urgent: false,
+                        active_window: Some(42),
+                        columns: BTreeMap::from([(2, BTreeMap::from([(3, window)]))]),
+                        floating: Vec::new(),
+                    }],
+                },
+            )]),
+            focused_window: Some(42),
+            overview_open: false,
+            generation: 9,
+        }
+    }
+
+    #[test]
+    fn snapshot_json_schema_is_stable() {
+        let value: serde_json::Value =
+            serde_json::from_str(&snapshot_json(&protocol_snapshot(), None)).unwrap();
+
+        assert_eq!(value["generation"], 9);
+        assert_eq!(value["focused_window"], 42);
+        assert_eq!(value["outputs"][0]["name"], "eDP-1");
+        assert_eq!(value["outputs"][0]["workspaces"][0]["label"], "main");
+        assert_eq!(value["outputs"][0]["workspaces"][0]["windows"][0]["id"], 42);
+        assert_eq!(
+            value["outputs"][0]["workspaces"][0]["windows"][0]["column"],
+            2
+        );
+        assert_eq!(value["outputs"][0]["workspaces"][0]["windows"][0]["row"], 3);
+        assert_eq!(
+            value.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["focused_window", "generation", "outputs"]
+        );
+    }
+
+    #[test]
+    fn snapshot_filter_rejects_unknown_output() {
+        let snapshot = protocol_snapshot();
+        assert_eq!(
+            snapshot_response(&snapshot, Some("missing")),
+            "error: unknown output\n"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&snapshot_response(&snapshot, Some("eDP-1"))).unwrap();
+        assert_eq!(value["outputs"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn status_response_reports_niri_health_additively() {
+        let mut health = NiriHealth::default();
+        health.apply(niri::NiriHealthUpdate::EventDisconnected(
+            "stream lost".into(),
+        ));
+        health.apply(niri::NiriHealthUpdate::ActionFailed("focus failed".into()));
+        let value: serde_json::Value = serde_json::from_str(&status_response(
+            &HashSet::new(),
+            PopupMode::Hidden,
+            None,
+            &protocol_snapshot(),
+            true,
+            &health,
+            &DropTransactionState::default(),
+            0,
+        ))
+        .unwrap();
+
+        assert_eq!(value["visible"], false);
+        assert_eq!(value["mode"], "hidden");
+        assert_eq!(value["cursor_restore"], true);
+        assert_eq!(value["niri"]["event_stream_connected"], false);
+        assert_eq!(value["niri"]["last_event_error"], "stream lost");
+        assert_eq!(value["niri"]["last_action_error"], "focus failed");
+    }
 
     #[test]
     fn restart_is_available_as_a_cli_subcommand() {
         let cli = Cli::try_parse_from(["niri-xmb", "restart"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Restart)));
+    }
+
+    #[test]
+    fn verbosity_count_maps_to_log_filters() {
+        assert_eq!(log_filter(0), "niri_xmb=info");
+        assert_eq!(log_filter(1), "niri_xmb=debug");
+        assert_eq!(log_filter(2), "niri_xmb=trace");
+        assert_eq!(log_filter(9), "niri_xmb=trace");
+    }
+
+    #[test]
+    fn only_a_non_empty_rust_log_overrides_verbosity() {
+        assert_eq!(effective_rust_log(Some("trace")), Some("trace".into()));
+        assert_eq!(
+            effective_rust_log(Some("  niri_xmb=debug  ")),
+            Some("niri_xmb=debug".into())
+        );
+        assert_eq!(effective_rust_log(None), None);
+        assert_eq!(effective_rust_log(Some("")), None);
+        assert_eq!(effective_rust_log(Some("   ")), None);
+    }
+
+    #[test]
+    fn cli_parses_repeated_verbosity_before_and_after_the_subcommand() {
+        let cli = Cli::try_parse_from(["niri-xmb", "-vv", "restart"]).unwrap();
+        assert_eq!(cli.verbose, 2);
+        let cli = Cli::try_parse_from(["niri-xmb", "restart", "-v"]).unwrap();
+        assert_eq!(cli.verbose, 1);
+        let cli = Cli::try_parse_from(["niri-xmb"]).unwrap();
+        assert_eq!(cli.verbose, 0);
+    }
+
+    #[test]
+    fn restart_arguments_carry_config_and_verbosity_to_the_daemon() {
+        let path = std::path::Path::new("/tmp/niri-xmb.toml");
+        assert_eq!(
+            daemon_spawn_args(path, 0),
+            vec!["--config", "/tmp/niri-xmb.toml", "daemon"]
+        );
+        assert_eq!(
+            daemon_spawn_args(path, 1),
+            vec!["--config", "/tmp/niri-xmb.toml", "-v", "daemon"]
+        );
+        // Levels past trace collapse so a long flag chain cannot grow the
+        // spawned command line without bound.
+        assert_eq!(
+            daemon_spawn_args(path, 7),
+            vec!["--config", "/tmp/niri-xmb.toml", "-v", "-v", "daemon"]
+        );
+    }
+
+    #[test]
+    fn rejected_drop_reply_names_the_exact_reason() {
+        let snapshot = protocol_snapshot();
+        let (niri_tx, _niri_rx) = crossbeam_channel::unbounded();
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let mut state = DropTransactionState::default();
+
+        let submitted = dispatch_drop(
+            42,
+            &HitTarget::Window {
+                workspace_id: 7,
+                window_id: 999,
+                rect: render::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 20.0,
+                },
+                canvas: None,
+            },
+            10.0,
+            10.0,
+            &snapshot,
+            &Config::default(),
+            None,
+            None,
+            &mut state,
+            Some(reply_tx),
+            &niri_tx,
+            PopupMode::Manual,
+            true,
+        );
+
+        assert!(!submitted);
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            "error: drop rejected: missing target window\n"
+        );
+    }
+
+    #[test]
+    fn unknown_workspace_drop_reply_names_the_workspace() {
+        let snapshot = protocol_snapshot();
+        let (niri_tx, _niri_rx) = crossbeam_channel::unbounded();
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let mut state = DropTransactionState::default();
+
+        let submitted = dispatch_drop(
+            42,
+            &HitTarget::Canvas {
+                workspace_id: 999,
+                rect: render::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+            },
+            0.5,
+            0.5,
+            &snapshot,
+            &Config::default(),
+            None,
+            None,
+            &mut state,
+            Some(reply_tx),
+            &niri_tx,
+            PopupMode::Hidden,
+            false,
+        );
+
+        assert!(!submitted);
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            "error: drop rejected: unknown workspace\n"
+        );
     }
 
     #[test]
@@ -2282,38 +2517,233 @@ mod tests {
         assert!(!peek_deadline_reached(None, None, now));
     }
 
-    #[test]
-    fn tiled_drop_preserves_niris_one_based_indices() {
-        assert!(matches!(tiled_drop_position(1, 0.1, false), (1, None)));
-        assert!(matches!(tiled_drop_position(1, 0.9, false), (2, None)));
-        assert!(matches!(tiled_drop_position(4, 0.1, false), (4, None)));
-        assert!(matches!(tiled_drop_position(4, 0.9, false), (5, None)));
+    fn transaction_plan(generation: u64) -> drop_plan::DropPlan {
+        drop_plan::DropPlan {
+            base_generation: generation,
+            source_window_id: 42,
+            source_workspace_id: 7,
+            source_joined: false,
+            destination: drop_plan::DropDestination::Tiled {
+                workspace_id: 7,
+                column: 1,
+                join: None,
+            },
+            // An exact projection of a workspace that exists nowhere can never
+            // be observed, so confirmation only succeeds through the explicit
+            // paths that replace it below.
+            projection: drop_plan::DropProjection::Exact(vec![drop_plan::ProjectedWorkspace {
+                workspace_id: u64::MAX,
+                columns: Vec::new(),
+                floating: Vec::new(),
+            }]),
+            confirmation: drop_plan::DropConfirmation::ExactProjection,
+            restore_focus: None,
+            restore_cursor: None,
+        }
+    }
+
+    fn confirmed_plan(generation: u64) -> drop_plan::DropPlan {
+        let mut plan = transaction_plan(generation);
+        // An empty exact projection is vacuously satisfied, so any snapshot
+        // after a successful action confirms the transaction.
+        plan.projection = drop_plan::DropProjection::Exact(Vec::new());
+        plan
+    }
+
+    fn failed_result(request_id: u64) -> niri::ActionTransactionResult {
+        niri::ActionTransactionResult {
+            request_id,
+            completed_steps: vec![ActionStep::MoveToWorkspace],
+            failure: Some(niri::ActionStepFailure {
+                step: ActionStep::MoveColumn,
+                error: "column move rejected".into(),
+            }),
+            focus_restoration: niri::RestorationStatus::Completed,
+            cursor_restoration: niri::RestorationStatus::NotRequested,
+        }
     }
 
     #[test]
-    fn center_zone_places_then_joins_from_the_right() {
-        assert!(matches!(
-            tiled_drop_position(1, 0.5, true),
-            (2, Some(niri::JoinDirection::Left))
-        ));
-        assert!(matches!(
-            tiled_drop_position(3, 0.5, true),
-            (4, Some(niri::JoinDirection::Left))
-        ));
+    fn drop_transaction_confirms_after_successful_action() {
+        let snapshot = protocol_snapshot();
+        let (niri_tx, niri_rx) = crossbeam_channel::unbounded();
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let mut state = DropTransactionState::default();
+
+        let request_id = state
+            .submit(
+                confirmed_plan(snapshot.generation),
+                &snapshot,
+                Some(reply_tx),
+                &niri_tx,
+            )
+            .unwrap();
+        assert!(niri_rx.try_recv().is_ok());
+        assert!(reply_rx.try_recv().is_err(), "reply must stay deferred");
+
+        let submitted_at = Instant::now();
+        // Before the action worker reports, nothing may confirm or reply.
+        state.reconcile(&snapshot, true, submitted_at);
+        assert!(reply_rx.try_recv().is_err());
+
+        state.record_action_result(
+            niri::ActionTransactionResult {
+                request_id,
+                completed_steps: vec![ActionStep::FocusWindow, ActionStep::MoveColumn],
+                failure: None,
+                focus_restoration: niri::RestorationStatus::Completed,
+                cursor_restoration: niri::RestorationStatus::NotRequested,
+            },
+            submitted_at,
+        );
+
+        state.reconcile(&snapshot, true, submitted_at + Duration::from_millis(1));
+        assert_eq!(reply_rx.try_recv().unwrap(), "ok\n");
+        assert!(state.next_deadline().is_none());
     }
 
     #[test]
-    fn disabled_join_routes_center_to_a_side() {
-        assert!(matches!(tiled_drop_position(2, 0.49, false), (2, None)));
-        assert!(matches!(tiled_drop_position(2, 0.50, false), (3, None)));
+    fn drop_transaction_reports_failed_step_and_keeps_reply() {
+        let snapshot = protocol_snapshot();
+        let (niri_tx, _niri_rx) = crossbeam_channel::unbounded();
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let mut state = DropTransactionState::default();
+
+        let request_id = state
+            .submit(
+                transaction_plan(snapshot.generation),
+                &snapshot,
+                Some(reply_tx),
+                &niri_tx,
+            )
+            .unwrap();
+
+        let result_at = Instant::now();
+        state.record_action_result(failed_result(request_id), result_at);
+        // The failure holds briefly so an immediately following event burst
+        // cannot race the structured result.
+        state.reconcile(&snapshot, true, result_at + Duration::from_millis(1));
+        assert!(reply_rx.try_recv().is_err());
+
+        state.reconcile(
+            &snapshot,
+            true,
+            result_at + DROP_FAILURE_RECONCILE + Duration::from_millis(1),
+        );
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            "error: drop action failed: move-column: column move rejected\n"
+        );
     }
 
     #[test]
-    fn same_workspace_move_accounts_for_source_removal() {
-        assert_eq!(adjust_same_workspace_index(3, Some(1), true), 2);
-        assert_eq!(adjust_same_workspace_index(3, Some(4), true), 3);
-        assert_eq!(adjust_same_workspace_index(3, Some(1), false), 3);
-        assert_eq!(adjust_same_workspace_index(1, Some(1), true), 1);
+    fn drop_transaction_times_out_without_confirmation() {
+        let snapshot = protocol_snapshot();
+        let (niri_tx, _niri_rx) = crossbeam_channel::unbounded();
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let mut state = DropTransactionState::default();
+
+        let request_id = state
+            .submit(
+                transaction_plan(snapshot.generation),
+                &snapshot,
+                Some(reply_tx),
+                &niri_tx,
+            )
+            .unwrap();
+
+        let result_at = Instant::now();
+        state.record_action_result(
+            niri::ActionTransactionResult {
+                request_id,
+                completed_steps: vec![ActionStep::MoveColumn],
+                failure: None,
+                focus_restoration: niri::RestorationStatus::Completed,
+                cursor_restoration: niri::RestorationStatus::NotRequested,
+            },
+            result_at,
+        );
+        state.reconcile(
+            &snapshot,
+            true,
+            result_at + DROP_CONFIRM_TIMEOUT + Duration::from_millis(1),
+        );
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            "error: drop confirmation timeout\n"
+        );
+    }
+
+    #[test]
+    fn drop_transaction_rejects_overlap_and_stale_plans() {
+        let snapshot = protocol_snapshot();
+        let (niri_tx, _niri_rx) = crossbeam_channel::unbounded();
+        let mut state = DropTransactionState::default();
+
+        state
+            .submit(
+                transaction_plan(snapshot.generation),
+                &snapshot,
+                None,
+                &niri_tx,
+            )
+            .unwrap();
+        assert_eq!(
+            state.submit(
+                transaction_plan(snapshot.generation),
+                &snapshot,
+                None,
+                &niri_tx
+            ),
+            Err("drop transaction already active")
+        );
+
+        let mut stale = DropTransactionState::default();
+        assert_eq!(
+            stale.submit(
+                transaction_plan(snapshot.generation - 1),
+                &snapshot,
+                None,
+                &niri_tx
+            ),
+            Err("stale drop plan")
+        );
+    }
+
+    #[test]
+    fn drop_transaction_survives_event_stream_loss() {
+        let snapshot = protocol_snapshot();
+        let (niri_tx, _niri_rx) = crossbeam_channel::unbounded();
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let mut state = DropTransactionState::default();
+
+        let request_id = state
+            .submit(
+                transaction_plan(snapshot.generation),
+                &snapshot,
+                Some(reply_tx),
+                &niri_tx,
+            )
+            .unwrap();
+
+        let result_at = Instant::now();
+        state.record_action_result(
+            niri::ActionTransactionResult {
+                request_id,
+                completed_steps: vec![ActionStep::MoveColumn],
+                failure: None,
+                focus_restoration: niri::RestorationStatus::Completed,
+                cursor_restoration: niri::RestorationStatus::NotRequested,
+            },
+            result_at,
+        );
+        // Without events no postcondition can ever be observed; report that
+        // instead of waiting for a timeout that proves nothing.
+        state.reconcile(&snapshot, false, result_at + Duration::from_millis(1));
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            "error: Niri event stream unavailable\n"
+        );
     }
 }
 
@@ -2638,153 +3068,6 @@ mod selection_tests {
     }
 
     #[test]
-    fn moving_between_workspaces_lands_on_the_active_window() {
-        let snapshot = snapshot();
-        let mut selection = Selection {
-            output: "DP-1".into(),
-            workspace: 0,
-            window: 2,
-            ..Selection::default()
-        };
-        move_selection(&mut selection, &snapshot, 1, 0);
-        assert_eq!((selection.workspace, selection.window), (1, 1));
-        move_selection(&mut selection, &snapshot, 1, 0);
-        assert_eq!((selection.workspace, selection.window), (2, 4));
-        // Wrapping back round must not reset to the first window either.
-        move_selection(&mut selection, &snapshot, 1, 0);
-        assert_eq!((selection.workspace, selection.window), (0, 2));
-    }
-
-    /// The renderer parks each row's anchor on the focal column, so vertical
-    /// movement must land exactly on that anchor. If the two ever disagree the
-    /// row visibly slides sideways on arrival.
-    #[test]
-    fn vertical_movement_does_not_scroll_the_row_sideways() {
-        let snapshot = snapshot();
-        let output = &snapshot.outputs["DP-1"];
-        let mut selection = Selection {
-            output: "DP-1".into(),
-            workspace: 0,
-            window: 0,
-            ..Selection::default()
-        };
-        // Twice around, so the second lap exercises remembered positions.
-        for _ in 0..output.workspaces.len() * 2 {
-            let before = selection_visual(&selection, &snapshot).expect("a selection");
-            move_selection(&mut selection, &snapshot, 1, 0);
-            let arrived = &output.workspaces[selection.workspace];
-            assert_eq!(
-                selection.window,
-                before.anchor(arrived),
-                "selection must arrive on the column the row was already parked at"
-            );
-        }
-    }
-
-    #[test]
-    fn selecting_the_active_workspace_uses_its_active_window() {
-        let snapshot = snapshot();
-        let mut selection = Selection {
-            output: "DP-1".into(),
-            workspace: 0,
-            window: 0,
-            ..Selection::default()
-        };
-        select_active_workspace(&mut selection, &snapshot);
-        assert_eq!((selection.workspace, selection.window), (0, 2));
-    }
-
-    #[test]
-    fn navigating_away_and_back_returns_to_where_you_were() {
-        let snapshot = snapshot();
-        let mut selection = Selection {
-            output: "DP-1".into(),
-            workspace: 0,
-            window: 0,
-            ..Selection::default()
-        };
-        // Walk to the third window of workspace 0, which is not its active one.
-        move_selection(&mut selection, &snapshot, 0, 1);
-        move_selection(&mut selection, &snapshot, 0, 1);
-        assert_eq!(selection.window, 2);
-
-        move_selection(&mut selection, &snapshot, 1, 0);
-        assert_eq!((selection.workspace, selection.window), (1, 1));
-        move_selection(&mut selection, &snapshot, -1, 0);
-        assert_eq!(
-            (selection.workspace, selection.window),
-            (0, 2),
-            "must restore the staged position, not snap to the live active window"
-        );
-    }
-
-    #[test]
-    fn a_new_session_starts_from_live_state_again() {
-        let snapshot = snapshot();
-        let mut selection = Selection {
-            output: "DP-1".into(),
-            workspace: 0,
-            window: 0,
-            ..Selection::default()
-        };
-        move_selection(&mut selection, &snapshot, 0, 1);
-        assert_eq!(selection.window, 1);
-        assert!(!selection.visited.is_empty());
-
-        // Closing the popup ends the session.
-        selection.clear_session();
-        reset_selection(&mut selection, &snapshot);
-        assert_eq!(
-            (selection.workspace, selection.window),
-            (0, 2),
-            "workspace 0's active window index"
-        );
-    }
-
-    #[test]
-    fn a_remembered_index_past_the_end_falls_back_to_the_active_window() {
-        let snapshot = snapshot();
-        let workspace = &snapshot.outputs["DP-1"].workspaces[1];
-        let mut selection = Selection {
-            output: "DP-1".into(),
-            workspace: 1,
-            window: 0,
-            ..Selection::default()
-        };
-        // Stale entry from before windows closed on that workspace.
-        selection.visited.insert(workspace.id, 99);
-        assert_eq!(selection.entry_index(workspace), workspace.active_index());
-    }
-
-    #[test]
-    fn selection_stays_on_the_same_window_after_a_reorder() {
-        let mut snapshot = snapshot();
-        let mut selection = Selection {
-            output: "DP-1".into(),
-            workspace: 0,
-            window: 2,
-            ..Selection::default()
-        };
-        normalize_selection(&mut selection, &snapshot);
-        assert_eq!(selected_window(&selection, &snapshot), Some(102));
-
-        // Moving this column changes its visible index from 2 to 3 without
-        // changing Niri focus. The XMB must keep the same icon at its focal
-        // point rather than selecting the new third icon.
-        let workspace = &mut snapshot.outputs.get_mut("DP-1").unwrap().workspaces[0];
-        let moved = workspace.columns.remove(&2).expect("third column");
-        workspace.columns.insert(5, moved);
-        normalize_selection(&mut selection, &snapshot);
-
-        assert_eq!(selection.window, 3);
-        assert_eq!(selected_window(&selection, &snapshot), Some(102));
-        assert_eq!(
-            selection_visual(&selection, &snapshot).and_then(|visual| visual.window_id),
-            Some(102)
-        );
-    }
-
-    #[test]
     fn focus_signature_tracks_workspace_and_window_but_peek_ignores_window() {
         let mut snapshot = snapshot();
         let base = focus_signature(&snapshot);
@@ -2815,21 +3098,6 @@ mod selection_tests {
         workspaces[0].focused = false;
         workspaces[1].focused = true;
         assert_ne!(before, workspace_focus_signature(&snapshot));
-    }
-
-    #[test]
-    fn horizontal_movement_still_walks_one_window_at_a_time() {
-        let snapshot = snapshot();
-        let mut selection = Selection {
-            output: "DP-1".into(),
-            workspace: 1,
-            window: 1,
-            ..Selection::default()
-        };
-        move_selection(&mut selection, &snapshot, 0, 1);
-        assert_eq!((selection.workspace, selection.window), (1, 2));
-        move_selection(&mut selection, &snapshot, 0, 1);
-        assert_eq!((selection.workspace, selection.window), (1, 0), "wraps");
     }
 
     #[test]

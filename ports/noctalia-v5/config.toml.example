@@ -8,7 +8,7 @@ enabled = ["amarinne/niri-xmb"]
 [[plugins.source]]
 name = "niri-xmb-local"
 kind = "path"
-location = "/home/eza/Projects/niri-xmb/ports/noctalia-v5/plugins"
+location = "/path/to/niri-xmb/ports/noctalia-v5/plugins"
 
 [bar.main]
 start = ["niri-xmb-hdmi1", "niri-xmb-hdmi2"]
@@ -16,7 +16,7 @@ start = ["niri-xmb-hdmi1", "niri-xmb-hdmi2"]
 [widget.niri-xmb-hdmi1]
 type = "amarinne/niri-xmb:workspace-strip"
 target_output = "HDMI-A-1"
-backend_command = "/home/eza/.local/bin/niri-xmb"
+backend_command = "niri-xmb"
 poll_interval_ms = 250
 hide_empty_workspaces = false
 allow_drag = true
@@ -29,7 +29,7 @@ group_opacity = 0.72
 [widget.niri-xmb-hdmi2]
 type = "amarinne/niri-xmb:workspace-strip"
 target_output = "HDMI-A-2"
-backend_command = "/home/eza/.local/bin/niri-xmb"
+backend_command = "niri-xmb"
 poll_interval_ms = 250
 hide_empty_workspaces = false
 allow_drag = true

@@ -6,6 +6,33 @@ use niri_ipc::{Action, Event, Request, Response, WorkspaceReferenceArg};
 use std::thread;
 use std::time::Duration;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NiriHealth {
+    pub event_stream_connected: bool,
+    pub last_event_error: Option<String>,
+    pub last_action_error: Option<String>,
+}
+
+impl NiriHealth {
+    pub fn apply(&mut self, update: NiriHealthUpdate) {
+        match update {
+            NiriHealthUpdate::EventConnected => self.event_stream_connected = true,
+            NiriHealthUpdate::EventDisconnected(error) => {
+                self.event_stream_connected = false;
+                self.last_event_error = Some(error);
+            }
+            NiriHealthUpdate::ActionFailed(error) => self.last_action_error = Some(error),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NiriHealthUpdate {
+    EventConnected,
+    EventDisconnected(String),
+    ActionFailed(String),
+}
+
 #[derive(Debug, Clone)]
 pub enum NiriCommand {
     FocusWindow(u64),
@@ -32,53 +59,145 @@ pub enum NiriCommand {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
+pub enum NiriRequest {
+    Command(NiriCommand),
+    Transaction {
+        request_id: u64,
+        command: NiriCommand,
+    },
+}
+
+impl From<NiriCommand> for NiriRequest {
+    fn from(command: NiriCommand) -> Self {
+        Self::Command(command)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionStep {
+    FocusWindow,
+    FocusWorkspace,
+    DetachJoinedSource,
+    MoveToTiling,
+    MoveToFloating,
+    MoveToWorkspace,
+    FocusMovedWindow,
+    MoveColumn,
+    JoinLeft,
+    MoveFloatingWindow,
+    RestoreFocus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionStepFailure {
+    pub step: ActionStep,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestorationStatus {
+    NotRequested,
+    Completed,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionTransactionResult {
+    pub request_id: u64,
+    pub completed_steps: Vec<ActionStep>,
+    pub failure: Option<ActionStepFailure>,
+    pub focus_restoration: RestorationStatus,
+    pub cursor_restoration: RestorationStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinDirection {
     Left,
 }
 
 pub fn spawn(
     snapshot_tx: Sender<Snapshot>,
-    command_rx: Receiver<NiriCommand>,
+    command_rx: Receiver<NiriRequest>,
     cursor_restore_tx: Sender<(f64, f64)>,
+    health_tx: Sender<NiriHealthUpdate>,
+    transaction_tx: Sender<ActionTransactionResult>,
     wake: WakeHandle,
 ) {
     let event_wake = wake.clone();
+    let event_health_tx = health_tx.clone();
     thread::Builder::new()
         .name("niri-xmb-events".into())
-        .spawn(move || run_events(snapshot_tx, event_wake))
+        .spawn(move || run_events(snapshot_tx, event_health_tx, event_wake))
         .expect("failed to spawn niri IPC thread");
     thread::Builder::new()
         .name("niri-xmb-actions".into())
         .spawn(move || {
-            while let Ok(command) = command_rx.recv() {
-                let restore_cursor = match &command {
-                    NiriCommand::MoveTiled { restore_cursor, .. }
-                    | NiriCommand::MoveFloating { restore_cursor, .. } => *restore_cursor,
-                    _ => None,
-                };
-                match dispatch(command) {
-                    Ok(()) => {
-                        if let Some(position) = restore_cursor
-                            && cursor_restore_tx.send(position).is_ok()
-                        {
-                            wake.wake();
+            while let Ok(request) = command_rx.recv() {
+                match request {
+                    NiriRequest::Command(command) => {
+                        let restore_cursor = command.restore_cursor();
+                        let mut transport = SocketActionTransport;
+                        let mut result = execute_command(command, &mut transport);
+                        restore_cursor_position(
+                            restore_cursor,
+                            &cursor_restore_tx,
+                            &mut result.cursor_restoration,
+                        );
+                        if let Some(failure) = result.failure {
+                            tracing::warn!(step = ?failure.step, error = %failure.error, "Niri action failed");
+                            let _ = health_tx.send(NiriHealthUpdate::ActionFailed(failure.error));
                         }
+                        wake.wake();
                     }
-                    Err(error) => tracing::warn!(%error, "Niri action failed"),
+                    NiriRequest::Transaction {
+                        request_id,
+                        command,
+                    } => {
+                        let restore_cursor = command.restore_cursor();
+                        let mut transport = SocketActionTransport;
+                        let mut execution = execute_command(command, &mut transport);
+                        restore_cursor_position(
+                            restore_cursor,
+                            &cursor_restore_tx,
+                            &mut execution.cursor_restoration,
+                        );
+                        if let Some(failure) = &execution.failure {
+                            tracing::warn!(request_id, step = ?failure.step, error = %failure.error, "Niri transaction failed");
+                            let _ = health_tx
+                                .send(NiriHealthUpdate::ActionFailed(failure.error.clone()));
+                        }
+                        let _ = transaction_tx.send(ActionTransactionResult {
+                            request_id,
+                            completed_steps: execution.completed_steps,
+                            failure: execution.failure,
+                            focus_restoration: execution.focus_restoration,
+                            cursor_restoration: execution.cursor_restoration,
+                        });
+                        wake.wake();
+                    }
                 }
             }
         })
         .expect("failed to spawn niri action thread");
 }
 
-fn run_events(snapshot_tx: Sender<Snapshot>, wake: WakeHandle) {
+fn run_events(
+    snapshot_tx: Sender<Snapshot>,
+    health_tx: Sender<NiriHealthUpdate>,
+    wake: WakeHandle,
+) {
     loop {
         let mut state = NiriState::default();
         refresh_outputs(&mut state);
 
         let Ok(mut socket) = Socket::connect() else {
             tracing::warn!("cannot connect to Niri IPC; retrying");
+            publish_health(
+                &health_tx,
+                &wake,
+                NiriHealthUpdate::EventDisconnected("cannot connect to Niri IPC".into()),
+            );
             thread::sleep(Duration::from_secs(2));
             continue;
         };
@@ -86,20 +205,43 @@ fn run_events(snapshot_tx: Sender<Snapshot>, wake: WakeHandle) {
             Ok(Ok(Response::Handled)) => {}
             Ok(Err(error)) => {
                 tracing::warn!(%error, "Niri rejected event stream");
+                publish_health(
+                    &health_tx,
+                    &wake,
+                    NiriHealthUpdate::EventDisconnected(format!(
+                        "Niri rejected event stream: {error}"
+                    )),
+                );
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
             Ok(Ok(response)) => {
                 tracing::warn!(?response, "unexpected Niri event-stream response");
+                publish_health(
+                    &health_tx,
+                    &wake,
+                    NiriHealthUpdate::EventDisconnected(format!(
+                        "unexpected Niri event-stream response: {response:?}"
+                    )),
+                );
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
             Err(error) => {
                 tracing::warn!(%error, "failed to start Niri event stream");
+                publish_health(
+                    &health_tx,
+                    &wake,
+                    NiriHealthUpdate::EventDisconnected(format!(
+                        "failed to start Niri event stream: {error}"
+                    )),
+                );
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
         }
+
+        publish_health(&health_tx, &wake, NiriHealthUpdate::EventConnected);
 
         let mut read_event = socket.read_events();
         loop {
@@ -107,6 +249,13 @@ fn run_events(snapshot_tx: Sender<Snapshot>, wake: WakeHandle) {
                 Ok(event) => event,
                 Err(error) => {
                     tracing::warn!(%error, "Niri event stream disconnected");
+                    publish_health(
+                        &health_tx,
+                        &wake,
+                        NiriHealthUpdate::EventDisconnected(format!(
+                            "Niri event stream disconnected: {error}"
+                        )),
+                    );
                     break;
                 }
             };
@@ -116,6 +265,16 @@ fn run_events(snapshot_tx: Sender<Snapshot>, wake: WakeHandle) {
             }
         }
         thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn publish_health(
+    health_tx: &Sender<NiriHealthUpdate>,
+    wake: &WakeHandle,
+    update: NiriHealthUpdate,
+) {
+    if health_tx.send(update).is_ok() {
+        wake.wake();
     }
 }
 
@@ -207,21 +366,154 @@ fn apply_event(state: &mut NiriState, event: Event) -> bool {
     }
 }
 
-fn send(action: Action) -> anyhow::Result<()> {
-    let mut socket = Socket::connect()?;
-    match socket.send(Request::Action(action))? {
-        Ok(Response::Handled) => Ok(()),
-        Ok(response) => anyhow::bail!("unexpected Niri response: {response:?}"),
-        Err(error) => anyhow::bail!(error),
+impl NiriCommand {
+    fn restore_cursor(&self) -> Option<(f64, f64)> {
+        match self {
+            Self::MoveTiled { restore_cursor, .. } | Self::MoveFloating { restore_cursor, .. } => {
+                *restore_cursor
+            }
+            Self::FocusWindow(_) | Self::FocusWorkspace(_) => None,
+        }
     }
 }
 
-fn dispatch(command: NiriCommand) -> anyhow::Result<()> {
+trait ActionTransport {
+    fn send(&mut self, action: Action) -> anyhow::Result<()>;
+}
+
+struct SocketActionTransport;
+
+impl ActionTransport for SocketActionTransport {
+    fn send(&mut self, action: Action) -> anyhow::Result<()> {
+        let mut socket = Socket::connect()?;
+        match socket.send(Request::Action(action))? {
+            Ok(Response::Handled) => Ok(()),
+            Ok(response) => anyhow::bail!("unexpected Niri response: {response:?}"),
+            Err(error) => anyhow::bail!(error),
+        }
+    }
+}
+
+struct CommandExecution {
+    completed_steps: Vec<ActionStep>,
+    failure: Option<ActionStepFailure>,
+    focus_restoration: RestorationStatus,
+    cursor_restoration: RestorationStatus,
+}
+
+impl CommandExecution {
+    fn new(command: &NiriCommand) -> Self {
+        let focus_restoration = match command {
+            NiriCommand::MoveTiled { restore_focus, .. }
+            | NiriCommand::MoveFloating { restore_focus, .. }
+                if restore_focus.is_some() =>
+            {
+                RestorationStatus::Failed("focus restoration did not run".into())
+            }
+            _ => RestorationStatus::NotRequested,
+        };
+        let cursor_restoration = if command.restore_cursor().is_some() {
+            RestorationStatus::Failed("cursor restoration did not run".into())
+        } else {
+            RestorationStatus::NotRequested
+        };
+        Self {
+            completed_steps: Vec::new(),
+            failure: None,
+            focus_restoration,
+            cursor_restoration,
+        }
+    }
+}
+
+fn run_step<T: ActionTransport>(
+    transport: &mut T,
+    execution: &mut CommandExecution,
+    step: ActionStep,
+    action: Action,
+) -> bool {
+    match transport.send(action) {
+        Ok(()) => {
+            execution.completed_steps.push(step);
+            if step == ActionStep::RestoreFocus {
+                execution.focus_restoration = RestorationStatus::Completed;
+            }
+            true
+        }
+        Err(error) => {
+            execution.failure = Some(ActionStepFailure {
+                step,
+                error: error.to_string(),
+            });
+            false
+        }
+    }
+}
+
+fn restore_focus_after_failure<T: ActionTransport>(
+    transport: &mut T,
+    execution: &mut CommandExecution,
+    window_id: u64,
+    restore_focus: Option<u64>,
+) {
+    let Some(id) = restore_focus.filter(|id| *id != window_id) else {
+        return;
+    };
+    if execution
+        .completed_steps
+        .contains(&ActionStep::RestoreFocus)
+        || execution
+            .failure
+            .as_ref()
+            .is_some_and(|failure| failure.step == ActionStep::RestoreFocus)
+    {
+        return;
+    }
+    execution.focus_restoration = match transport.send(Action::FocusWindow { id }) {
+        Ok(()) => RestorationStatus::Completed,
+        Err(error) => RestorationStatus::Failed(error.to_string()),
+    };
+}
+
+fn restore_cursor_position(
+    position: Option<(f64, f64)>,
+    cursor_restore_tx: &Sender<(f64, f64)>,
+    status: &mut RestorationStatus,
+) {
+    let Some(position) = position else {
+        return;
+    };
+    *status = if cursor_restore_tx.send(position).is_ok() {
+        RestorationStatus::Completed
+    } else {
+        RestorationStatus::Failed("cursor restore channel is unavailable".into())
+    };
+}
+
+fn execute_command<T: ActionTransport>(
+    command: NiriCommand,
+    transport: &mut T,
+) -> CommandExecution {
+    let mut execution = CommandExecution::new(&command);
     match command {
-        NiriCommand::FocusWindow(id) => send(Action::FocusWindow { id }),
-        NiriCommand::FocusWorkspace(id) => send(Action::FocusWorkspace {
-            reference: WorkspaceReferenceArg::Id(id),
-        }),
+        NiriCommand::FocusWindow(id) => {
+            run_step(
+                transport,
+                &mut execution,
+                ActionStep::FocusWindow,
+                Action::FocusWindow { id },
+            );
+        }
+        NiriCommand::FocusWorkspace(id) => {
+            run_step(
+                transport,
+                &mut execution,
+                ActionStep::FocusWorkspace,
+                Action::FocusWorkspace {
+                    reference: WorkspaceReferenceArg::Id(id),
+                },
+            );
+        }
         NiriCommand::MoveTiled {
             window_id,
             source_workspace_id,
@@ -232,37 +524,85 @@ fn dispatch(command: NiriCommand) -> anyhow::Result<()> {
             restore_focus,
             restore_cursor: _,
         } => {
-            if source_joined {
-                send(Action::ConsumeOrExpelWindowLeft {
+            if source_joined
+                && !run_step(
+                    transport,
+                    &mut execution,
+                    ActionStep::DetachJoinedSource,
+                    Action::ConsumeOrExpelWindowLeft {
+                        id: Some(window_id),
+                    },
+                )
+            {
+                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
+                return execution;
+            }
+            if !run_step(
+                transport,
+                &mut execution,
+                ActionStep::MoveToTiling,
+                Action::MoveWindowToTiling {
                     id: Some(window_id),
-                })?;
+                },
+            ) {
+                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
+                return execution;
             }
-            send(Action::MoveWindowToTiling {
-                id: Some(window_id),
-            })?;
-            if source_workspace_id != workspace_id {
-                send(Action::MoveWindowToWorkspace {
-                    window_id: Some(window_id),
-                    reference: WorkspaceReferenceArg::Id(workspace_id),
-                    focus: false,
-                })?;
+            if source_workspace_id != workspace_id
+                && !run_step(
+                    transport,
+                    &mut execution,
+                    ActionStep::MoveToWorkspace,
+                    Action::MoveWindowToWorkspace {
+                        window_id: Some(window_id),
+                        reference: WorkspaceReferenceArg::Id(workspace_id),
+                        focus: false,
+                    },
+                )
+            {
+                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
+                return execution;
             }
-            send(Action::FocusWindow { id: window_id })?;
-            send(Action::MoveColumnToIndex {
-                index: column.max(1),
-            })?;
+            if !run_step(
+                transport,
+                &mut execution,
+                ActionStep::FocusMovedWindow,
+                Action::FocusWindow { id: window_id },
+            ) || !run_step(
+                transport,
+                &mut execution,
+                ActionStep::MoveColumn,
+                Action::MoveColumnToIndex {
+                    index: column.max(1),
+                },
+            ) {
+                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
+                return execution;
+            }
             if let Some(direction) = join {
                 let action = match direction {
                     JoinDirection::Left => Action::ConsumeOrExpelWindowLeft {
                         id: Some(window_id),
                     },
                 };
-                send(action)?;
+                if !run_step(transport, &mut execution, ActionStep::JoinLeft, action) {
+                    restore_focus_after_failure(
+                        transport,
+                        &mut execution,
+                        window_id,
+                        restore_focus,
+                    );
+                    return execution;
+                }
             }
             if let Some(id) = restore_focus.filter(|id| *id != window_id) {
-                send(Action::FocusWindow { id })?;
+                run_step(
+                    transport,
+                    &mut execution,
+                    ActionStep::RestoreFocus,
+                    Action::FocusWindow { id },
+                );
             }
-            Ok(())
         }
         NiriCommand::MoveFloating {
             window_id,
@@ -274,27 +614,73 @@ fn dispatch(command: NiriCommand) -> anyhow::Result<()> {
             restore_focus,
             restore_cursor: _,
         } => {
-            if make_floating {
-                send(Action::MoveWindowToFloating {
+            if make_floating
+                && !run_step(
+                    transport,
+                    &mut execution,
+                    ActionStep::MoveToFloating,
+                    Action::MoveWindowToFloating {
+                        id: Some(window_id),
+                    },
+                )
+            {
+                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
+                return execution;
+            }
+            if source_workspace_id != workspace_id
+                && !run_step(
+                    transport,
+                    &mut execution,
+                    ActionStep::MoveToWorkspace,
+                    Action::MoveWindowToWorkspace {
+                        window_id: Some(window_id),
+                        reference: WorkspaceReferenceArg::Id(workspace_id),
+                        focus: false,
+                    },
+                )
+            {
+                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
+                return execution;
+            }
+            if !run_step(
+                transport,
+                &mut execution,
+                ActionStep::MoveFloatingWindow,
+                Action::MoveFloatingWindow {
                     id: Some(window_id),
-                })?;
+                    x: niri_ipc::PositionChange::SetFixed(x),
+                    y: niri_ipc::PositionChange::SetFixed(y),
+                },
+            ) {
+                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
+                return execution;
             }
-            if source_workspace_id != workspace_id {
-                send(Action::MoveWindowToWorkspace {
-                    window_id: Some(window_id),
-                    reference: WorkspaceReferenceArg::Id(workspace_id),
-                    focus: false,
-                })?;
-            }
-            send(Action::MoveFloatingWindow {
-                id: Some(window_id),
-                x: niri_ipc::PositionChange::SetFixed(x),
-                y: niri_ipc::PositionChange::SetFixed(y),
-            })?;
             if let Some(id) = restore_focus.filter(|id| *id != window_id) {
-                send(Action::FocusWindow { id })?;
+                run_step(
+                    transport,
+                    &mut execution,
+                    ActionStep::RestoreFocus,
+                    Action::FocusWindow { id },
+                );
             }
-            Ok(())
         }
+    }
+    execution
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_keeps_last_errors_across_reconnects() {
+        let mut health = NiriHealth::default();
+        health.apply(NiriHealthUpdate::EventDisconnected("lost stream".into()));
+        health.apply(NiriHealthUpdate::ActionFailed("focus failed".into()));
+        health.apply(NiriHealthUpdate::EventConnected);
+
+        assert!(health.event_stream_connected);
+        assert_eq!(health.last_event_error.as_deref(), Some("lost stream"));
+        assert_eq!(health.last_action_error.as_deref(), Some("focus failed"));
     }
 }

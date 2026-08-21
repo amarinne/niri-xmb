@@ -1,6 +1,14 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+const MAX_LOGICAL_DIMENSION: f32 = 8192.0;
+const MAX_OFFSET: f32 = 8192.0;
+const MAX_DURATION_MS: u64 = 60_000;
+const MAX_STYLE_LENGTH: f32 = 2048.0;
+const MAX_FONT_SIZE: f32 = 512.0;
+const MAX_ICON_SIZE: u32 = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -32,7 +40,9 @@ impl PopupConfig {
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
-            return Ok(Self::default());
+            let config = Self::default();
+            config.validate()?;
+            return Ok(config);
         }
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
@@ -44,6 +54,9 @@ impl Config {
             .and_then(toml::Value::as_str)
             .map(str::to_owned);
         if let Some(theme) = theme_path {
+            if theme.trim().is_empty() {
+                anyhow::bail!("theme must not be empty");
+            }
             let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
             let resolved = resolve_theme_path(&theme, config_dir);
             let theme_source = std::fs::read_to_string(&resolved)
@@ -51,20 +64,199 @@ impl Config {
             let theme_value: toml::Value = toml::from_str(&theme_source)
                 .with_context(|| format!("failed to parse theme {}", resolved.display()))?;
 
+            validate_theme(&theme_value, &resolved)?;
+
             let table = value
                 .as_table_mut()
                 .expect("top-level config is always a table");
             let style = table
                 .entry("style")
                 .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-            if let Some(theme_style) = theme_value.get("style") {
-                merge_style(style, theme_style);
-            }
+            let theme_style = theme_value
+                .get("style")
+                .expect("validated theme has a style table");
+            merge_style(style, theme_style);
         }
 
-        value
+        let mut config: Self = value
             .try_into()
-            .with_context(|| format!("failed to parse {}", path.display()))
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        config.reconcile_legacy_switches();
+        config
+            .validate()
+            .with_context(|| format!("invalid configuration in {}", path.display()))?;
+        Ok(config)
+    }
+
+    /// Apply deprecated switches without silently changing behavior.
+    ///
+    /// `show_urgent_ring = false` used to suppress the `ring` preset. That
+    /// combination keeps its meaning by mapping to `urgent_indicator = "none"`;
+    /// every other use of the switch is now ignored.
+    pub fn reconcile_legacy_switches(&mut self) {
+        if self.style.show_urgent_ring == Some(false)
+            && self.style.urgent_indicator == UrgentIndicator::Ring
+        {
+            tracing::warn!(
+                "style.show_urgent_ring is deprecated; replace `urgent_indicator = \"ring\"` \
+                 plus `show_urgent_ring = false` with `urgent_indicator = \"none\"`"
+            );
+            self.style.urgent_indicator = UrgentIndicator::None;
+        }
+        self.style.show_urgent_ring = None;
+    }
+
+    /// Validate values that TOML and Serde cannot constrain by type.
+    ///
+    /// Logical pixel dimensions are limited to 8192. Durations are limited to
+    /// 60 seconds. Percent sizes use 0-100, while signed positions use
+    /// -100-100. These limits prevent accidental large buffers and timers.
+    pub fn validate(&self) -> Result<()> {
+        let mut bar_outputs = HashSet::new();
+        for (index, bar) in self.bars.iter().enumerate() {
+            validate_output_name(&bar.output, &format!("bars[{index}].output"))?;
+            if !bar_outputs.insert(&bar.output) {
+                anyhow::bail!("bars[{index}].output duplicates output {:?}", bar.output);
+            }
+            let (max_width, max_height) = match bar.edge {
+                Edge::Top | Edge::Bottom => (8192, 512),
+                Edge::Left | Edge::Right => (512, 8192),
+            };
+            validate_u32_range(&format!("bars[{index}].width"), bar.width, 1, max_width)?;
+            validate_u32_range(&format!("bars[{index}].height"), bar.height, 1, max_height)?;
+            validate_i32_range(
+                &format!("bars[{index}].margin"),
+                bar.margin,
+                0,
+                MAX_OFFSET as i32,
+            )?;
+            validate_i32_range(
+                &format!("bars[{index}].offset"),
+                bar.offset,
+                -(MAX_OFFSET as i32),
+                MAX_OFFSET as i32,
+            )?;
+            validate_u64_range(
+                &format!("bars[{index}].scroll_repeat_ms"),
+                bar.scroll_repeat_ms,
+                0,
+                5_000,
+            )?;
+        }
+
+        validate_length(
+            "popup.width",
+            self.popup.width,
+            1.0,
+            MAX_LOGICAL_DIMENSION,
+            0.1,
+            100.0,
+        )?;
+        validate_length(
+            "popup.height",
+            self.popup.height,
+            1.0,
+            MAX_LOGICAL_DIMENSION,
+            0.1,
+            100.0,
+        )?;
+        validate_length(
+            "popup.canvas_width",
+            self.popup.canvas_width,
+            1.0,
+            MAX_LOGICAL_DIMENSION,
+            0.1,
+            100.0,
+        )?;
+        validate_length(
+            "popup.canvas_height",
+            self.popup.canvas_height,
+            1.0,
+            MAX_LOGICAL_DIMENSION,
+            0.1,
+            100.0,
+        )?;
+        validate_length(
+            "popup.fixed_x",
+            self.popup.fixed_x,
+            -MAX_OFFSET,
+            MAX_OFFSET,
+            -100.0,
+            100.0,
+        )?;
+        validate_length(
+            "popup.fixed_y",
+            self.popup.fixed_y,
+            -MAX_OFFSET,
+            MAX_OFFSET,
+            -100.0,
+            100.0,
+        )?;
+        validate_u64_range(
+            "popup.follow_delay_ms",
+            self.popup.follow_delay_ms,
+            0,
+            MAX_DURATION_MS,
+        )?;
+
+        let mut placement_outputs = HashSet::new();
+        for (index, placement) in self.popup.placements.iter().enumerate() {
+            validate_output_name(
+                &placement.output,
+                &format!("popup.placements[{index}].output"),
+            )?;
+            if !placement_outputs.insert(&placement.output) {
+                anyhow::bail!(
+                    "popup.placements[{index}].output duplicates output {:?}",
+                    placement.output
+                );
+            }
+            validate_length(
+                &format!("popup.placements[{index}].margin"),
+                placement.margin,
+                0.0,
+                MAX_OFFSET,
+                0.0,
+                100.0,
+            )?;
+        }
+
+        for (field, value) in [
+            ("peek.duration_ms", self.peek.duration_ms),
+            ("peek.arm_grace_ms", self.peek.arm_grace_ms),
+            ("peek.demote_ms", self.peek.demote_ms),
+        ] {
+            validate_u64_range(field, value, 0, MAX_DURATION_MS)?;
+        }
+        validate_f32_range("animation.panel_ms", self.animation.panel_ms, 0.0, 60_000.0)?;
+        validate_f32_range(
+            "animation.emphasis_ms",
+            self.animation.emphasis_ms,
+            0.0,
+            60_000.0,
+        )?;
+        validate_f32_range(
+            "animation.scroll_ms",
+            self.animation.scroll_ms,
+            0.0,
+            60_000.0,
+        )?;
+        validate_f32_range("animation.open_scale", self.animation.open_scale, 0.1, 2.0)?;
+        validate_f64_range(
+            "behavior.drag_threshold",
+            self.behavior.drag_threshold,
+            0.0,
+            MAX_LOGICAL_DIMENSION as f64,
+        )?;
+        self.style.validate()?;
+        if self
+            .theme
+            .as_ref()
+            .is_some_and(|theme| theme.trim().is_empty())
+        {
+            anyhow::bail!("theme must not be empty");
+        }
+        Ok(())
     }
 
     pub fn default_path() -> PathBuf {
@@ -120,6 +312,102 @@ fn merge_style(base: &mut toml::Value, theme: &toml::Value) {
     for (key, value) in theme_table {
         base_table.insert(key.clone(), value.clone());
     }
+}
+
+fn validate_theme(theme: &toml::Value, path: &Path) -> Result<()> {
+    let table = theme
+        .as_table()
+        .with_context(|| format!("theme {} must contain a [style] table", path.display()))?;
+    let style = table
+        .get("style")
+        .with_context(|| format!("theme {} is missing required [style] table", path.display()))?;
+    if let Some(key) = table.keys().find(|key| key.as_str() != "style") {
+        anyhow::bail!(
+            "theme {} has unsupported top-level key {key:?}; only [style] is allowed",
+            path.display()
+        );
+    }
+    let style_table = style
+        .as_table()
+        .with_context(|| format!("theme {} field style must be a table", path.display()))?;
+
+    let mut merged = toml::Value::try_from(StyleConfig::default())
+        .context("failed to build default style for theme validation")?;
+    let known = merged
+        .as_table()
+        .expect("serialized StyleConfig is a table")
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    if let Some(key) = style_table.keys().find(|key| !known.contains(*key)) {
+        anyhow::bail!("theme {} has unknown style key style.{key}", path.display());
+    }
+    merge_style(&mut merged, style);
+    let parsed: StyleConfig = merged
+        .try_into()
+        .with_context(|| format!("theme {} has an invalid [style] field", path.display()))?;
+    parsed
+        .validate()
+        .with_context(|| format!("invalid theme {}", path.display()))
+}
+
+fn validate_output_name(value: &str, field: &str) -> Result<()> {
+    if value.is_empty() || value.trim() != value {
+        anyhow::bail!("{field} must be a nonempty output name without surrounding whitespace");
+    }
+    if value.len() > 255 || value.chars().any(char::is_control) {
+        anyhow::bail!("{field} must be at most 255 bytes and contain no control characters");
+    }
+    Ok(())
+}
+
+fn validate_length(
+    field: &str,
+    value: ConfigLength,
+    min_pixels: f32,
+    max_pixels: f32,
+    min_percent: f32,
+    max_percent: f32,
+) -> Result<()> {
+    match value {
+        ConfigLength::Pixels(value) => validate_f32_range(field, value, min_pixels, max_pixels),
+        ConfigLength::Percent(value) => validate_f32_range(field, value, min_percent, max_percent),
+    }
+}
+
+fn validate_f32_range(field: &str, value: f32, min: f32, max: f32) -> Result<()> {
+    if !value.is_finite() || value < min || value > max {
+        anyhow::bail!("{field} must be finite and between {min} and {max}; got {value}");
+    }
+    Ok(())
+}
+
+fn validate_f64_range(field: &str, value: f64, min: f64, max: f64) -> Result<()> {
+    if !value.is_finite() || value < min || value > max {
+        anyhow::bail!("{field} must be finite and between {min} and {max}; got {value}");
+    }
+    Ok(())
+}
+
+fn validate_u32_range(field: &str, value: u32, min: u32, max: u32) -> Result<()> {
+    if value < min || value > max {
+        anyhow::bail!("{field} must be between {min} and {max}; got {value}");
+    }
+    Ok(())
+}
+
+fn validate_i32_range(field: &str, value: i32, min: i32, max: i32) -> Result<()> {
+    if value < min || value > max {
+        anyhow::bail!("{field} must be between {min} and {max}; got {value}");
+    }
+    Ok(())
+}
+
+fn validate_u64_range(field: &str, value: u64, min: u64, max: u64) -> Result<()> {
+    if value < min || value > max {
+        anyhow::bail!("{field} must be between {min} and {max}; got {value}");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,8 +692,12 @@ pub struct StyleConfig {
     pub urgent: String,
     /// Preset used to mark urgent window icons.
     pub urgent_indicator: UrgentIndicator,
-    /// Legacy ring visibility switch. It only affects the `ring` preset.
-    pub show_urgent_ring: bool,
+    /// Deprecated compatibility switch. `urgent_indicator` alone controls
+    /// urgency rendering. An explicit `false` combined with the `ring` preset
+    /// maps to `urgent_indicator = "none"` during load; every other value is
+    /// ignored.
+    #[serde(default)]
+    pub show_urgent_ring: Option<bool>,
     /// Stroke width of the urgent window ring in logical pixels.
     pub urgent_ring_width: f32,
     /// Gap between an urgent window icon and its ring in logical pixels.
@@ -472,7 +764,7 @@ impl Default for StyleConfig {
             muted: "#ffc0c7cd".into(),
             urgent: "#ffffb4ab".into(),
             urgent_indicator: UrgentIndicator::Glow,
-            show_urgent_ring: true,
+            show_urgent_ring: None,
             urgent_ring_width: 1.25,
             urgent_ring_padding: 2.0,
             urgent_glow_spread: 6.0,
@@ -499,6 +791,85 @@ impl Default for StyleConfig {
             title_font_size: 10.0,
         }
     }
+}
+
+impl StyleConfig {
+    fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("style.background", &self.background),
+            ("style.background_end", &self.background_end),
+            ("style.surface", &self.surface),
+            ("style.surface_hover", &self.surface_hover),
+            ("style.border", &self.border),
+            ("style.border_soft", &self.border_soft),
+            ("style.accent", &self.accent),
+            ("style.selection_border", &self.selection_border),
+            ("style.text", &self.text),
+            ("style.muted", &self.muted),
+            ("style.urgent", &self.urgent),
+            ("style.shadow", &self.shadow),
+            ("style.floating_backing", &self.floating_backing),
+        ] {
+            validate_color(field, value)?;
+        }
+        for (field, value) in [
+            ("style.urgent_ring_width", self.urgent_ring_width),
+            ("style.urgent_ring_padding", self.urgent_ring_padding),
+            ("style.urgent_glow_spread", self.urgent_glow_spread),
+            ("style.urgent_badge_radius", self.urgent_badge_radius),
+            ("style.radius", self.radius),
+            ("style.panel_radius", self.panel_radius),
+            ("style.border_width", self.border_width),
+            ("style.gap", self.gap),
+            ("style.panel_padding", self.panel_padding),
+            ("style.canvas_gap", self.canvas_gap),
+            ("style.column_gap", self.column_gap),
+            ("style.stack_gap", self.stack_gap),
+            ("style.row_gap", self.row_gap),
+            ("style.shadow_spread", self.shadow_spread),
+            ("style.empty_dot_radius", self.empty_dot_radius),
+        ] {
+            validate_f32_range(field, value, 0.0, MAX_STYLE_LENGTH)?;
+        }
+        validate_f32_range(
+            "style.shadow_offset",
+            self.shadow_offset,
+            -MAX_STYLE_LENGTH,
+            MAX_STYLE_LENGTH,
+        )?;
+        validate_f32_range("style.dim_alpha", self.dim_alpha, 0.0, 1.0)?;
+        validate_f32_range("style.urgent_glow_alpha", self.urgent_glow_alpha, 0.0, 1.0)?;
+        validate_f32_range(
+            "style.label_font_size",
+            self.label_font_size,
+            1.0,
+            MAX_FONT_SIZE,
+        )?;
+        validate_f32_range(
+            "style.title_font_size",
+            self.title_font_size,
+            1.0,
+            MAX_FONT_SIZE,
+        )?;
+        validate_u32_range("style.icon_size", self.icon_size, 1, MAX_ICON_SIZE)?;
+        validate_u32_range(
+            "style.icon_size_focused",
+            self.icon_size_focused,
+            1,
+            MAX_ICON_SIZE,
+        )?;
+        Ok(())
+    }
+}
+
+fn validate_color(field: &str, value: &str) -> Result<()> {
+    let digits = value
+        .strip_prefix('#')
+        .with_context(|| format!("{field} must use #RRGGBB or #AARRGGBB syntax"))?;
+    if !matches!(digits.len(), 6 | 8) || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("{field} must use #RRGGBB or #AARRGGBB syntax; got {value:?}");
+    }
+    Ok(())
 }
 
 /// Timing and easing of the popup's transitions.
@@ -631,6 +1002,26 @@ impl Default for BehaviorConfig {
 mod tests {
     use super::*;
 
+    fn load_source(config_source: &str, theme_source: Option<&str>) -> Result<Config> {
+        let dir = std::env::temp_dir().join(format!(
+            "niri-xmb-config-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, config_source).unwrap();
+        if let Some(theme_source) = theme_source {
+            std::fs::write(dir.join("theme.toml"), theme_source).unwrap();
+        }
+        let result = Config::load(&config_path);
+        std::fs::remove_dir_all(&dir).ok();
+        result
+    }
+
     #[test]
     fn default_config_round_trips() {
         let encoded = toml::to_string_pretty(&Config::default()).unwrap();
@@ -641,6 +1032,7 @@ mod tests {
     fn shipped_example_config_parses() {
         let source = include_str!("../../../config/niri-xmb.toml.example");
         let config = toml::from_str::<Config>(source).unwrap();
+        config.validate().unwrap();
         assert_eq!(config.bars.len(), 2);
         assert!(!config.bars[0].allow_column_join);
         assert!(config.bars[1].allow_column_join);
@@ -688,9 +1080,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.style.urgent, "#ff112233");
-        assert!(!config.style.show_urgent_ring);
         assert_eq!(config.style.urgent_ring_width, 3.5);
         assert_eq!(config.style.urgent_ring_padding, 6.0);
+    }
+
+    #[test]
+    fn legacy_urgent_ring_switch_maps_to_none() {
+        // The deprecated switch suppressed the ring preset; that combination
+        // keeps its meaning instead of starting to draw a ring.
+        let mut config = toml::from_str::<Config>(
+            r#"
+            [style]
+            urgent_indicator = "ring"
+            show_urgent_ring = false
+            "#,
+        )
+        .unwrap();
+        config.reconcile_legacy_switches();
+        assert_eq!(config.style.urgent_indicator, UrgentIndicator::None);
+
+        // An explicit false with any other preset changes nothing, and the
+        // switch is consumed either way.
+        let mut config = toml::from_str::<Config>(
+            r#"
+            [style]
+            urgent_indicator = "glow"
+            show_urgent_ring = false
+            "#,
+        )
+        .unwrap();
+        config.reconcile_legacy_switches();
+        assert_eq!(config.style.urgent_indicator, UrgentIndicator::Glow);
+        assert_eq!(config.style.show_urgent_ring, None);
+
+        // Omitting the switch leaves the ring preset active.
+        let mut config =
+            toml::from_str::<Config>("[style]\nurgent_indicator = \"ring\"\n").unwrap();
+        config.reconcile_legacy_switches();
+        assert_eq!(config.style.urgent_indicator, UrgentIndicator::Ring);
     }
 
     #[test]
@@ -719,6 +1146,108 @@ mod tests {
         .expect_err("non-percentage length string should fail");
 
         assert!(error.to_string().contains("percentage"));
+    }
+
+    #[test]
+    fn semantic_validation_rejects_unsafe_dimensions_and_invalid_colors() {
+        let config = toml::from_str::<Config>(
+            r##"
+            [[bars]]
+            output = "eDP-1"
+            width = 9000
+
+            [style]
+            accent = "#not-hex"
+            "##,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("bars[0].width"), "unexpected error: {error}");
+
+        let mut config = Config::default();
+        config.style.accent = "#not-hex".into();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("style.accent"), "unexpected error: {error}");
+
+        let config = toml::from_str::<Config>(
+            r#"
+            [[bars]]
+            output = "eDP-1"
+            edge = "top"
+            height = 513
+            "#,
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("bars[0].height"),
+            "unexpected error: {error}"
+        );
+
+        let config = toml::from_str::<Config>(
+            r#"
+            [[bars]]
+            output = "eDP-1"
+            edge = "left"
+            width = 513
+            "#,
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("bars[0].width"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn semantic_validation_rejects_duplicate_outputs_and_placements() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [[bars]]
+            output = "eDP-1"
+
+            [[bars]]
+            output = "eDP-1"
+            "#,
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("duplicates output"),
+            "unexpected error: {error}"
+        );
+
+        let config = toml::from_str::<Config>(
+            r#"
+            [[popup.placements]]
+            output = "eDP-1"
+
+            [[popup.placements]]
+            output = "eDP-1"
+            "#,
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("popup.placements[1].output duplicates"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn semantic_validation_rejects_nonfinite_and_out_of_range_values() {
+        let mut config = Config::default();
+        config.animation.panel_ms = f32::NAN;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("animation.panel_ms"));
+
+        config = Config::default();
+        config.popup.width = ConfigLength::Percent(101.0);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("popup.width"));
+
+        config = Config::default();
+        config.popup.fixed_x = ConfigLength::Percent(-25.0);
+        config.validate().unwrap();
     }
 
     #[test]
@@ -805,6 +1334,67 @@ mod tests {
     }
 
     #[test]
+    fn referenced_theme_requires_a_style_table() {
+        let error =
+            load_source("theme = \"theme.toml\"\n", Some("accent = \"#ff112233\"\n")).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("missing required [style]"), "{message}");
+    }
+
+    #[test]
+    fn referenced_theme_rejects_wrong_style_type_and_unknown_keys() {
+        let error =
+            load_source("theme = \"theme.toml\"\n", Some("style = \"dark\"\n")).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("style must be a table"), "{message}");
+
+        let error = load_source(
+            "theme = \"theme.toml\"\n",
+            Some("[style]\naccent = \"#ff112233\"\naccentt = \"#ff112233\"\n"),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("unknown style key style.accentt"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn referenced_theme_rejects_invalid_color_and_top_level_keys() {
+        let error = load_source(
+            "theme = \"theme.toml\"\n",
+            Some("[style]\naccent = \"blue\"\n"),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("style.accent"), "{message}");
+
+        let error = load_source(
+            "theme = \"theme.toml\"\n",
+            Some("name = \"test\"\n[style]\naccent = \"#ff112233\"\n"),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("unsupported top-level key"), "{message}");
+    }
+
+    #[test]
+    fn config_load_runs_semantic_validation() {
+        let error = load_source(
+            r#"
+            [[bars]]
+            output = "eDP-1"
+            height = 0
+            "#,
+            None,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("bars[0].height"), "{message}");
+    }
+
+    #[test]
     fn shipped_themes_parse_and_merge() {
         let dank = include_str!("../../../themes/dank.toml");
         let noctalia = include_str!("../../../themes/noctalia.toml");
@@ -816,6 +1406,7 @@ mod tests {
             merge_style(&mut base, theme_style);
 
             let merged: StyleConfig = base.try_into().unwrap();
+            merged.validate().unwrap();
             // A couple of layout fields must survive untouched since the
             // shipped themes only override colours.
             let defaults = StyleConfig::default();

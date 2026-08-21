@@ -1,15 +1,16 @@
 # niri-xmb UX specification
 
-This document defines the intended user experience for the personal desktop profile.
+This document defines the product interaction rules. See
+[MACHINE_PROFILE.md](MACHINE_PROFILE.md) for one machine-specific configuration.
 The words **must**, **should**, and **may** state requirement levels.
 
 ## Design goals
 
-- The popup must show Niri state without changing window layout.
+- The popup must show Niri state without changing the window layout.
 - Window organization must not move pointer focus to the target output.
-- Surfaces outside the panel must keep normal hover, drag, and click behavior.
-- Window activation from inside the panel must close the popup with one action.
-- Multi-window organization must keep the popup open.
+- Surfaces outside the panel must keep normal pointer and click behavior.
+- Window activation from the panel must require one action.
+- Multi-window organization must keep the popup open when configured.
 - Missing optional configuration must use documented defaults.
 - Invalid configuration must not stop the active daemon.
 
@@ -18,157 +19,123 @@ The words **must**, **should**, and **may** state requirement levels.
 | Mode | Trigger | Pointer input | Keyboard input | Close rule |
 | --- | --- | --- | --- | --- |
 | Hidden | Startup or explicit hide | None | None | Not applicable |
-| Manual | `Mod+Z`, `show`, or `toggle` | Panel only | Yes | Behavior settings control closure |
-| Peek | Niri workspace navigation | None, or panel only with `peek.pointer_promote` | None | Hide after `peek.duration_ms` |
-| Peek armed | Pointer moves onto a visible peek panel | Panel only | None | Hide `peek.demote_ms` after the pointer leaves |
+| Manual | `show` or `toggle` | Panel, or configured capture surface | Yes | Behavior settings control closure |
+| Peek | Niri workspace navigation | None, or panel with pointer promotion | None | Hide after `peek.duration_ms` |
+| Peek armed | Pointer moves onto a promoted peek panel | Panel only | None | Hide after configured pointer exit delay |
 
 Manual mode must take keyboard focus for navigation. Peek mode must remain passive.
-Pointer focus and keyboard focus must be tracked separately.
-A manual panel must keep answering keys after the pointer leaves it.
+The daemon must track pointer focus and keyboard focus separately.
+A manual panel must keep answering keys after the pointer leaves the panel.
 Opening manual mode while peek is visible must promote the existing popup.
-The desktop profile must show peek for deliberate workspace changes.
-Window creation, window removal, and XMB-generated focus changes must not raise peek.
-Each qualifying focus move must extend the active peek without hiding it first.
+The configured event policy controls which Niri events raise peek.
+Each qualifying focus move must extend active peek without hiding it first.
 Peek expiry must pause while a focus event burst settles.
 
 ## Peek promotion
 
 `peek.pointer_promote = false` keeps the overlay click-through. Promotion is then
-keybind-only, and every pointer event passes to whatever is underneath.
+keybind-only. All pointer events pass to the surface below.
 
-`peek.pointer_promote = true` adds the pointer handover:
+`peek.pointer_promote = true` enables pointer handover:
 
-- The overlay must stay click-through for `peek.arm_grace_ms` after appearing.
-- After that grace, the panel rectangle must accept pointer input. Nothing outside it may.
-- Peek must never take the keyboard, so the keybinds that raised it keep working.
-- Pointer motion over the panel must arm the overlay. A pointer that has not moved must not.
+- The overlay must stay click-through for `peek.arm_grace_ms` after it appears.
+- The panel rectangle must accept pointer input after the grace period.
+- No surface outside the panel may accept pointer input for the overlay.
+- Peek must never take keyboard focus.
+- Pointer motion over the panel must arm the overlay.
+- A stationary pointer must not arm the overlay.
 - An armed overlay must not expire while the pointer rests on it.
-- An armed overlay must use `style.accent` after it claims the pointer input region.
-- Pointer exit must disarm and hide the overlay after `peek.demote_ms`.
-- A click on an armed or unarmed peek must promote it to manual mode and act on the same click.
-- Promotion must reuse the mapped surface, so no reopen animation may play.
-- Peek must never capture the whole output, whatever `close_on_outside_click` says.
+- An armed overlay must use `style.accent` after it claims pointer input.
+- Pointer exit must hide the overlay after `peek.demote_ms`.
+- A click on peek must promote it and perform the selected action once.
+- Promotion must reuse the mapped surface without a second open animation.
+- Peek must never capture the full output.
 
 ## Panel placement and outputs
 
-The desktop profile uses one combined panel. The panel must contain maps for all connected outputs.
+`popup.outputs` controls which output maps appear in a popup.
+`popup.surface_mode` controls whether the popup stays on its initial output.
+`popup.position` and placement rules control the popup anchor and margin.
 
-| Setting | Desktop value | Required behavior |
-| --- | --- | --- |
-| `popup.outputs` | `"combined"` | Put all output maps in one panel |
-| `popup.surface_mode` | `"fixed"` | Keep panel on its spawn output |
-| `popup.position` | `"anchored"` | Use output placement rules |
-| Horizontal anchor | `"center"` | Center panel on spawn output |
-| Vertical anchor | `"top"` | Pin panel to top edge |
+The daemon must add a popup surface when an output connects after startup.
+An absent output must not create visible empty content.
+`popup.surface_mode = "fixed"` must keep the panel on its initial output.
+`popup.surface_mode = "follow_active"` must follow focus after `follow_delay_ms`.
 
-The panel must support `HDMI-A-1`, `HDMI-A-2`, and `Virtual-1`.
-An output connected after daemon startup must receive a popup surface without a restart.
-An absent virtual output must not create visible empty content.
-
-Set `popup.surface_mode = "fixed"` to keep the panel on its initial output.
-Set `popup.surface_mode = "follow_active"` to follow active-output focus after `follow_delay_ms`.
-
-Workspaces must run from top to bottom. Windows must follow Niri column order from left to right.
+Workspaces must run from top to bottom in each output map.
+Windows must follow Niri column order from left to right.
 Panel size must shrink to visible content and stop at configured maximum sizes.
 
 ## Pointer behavior
 
-Manual mode must advertise only the visible panel as its pointer input region.
-Armed peek mode must use the same region and no more.
-Windows, bars, and docks outside the panel must receive normal pointer motion.
+Manual mode must advertise only required input regions.
+Armed peek mode must advertise only the visible panel as its input region.
+Windows, bars, and docks outside those regions must receive normal pointer input.
 Dock magnification and drag operations must work while the popup is open.
 
-The desktop profile uses these settings:
-
-```toml
-close_on_external_focus_change = false
-close_on_outside_click = true
-replay_outside_click = true
-```
-
-External focus changes must keep a manual popup open.
-An outside click must close a manual popup without confirmation. When virtual pointer support exists, the click must reach the surface below.
-
-Full-output click capture is required while the manual popup is open. Click replay cannot reproduce hover or drag motion.
+`close_on_external_focus_change` controls external focus handling.
+`close_on_outside_click` controls whether an outside click closes manual mode.
+`replay_outside_click` controls whether the daemon replays that click.
+Click replay cannot reproduce hover or drag motion.
 
 ## Popup lifetime
 
-| Action | Desktop result | Setting |
-| --- | --- | --- |
-| Click a window icon | Focus window and close | `close_on_window_click = true` |
-| Click a workspace | Focus workspace and keep open | `close_on_workspace_click = false` |
-| Complete drag and drop | Move window and keep open | `close_on_drop = false` |
-| Click outside | Close and replay the click when available | `close_on_outside_click = true` |
-| Press `Escape` | Close | `close_on_escape = true` |
-| Press `Mod+Z` while open | Close | Toggle command |
+Behavior settings must independently control closure after these actions:
+
+- Focus a window.
+- Focus a workspace.
+- Complete drag and drop.
+- Click outside the popup.
+- Press `Escape`.
+- Run the toggle command.
+
+An action that keeps the popup open must preserve valid navigation state.
+An action that closes the popup must release all input focus and capture surfaces.
 
 ## Keyboard navigation
 
-The desktop profile uses `navigation = "deferred"`.
-Arrow keys must move only the popup selection until confirmation.
+In `navigation = "deferred"` mode, arrow keys must change only popup selection.
 Enter must apply the selected window or workspace action.
-The selection must remember its position on each visited workspace during one session.
-Closing the popup must clear the staged selection.
+Selection must remember its position on each visited workspace during one session.
+Closing the popup must clear staged selection.
 
-The optional `live` mode may move Niri focus on every navigation step.
-XMB-generated focus changes must not close the popup as external changes.
-External Niri hotkeys must not change manual mode into hidden or peek mode.
+In `navigation = "live"` mode, each navigation step may move Niri focus.
+XMB-generated focus changes must not count as external changes.
+External Niri keybinds must not change manual mode into hidden or peek mode.
 
 ## Drag and drop
 
 Pointer travel must exceed `drag_threshold` before a press becomes a drag.
-The desktop value is `7.0` logical pixels.
+Drop behavior settings must control tiled, floating, focus, and cursor results.
+The result must match those settings for empty workspaces and window targets.
 
-Window drops must preserve tiled mode unless a floating behavior setting requests another result.
-The desktop profile uses these values:
-
-```toml
-empty_drop_floats = false
-floating_drop_tiles = false
-focus_after_drop = false
-snap_cursor_after_drop = false
-```
-
-A tiled window dropped on empty workspace space must remain tiled.
-A floating window dropped on a window or workspace must remain floating.
-A completed drop must preserve the user's current focus.
-The pointer must remain at the release location.
-
-When column joining is disabled, a window-icon target has two zones.
-The left half inserts before the target. The right half inserts after the target.
-The center must not create a joined Niri column.
+When column joining is disabled, a window target must have two zones.
+The left zone inserts before the target. The right zone inserts after the target.
+No target zone may create a joined Niri column in this mode.
 
 ## Noctalia taskbar integration
 
-Only HDMI-A-2 must show the desktop top bar.
-The bar must contain independent taskbar widgets for these output targets:
+Each taskbar widget must target one Niri output.
+Each widget must route focus, workspace cycling, and drag through `niri-xmb`.
+Taskbar focus changes must not raise peek unless the event policy requests it.
+Wheel input must start from the workspace row under the pointer.
+A wheel gesture must keep a stable target until the pointer changes rows.
+Queued requests must use the previous queued target until Niri updates state.
+Ratchet input must move one workspace per complete 120-unit step.
+Free-spin input must use the configured repeat limit.
 
-| Widget | Target output |
-| --- | --- |
-| `taskbar-hdmi1` | `HDMI-A-1` |
-| `taskbar-hdmi2` | `HDMI-A-2` |
-| `taskbar-virtual1` | `Virtual-1` |
+A configured middle-click command must replace native window close.
+An omitted or empty command must keep native window close.
+Middle-click behavior must apply to grouped and running pinned icons.
+An output-specific widget must remain empty when its output is absent.
 
-Each taskbar widget must call `niri-xmb drop` for window drag and drop.
-Each taskbar widget must route window and workspace focus through `niri-xmb`.
-Taskbar focus changes must not raise peek. Niri keybind focus changes can raise peek.
-Wheel input must start from the workspace row under the pointer on the bar's output.
-Each wheel request must keep that row as its gesture target until the pointer moves to another workspace row.
-Each later request in the same gesture must start from the previous queued target until Niri updates its workspace state.
-Ratchet wheel input must move one workspace per complete 120-unit wheel step.
-Free-spin wheel input must use the bar `scroll_repeat_ms` limit.
-Each desktop taskbar widget must set `middle_click_command` to `niri-xmb toggle`.
-A configured middle-click command must replace the native window-close action.
-An omitted or empty command must keep the native window-close action.
-Middle-click applies to window icons, including grouped and running pinned icons.
-The `Virtual-1` widget must remain empty when the output is absent.
-
-Noctalia dock item reordering applies only to pinned applications.
-The user must hold a pinned icon for 300 milliseconds before moving it.
+Noctalia dock reordering must apply only to pinned applications.
+The configured hold delay must expire before a pinned icon moves.
 
 ## Urgency indicators
 
-Urgency means that a Niri window requests attention. It does not mean normal focus or selection.
+Urgency means that a Niri window requests attention.
+It does not mean normal focus or selection.
 
 `style.urgent_indicator` supports these presets:
 
@@ -177,14 +144,11 @@ Urgency means that a Niri window requests attention. It does not mean normal foc
 | `"none"` | Hide window urgency indicator |
 | `"ring"` | Draw an outline around the icon |
 | `"glow"` | Draw a soft radial background glow |
-| `"badge"` | Draw a dot at the icon's top-right corner |
+| `"badge"` | Draw a dot at the icon top-right corner |
 
-The desktop profile uses `urgent_indicator = "badge"`.
-The current badge radius is `3.5` logical pixels.
-The theme field `style.urgent` controls indicator color.
-
+The theme field `style.urgent` must control indicator color.
 The indicator must remain visible in Niri overview mode.
-The indicator must follow Niri window urgency changes without a daemon restart.
+The indicator must follow Niri urgency changes without a daemon restart.
 
 Use these commands to test urgency:
 
@@ -198,18 +162,14 @@ Niri does not set urgency on the focused window. Select a non-focused window ID.
 
 ## Visual treatment
 
-Manual panels must draw their border in `style.accent` while XMB owns keyboard input.
-An armed peek panel must draw its border in `style.accent` after it claims pointer input.
-A normal peek panel must draw its border in `style.border`.
-The fixed focal icon, scale, and opacity indicate selection.
+Manual panels must use `style.accent` while XMB owns keyboard input.
+Armed peek panels must use `style.accent` after they claim pointer input.
+Normal peek panels must use `style.border`.
+The fixed focal icon, scale, and opacity must indicate selection.
 
-When `popup.show_titles` is true, each icon in a vertical window stack must show its window title on the right.
-The title must fit inside the canvas. The selected-title position below an icon applies only outside vertical stacks.
-
-The desktop profile uses a translucent warm glass theme.
-The panel gradient should remain between approximately 66 and 72 percent opacity.
-Panel borders and shadows should remain softer than application icons.
-Application icons, selected titles, accents, and urgency badges must remain legible.
+When `popup.show_titles` is true, a vertical stack must show titles on the right.
+Each title must fit inside the canvas.
+The below-icon title position applies only outside vertical stacks.
 Transparency must not change pointer input regions or popup lifetime behavior.
 
 ## Configuration resolution
@@ -218,28 +178,11 @@ An omitted field must use its Rust `Default` value.
 An omitted section must use all defaults for that section.
 A missing configuration file must use the complete built-in configuration.
 
-An empty value is not an omitted value. Invalid TOML, a wrong type, or an unknown preset must return an error.
-`niri-xmb restart` must validate the configuration before it stops the active daemon.
-If validation fails, the active daemon must continue with its previous configuration.
+An empty value is not an omitted value.
+Invalid TOML, a wrong type, or an unknown preset must return an error.
+`niri-xmb restart` must validate configuration before it stops the active daemon.
+The active daemon must keep its current configuration after validation failure.
 
 A referenced theme may contain a partial `[style]` table.
 Theme fields must override matching fields from the main configuration.
-Fields absent from the theme must keep main configuration or built-in values.
-
-## Verification checklist
-
-1. Run `niri-xmb restart` and confirm `config valid`.
-2. Open the popup with `Mod+Z`.
-3. Move the pointer over the Noctalia dock and confirm magnification works.
-4. Click another window and confirm the click works and the popup closes.
-5. Drag a window icon between workspaces and confirm tiled mode remains active.
-6. Confirm the pointer and focus stay at the interaction source after the drop.
-7. Connect `Virtual-1` and confirm its map and taskbar widget appear.
-8. Set urgency on a non-focused window and confirm the configured indicator appears.
-9. With `peek.pointer_promote = true`, navigate with a keybind, move the pointer onto the
-   overlay, and confirm it stops counting down and takes the accent border.
-10. Move the pointer off the overlay and confirm it leaves shortly afterwards.
-11. Click a window icon on an armed overlay and confirm the click focuses that window
-    without a second click and without a reopen animation.
-12. Navigate with a keybind while the pointer rests on the armed overlay and confirm the
-    keybind still reaches Niri.
+Absent theme fields must keep main configuration or built-in values.

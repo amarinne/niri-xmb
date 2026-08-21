@@ -54,24 +54,56 @@ niri-xmb daemon
 niri-xmb toggle
 niri-xmb restart
 niri-xmb status
+niri-xmb subscribe
 niri-xmb print-default-config
 ```
 
+`subscribe` streams daemon state as newline-delimited JSON frames until
+interrupted, reconnecting with bounded backoff while the daemon restarts.
+
 The default configuration path is `~/.config/niri-xmb/config.toml`.
+
+## Diagnostics
+
+Restart with raised verbosity to debug drops. `-v` enables debug logs, `-vv`
+enables trace logs including full drop plans; a set `RUST_LOG` always wins:
+
+```sh
+niri-xmb -v restart
+niri-xmb -vv restart
+```
+
+Verbosity is carried through `restart`, so the replacement daemon keeps the
+selected level. Follow the daemon's drop lifecycle through the Noctalia log:
+
+```sh
+tail -F ~/.cache/noctalia/noctalia.log | rg --line-buffered niri-xmb
+```
+
+Inspect the last drop transaction — request id, completed and failed steps,
+generations, and outcome — without raising verbosity:
+
+```sh
+niri-xmb status | jq .drop_transaction
+```
+
+Rejected drops always answer with their exact reason, for example
+`error: drop rejected: target window changed workspace`. Logs contain window
+and workspace ids only, never window titles.
 
 ## Repository layout
 
 ```text
 crates/niri-xmb/       Rust daemon, CLI, panel, model, and icon code
-plugins/noctalia-v4/   Legacy Noctalia integration
 ports/noctalia-v5/     Maintained Noctalia integration
+archive/noctalia-v4/   Reference copy of the retired Quickshell integration
 config/                Example configuration
 themes/                Optional panel themes
-UX_SPEC.md             Interaction specification
+UX_SPEC.md             Product interaction specification
 niri-xmb.service       Optional user-service unit
 ```
 
 ## More information
 
-- See [UX_SPEC.md](UX_SPEC.md) for interaction rules.
+- See [UX_SPEC.md](UX_SPEC.md) for product interaction rules.
 - See [ports/noctalia-v5/README.md](ports/noctalia-v5/README.md) for Noctalia v5 setup.

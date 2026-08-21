@@ -1,4 +1,5 @@
-# Merge a theme file's [style] table over the one below, key by key. See
+# Merge a theme file's [style] table over the one below, key by key. A theme
+# must contain only [style]. Unknown style keys cause an error. See
 # themes/dank.toml and themes/noctalia.toml for examples.
 # theme = "~/.config/niri-xmb/themes/dank.toml"
 
@@ -9,10 +10,10 @@ bars_enabled = true # false runs only the popup/peek daemon
 output = "HDMI-A-1"          # exact Niri connector name
 edge = "top"                 # "top", "bottom", "left", or "right"
 align = "center"             # "start", "center", or "end" along that edge
-width = 1000                 # bar length in logical pixels
-height = 42                  # bar thickness in logical pixels
-margin = 56                  # distance from the selected output edge
-offset = 0                   # shift along the edge from the aligned position
+width = 1000                 # 1-8192 px horizontal; 1-512 px vertical
+height = 42                  # 1-512 px horizontal; 1-8192 px vertical
+margin = 56                  # edge distance, 0-8192 logical pixels
+offset = 0                   # aligned shift, -8192 to 8192 logical pixels
 allow_column_join = false    # center drops join a Niri column when true
 show_workspace_labels = false # show workspace names/numbers beside icons
 hide_empty_workspaces = false # omit empty workspaces when true
@@ -21,7 +22,7 @@ show_active_indicator = true # mark the active window in each workspace
 scroll_to_switch = true      # one ratchet click changes one workspace
 scroll_wrap = true           # wheel navigation wraps at the ends
 scroll_reverse = false       # reverse the wheel direction
-scroll_repeat_ms = 75        # free-spin limit in milliseconds
+scroll_repeat_ms = 75        # free-spin limit, 0-5000 milliseconds
 
 # Additional bars use the same parameters and can differ per monitor. A
 # portrait output can opt into the center join zone independently.
@@ -46,10 +47,12 @@ scroll_repeat_ms = 75
 [popup]
 outputs = "combined" # "focused", "all", or "combined"
 surface_mode = "follow_active" # "fixed", "follow_active", or "mirror"
-follow_delay_ms = 180 # delay before follow_active moves to another output
+follow_delay_ms = 180 # follow delay, 0-60000 milliseconds
 position = "anchored" # "anchored", "cursor", "center", or "fixed"
 # Popup spatial values accept logical-pixel numbers or percentage strings.
 # Percentages resolve against each host monitor's logical width or height.
+# Sizes use 0.1%-100% or 1-8192 px. Fixed positions use -100%-100% or
+# -8192-8192 px.
 width = 1600       # maximum panel width; for example "80%"
 height = 850       # maximum panel height; for example "70%"
 fixed_x = 80       # X origin for position = "fixed"; for example "10%"
@@ -69,7 +72,7 @@ show_titles = false # selected app name, with window-title fallback
 output = "HDMI-A-1" # exact Niri connector name
 x = "right"  # "left", "center", "right"
 y = "center" # "top", "center", "bottom"
-margin = 48.0 # edge gap in logical pixels, or e.g. "3%"
+margin = 48.0 # edge gap, 0-8192 px or 0%-100%
 
 [[popup.placements]]
 output = "HDMI-A-2"
@@ -80,7 +83,7 @@ margin = 48.0
 # Passive overlay while navigating Niri with its own keybinds. Takes no input.
 [peek]
 enabled = false         # automatically show on matching Niri focus changes
-duration_ms = 1200      # linger time; restarts while navigation continues
+duration_ms = 1200      # linger time, 0-60000 milliseconds
 # Peek only follows Niri focused-workspace changes. Window focus, dialogs, and
 # pointer crossings do not show it.
 # The overlay is click-through by default. With pointer_promote the panel
@@ -88,14 +91,14 @@ duration_ms = 1200      # linger time; restarts while navigation continues
 # open, and clicking it becomes a full manual session in place. The keyboard is
 # never taken, so navigation keybinds keep working while the pointer rests on it.
 pointer_promote = false # let the pointer grab the overlay instead of passing through
-arm_grace_ms = 150      # stay click-through this long so an in-flight click still passes
-demote_ms = 400         # linger this long after the pointer moves off again
+arm_grace_ms = 150      # click-through grace, 0-60000 milliseconds
+demote_ms = 400         # pointer-leave linger, 0-60000 milliseconds
 
 [behavior]
 # "deferred": arrows stage a selection, Enter or a click applies it.
 # "live":     arrows move Niri's focus immediately, alt-tab style.
 navigation = "deferred"
-drag_threshold = 7.0         # pointer travel before a press becomes a drag
+drag_threshold = 7.0         # drag distance, 0-8192 logical pixels
 empty_drop_floats = false    # drop on empty map space creates floating windows
 floating_drop_tiles = true   # dropping a floating window on icons tiles it
 focus_after_drop = false     # focus the moved window after rearranging
@@ -110,12 +113,14 @@ close_on_escape = true       # Escape closes the popup
 
 [animation]
 enabled = true        # false applies every visual change immediately
-panel_ms = 140.0    # panel open and close
-emphasis_ms = 180.0 # selection and hover emphasis
-scroll_ms = 165.0   # canvas scrolling under the focal point
-open_scale = 0.94   # scale the panel grows from; 1.0 disables the scale
+panel_ms = 140.0    # panel transition, 0-60000 milliseconds
+emphasis_ms = 180.0 # emphasis transition, 0-60000 milliseconds
+scroll_ms = 165.0   # scroll transition, 0-60000 milliseconds
+open_scale = 0.94   # opening scale, 0.1-2.0; 1.0 disables scale
 
 # Primary popup colours and proportions. Colours are #RRGGBB or #AARRGGBB.
+# Style lengths use 0-2048 px. Font sizes use 1-512 px. Icon sizes use
+# 1-1024 px. Alpha values use 0.0-1.0.
 [style]
 background = "#f21b2530"       # popup gradient, top stop
 background_end = "#f20d1117"   # popup gradient, bottom stop

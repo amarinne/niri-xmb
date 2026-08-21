@@ -161,22 +161,35 @@ impl TextRenderer {
             self.layout_cache.insert(lkey.clone(), entry);
         }
 
-        let (gl_list, advance) = {
-            let e = &self.layout_cache[&lkey];
-            (e.glyphs.clone(), e.advance)
-        };
-
-        let pixels = pixmap.pixels_mut();
-        for (gk, rel_x, rel_y) in &gl_list {
-            let cached = self.glyph_cache.entry(gk.clone()).or_insert_with(|| {
-                let fi = gk.0 as usize;
-                let (metrics, bitmap) = self.fonts[fi].rasterize(gk.1, size);
+        // Populate missing bitmaps before borrowing the cached layout for the
+        // draw pass. This keeps the hot path on borrowed layout data instead
+        // of cloning every positioned glyph for every animated frame.
+        let missing = self.layout_cache[&lkey]
+            .glyphs
+            .iter()
+            .map(|(key, _, _)| key)
+            .filter(|key| !self.glyph_cache.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in missing {
+            let fi = key.0 as usize;
+            let (metrics, bitmap) = self.fonts[fi].rasterize(key.1, size);
+            self.glyph_cache.insert(
+                key,
                 CachedGlyph {
                     width: metrics.width,
                     height: metrics.height,
                     bitmap,
-                }
-            });
+                },
+            );
+        }
+
+        let entry = &self.layout_cache[&lkey];
+        let advance = entry.advance;
+
+        let pixels = pixmap.pixels_mut();
+        for (gk, rel_x, rel_y) in &entry.glyphs {
+            let cached = &self.glyph_cache[gk];
             if cached.width == 0 || cached.height == 0 {
                 continue;
             }

@@ -9,8 +9,8 @@
       "description": "Niri output whose workspaces this widget displays. Empty uses the bar output."
     },
     "backend_command": {
-      "label": "Backend command",
-      "description": "niri-xmb executable or command prefix used for snapshots and actions."
+      "label": "Backend executable",
+      "description": "niri-xmb executable name or path used for snapshots and actions."
     },
     "poll_interval_ms": {
       "label": "Refresh interval",
