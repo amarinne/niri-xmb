@@ -26,6 +26,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libxkbcommon-dev
       - name: Test
         run: cargo test --locked --workspace
       - name: Package
