@@ -1,94 +1,101 @@
 # niri-xmb
 
-`niri-xmb` is a workspace navigator and bar integration for [Niri](https://github.com/YaLTeR/niri).
-It keeps Niri state in a persistent daemon, so the panel opens without a new startup delay.
+Workspace navigator and bar integration for [Niri](https://github.com/YaLTeR/niri).
 
-The project supports workspace and window navigation, drag and drop, passive workspace peek,
-themes, window urgency, and Noctalia taskbar integration.
+Features:
 
-## Requirements
+- workspace and window navigation
+- drag and drop between workspaces and columns
+- per-output workspace bars
+- cursor-positioned workspace navigator
+- passive workspace peek
+- themes and window urgency
+- Noctalia taskbar integration
+- persistent daemon for fast panel startup
 
-- A Linux Wayland session that runs Niri.
-- Niri IPC access from the process that runs `niri-xmb`.
+## Installation
 
-A Rust toolchain that supports edition 2024 is only required for a source build.
+Requires Linux, Niri, and an `x86_64` or `aarch64` system.
 
-## Quick setup
-
-Want to try it? Run this:
+Run:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | sh
 ```
 
-That command works for both a first install and an update. It downloads the
-right build for your computer, checks the download, and puts `niri-xmb` in
-`~/.local/bin`. It also adds the startup line to your Niri config. Reload Niri
-when it finishes.
+The script:
 
-Your existing XMB config and themes stay untouched.
+- downloads and verifies the latest release
+- installs `niri-xmb` in `~/.local/bin`
+- installs the config example and themes in `~/.config/niri-xmb`
+- adds `niri-xmb` to the Niri startup config
+- keeps existing config and theme files
 
-Run `niri-xmb toggle` to open the navigator. The default settings detect all
-connected outputs, so you do not need a config file to get started.
+Reload Niri, then run `niri-xmb toggle` to open the navigator.
 
-If you want to customize it later, copy the example:
+No config file is required. The default config detects connected outputs.
+
+For custom settings, copy the example:
 
 ```sh
 cp ~/.config/niri-xmb/config.toml.example ~/.config/niri-xmb/config.toml
 ```
 
-You can also create that file during setup. The example uses placeholder output
-names, so change them before you reload Niri:
+Edit the output names in the copied file. To copy the example during setup:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | \
-  sh -s -- install --init-config
+  sh -s -- --init-config
 ```
 
-To remove niri-xmb:
+## Updating
+
+Run:
+
+```sh
+niri-xmb update
+```
+
+This downloads the latest verified release, replaces the binary, and restarts
+the daemon. Use `niri-xmb update --no-restart` to restart it later.
+
+The installation command also updates an existing install.
+
+## Uninstalling
+
+Run:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | \
   sh -s -- uninstall
 ```
 
-This keeps your config in `~/.config/niri-xmb`. Add `--purge` if you want to
-remove the config too.
+This keeps `~/.config/niri-xmb`. Add `--purge` to remove the config and themes.
 
-## Build
+## Building from source
 
-Build an optimized binary:
+Requires a Rust toolchain with edition 2024 support and the xkbcommon development
+package for your distribution.
+
+Build and install:
 
 ```sh
 cargo build --release -p niri-xmb
-```
-
-The binary is `target/release/niri-xmb`.
-
-## Install
-
-Install the binary in a directory on your `PATH`:
-
-```sh
 install -Dm755 target/release/niri-xmb ~/.local/bin/niri-xmb
 ```
 
-Create a user configuration only when you need custom settings. Review output
-names, placement, and theme settings before you use it:
+Add this line to the Niri config:
+
+```kdl
+spawn-at-startup "niri-xmb" "daemon"
+```
+
+Optional config:
 
 ```sh
 mkdir -p ~/.config/niri-xmb
 cp config/niri-xmb.toml.example ~/.config/niri-xmb/config.toml
 ```
-
-Start the daemon from the Niri session. The daemon needs `NIRI_SOCKET`, which Niri provides to
-commands that it starts:
-
-```sh
-niri-xmb daemon
-```
-
-Use `niri-xmb restart` only from an environment that has `NIRI_SOCKET`.
 
 ## Commands
 
@@ -102,15 +109,13 @@ niri-xmb subscribe
 niri-xmb print-default-config
 ```
 
-`niri-xmb update` downloads the latest setup script and verified release
-archive. It replaces the current binary and restarts the daemon when
-`NIRI_SOCKET` is available. Use `--version TAG` to install one release, or use
-`--no-restart` to defer the daemon restart.
-
 `subscribe` streams daemon state as newline-delimited JSON frames until
 interrupted, reconnecting with bounded backoff while the daemon restarts.
 
 The default configuration path is `~/.config/niri-xmb/config.toml`.
+
+`restart` and `update` need `NIRI_SOCKET` to restart the daemon without a Niri
+reload.
 
 ## Diagnostics
 
