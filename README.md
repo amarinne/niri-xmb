@@ -52,7 +52,11 @@ niri-xmb update
 ```
 
 This downloads the latest verified release, replaces the binary, and restarts
-the daemon. Use `niri-xmb update --no-restart` to restart it later.
+the daemon. If a new version exists, the command shows both versions and asks
+for confirmation. If the versions match, it exits without downloading anything.
+
+Use `niri-xmb update --yes` to skip the confirmation. Use
+`niri-xmb update --no-restart` to restart the daemon later.
 
 The installation command also updates an existing install.
 

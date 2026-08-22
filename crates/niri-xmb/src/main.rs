@@ -32,6 +32,7 @@ use selection::{
     selected_workspace, visual as selection_visual, wrap_index,
 };
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
@@ -151,6 +152,9 @@ enum Command {
         /// Install the update without restarting the daemon.
         #[arg(long)]
         no_restart: bool,
+        /// Install without asking for confirmation.
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Print the fully commented configuration template.
     PrintDefaultConfig,
@@ -509,9 +513,11 @@ fn main() -> Result<()> {
         Command::Update {
             version,
             no_restart,
+            yes,
         } => update_binary(
             version.as_deref(),
             no_restart,
+            yes,
             cli.config.unwrap_or_else(Config::default_path),
             cli.verbose,
         ),
@@ -615,9 +621,39 @@ fn restart_daemon(config_path: PathBuf, verbosity: u8) -> Result<()> {
 fn update_binary(
     version: Option<&str>,
     no_restart: bool,
+    yes: bool,
     config_path: PathBuf,
     verbosity: u8,
 ) -> Result<()> {
+    let target_version = match version {
+        Some(version) => version.to_string(),
+        None => latest_release_version()?,
+    };
+    let current_version = env!("CARGO_PKG_VERSION");
+    if versions_match(current_version, &target_version) {
+        println!("niri-xmb {current_version} is already up to date");
+        return Ok(());
+    }
+
+    println!(
+        "New niri-xmb version available: {current_version} -> {}",
+        normalized_version(&target_version)
+    );
+    if !yes {
+        print!("Install update? [y/N] ");
+        io::stdout()
+            .flush()
+            .context("failed to show update prompt")?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .context("failed to read update confirmation")?;
+        if !confirmation_is_yes(&answer) {
+            println!("update canceled");
+            return Ok(());
+        }
+    }
+
     let executable = std::env::current_exe().context("failed to locate niri-xmb executable")?;
     let install_dir = executable
         .parent()
@@ -650,9 +686,7 @@ fn update_binary(
         .args(["install", "--install-dir"])
         .arg(install_dir)
         .args(["--no-niri-config", "--no-service"]);
-    if let Some(version) = version {
-        setup.args(["--version", version]);
-    }
+    setup.args(["--version", &target_version]);
     let install = setup.status();
     let _ = std::fs::remove_file(&setup_path);
     let install = install.context("failed to run update setup script")?;
@@ -683,6 +717,56 @@ fn update_binary(
         anyhow::bail!("updated binary could not restart the daemon");
     }
     Ok(())
+}
+
+fn latest_release_version() -> Result<String> {
+    if let Ok(version) = std::env::var("NIRI_XMB_LATEST_VERSION") {
+        let version = version.trim();
+        if !version.is_empty() {
+            return Ok(version.to_string());
+        }
+    }
+
+    let output = ProcessCommand::new("curl")
+        .args([
+            "--fail",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--output",
+            "/dev/null",
+            "--write-out",
+            "%{url_effective}",
+            "https://github.com/amarinne/niri-xmb/releases/latest",
+        ])
+        .output()
+        .context("failed to run curl; install curl before updating")?;
+    if !output.status.success() {
+        anyhow::bail!("failed to check the latest niri-xmb release");
+    }
+    let url = String::from_utf8(output.stdout).context("latest release URL was not UTF-8")?;
+    let version = url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|version| !version.is_empty())
+        .context("latest release URL had no version tag")?;
+    Ok(version.to_string())
+}
+
+fn normalized_version(version: &str) -> &str {
+    version.trim().strip_prefix('v').unwrap_or(version.trim())
+}
+
+fn versions_match(current: &str, target: &str) -> bool {
+    normalized_version(current) == normalized_version(target)
+}
+
+fn confirmation_is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Wait for the control socket to enter the requested state. When waiting for
@@ -2434,17 +2518,39 @@ mod tests {
     }
 
     #[test]
-    fn update_parses_version_and_restart_policy() {
-        let cli =
-            Cli::try_parse_from(["niri-xmb", "update", "--version", "v0.2.0", "--no-restart"])
-                .unwrap();
+    fn update_parses_version_restart_policy_and_confirmation() {
+        let cli = Cli::try_parse_from([
+            "niri-xmb",
+            "update",
+            "--version",
+            "v0.2.0",
+            "--no-restart",
+            "--yes",
+        ])
+        .unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Update {
                 version: Some(ref version),
                 no_restart: true,
+                yes: true,
             }) if version == "v0.2.0"
         ));
+    }
+
+    #[test]
+    fn update_version_comparison_accepts_v_prefix() {
+        assert!(versions_match("0.1.2", "v0.1.2"));
+        assert!(versions_match("0.1.2", "0.1.2"));
+        assert!(!versions_match("0.1.1", "v0.1.2"));
+    }
+
+    #[test]
+    fn update_confirmation_accepts_only_explicit_yes() {
+        assert!(confirmation_is_yes("y"));
+        assert!(confirmation_is_yes(" YES \n"));
+        assert!(!confirmation_is_yes(""));
+        assert!(!confirmation_is_yes("no"));
     }
 
     #[test]
