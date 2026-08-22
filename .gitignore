@@ -14,6 +14,7 @@ PKGBUILD
 
 # Package build directories
 *.lock
+!Cargo.lock
 /src/
 /pkg/
 

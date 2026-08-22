@@ -143,6 +143,15 @@ enum Command {
     Quit,
     /// Validate the config, gracefully stop the daemon, and relaunch through Niri.
     Restart,
+    /// Download, verify, and install a prebuilt release.
+    Update {
+        /// Install this release tag instead of the latest release.
+        #[arg(long)]
+        version: Option<String>,
+        /// Install the update without restarting the daemon.
+        #[arg(long)]
+        no_restart: bool,
+    },
     /// Print the fully commented configuration template.
     PrintDefaultConfig,
     /// Stream daemon state as NDJSON frames until interrupted.
@@ -497,6 +506,15 @@ fn main() -> Result<()> {
         Command::Restart => {
             restart_daemon(cli.config.unwrap_or_else(Config::default_path), cli.verbose)
         }
+        Command::Update {
+            version,
+            no_restart,
+        } => update_binary(
+            version.as_deref(),
+            no_restart,
+            cli.config.unwrap_or_else(Config::default_path),
+            cli.verbose,
+        ),
         Command::Subscribe => {
             subscribe::run_subscribe_client();
         }
@@ -591,6 +609,79 @@ fn restart_daemon(config_path: PathBuf, verbosity: u8) -> Result<()> {
     };
     println!("daemon started");
     println!("{}", status.trim());
+    Ok(())
+}
+
+fn update_binary(
+    version: Option<&str>,
+    no_restart: bool,
+    config_path: PathBuf,
+    verbosity: u8,
+) -> Result<()> {
+    let executable = std::env::current_exe().context("failed to locate niri-xmb executable")?;
+    let install_dir = executable
+        .parent()
+        .context("niri-xmb executable has no parent directory")?;
+    let custom_setup_url = std::env::var("NIRI_XMB_SETUP_URL").ok();
+    let setup_url = custom_setup_url
+        .as_deref()
+        .unwrap_or("https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh");
+    let setup_path = std::env::temp_dir().join(format!("niri-xmb-setup-{}.sh", std::process::id()));
+
+    let mut curl = ProcessCommand::new("curl");
+    curl.args(["--fail", "--location", "--silent", "--show-error"]);
+    if custom_setup_url.is_none() {
+        curl.args(["--proto", "=https", "--tlsv1.2"]);
+    }
+    let download = curl
+        .arg("--output")
+        .arg(&setup_path)
+        .arg(setup_url)
+        .status()
+        .context("failed to run curl; install curl before updating")?;
+    if !download.success() {
+        let _ = std::fs::remove_file(&setup_path);
+        anyhow::bail!("failed to download update setup script");
+    }
+
+    let mut setup = ProcessCommand::new("sh");
+    setup
+        .arg(&setup_path)
+        .args(["install", "--install-dir"])
+        .arg(install_dir)
+        .args(["--no-niri-config", "--no-service"]);
+    if let Some(version) = version {
+        setup.args(["--version", version]);
+    }
+    let install = setup.status();
+    let _ = std::fs::remove_file(&setup_path);
+    let install = install.context("failed to run update setup script")?;
+    if !install.success() {
+        anyhow::bail!("update setup script failed");
+    }
+
+    println!("update installed: {}", executable.display());
+    if no_restart {
+        println!("daemon restart skipped");
+        return Ok(());
+    }
+    if std::env::var_os("NIRI_SOCKET").is_none() {
+        println!("NIRI_SOCKET is not set; reload Niri to run the new build");
+        return Ok(());
+    }
+
+    let mut restart = ProcessCommand::new(&executable);
+    restart.arg("--config").arg(config_path);
+    for _ in 0..verbosity.min(2) {
+        restart.arg("-v");
+    }
+    let status = restart
+        .arg("restart")
+        .status()
+        .context("failed to restart the updated daemon")?;
+    if !status.success() {
+        anyhow::bail!("updated binary could not restart the daemon");
+    }
     Ok(())
 }
 
@@ -2340,6 +2431,20 @@ mod tests {
     fn restart_is_available_as_a_cli_subcommand() {
         let cli = Cli::try_parse_from(["niri-xmb", "restart"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Restart)));
+    }
+
+    #[test]
+    fn update_parses_version_and_restart_policy() {
+        let cli =
+            Cli::try_parse_from(["niri-xmb", "update", "--version", "v0.2.0", "--no-restart"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                version: Some(ref version),
+                no_restart: true,
+            }) if version == "v0.2.0"
+        ));
     }
 
     #[test]

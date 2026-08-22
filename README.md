@@ -9,8 +9,48 @@ themes, window urgency, and Noctalia taskbar integration.
 ## Requirements
 
 - A Linux Wayland session that runs Niri.
-- A Rust toolchain that supports edition 2024.
 - Niri IPC access from the process that runs `niri-xmb`.
+
+A Rust toolchain that supports edition 2024 is only required for a source build.
+
+## Quick setup
+
+Install the latest prebuilt release for Linux on `x86_64` or `aarch64`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | sh
+```
+
+The script verifies the release checksum. It installs the binary and examples.
+It also adds a marked `spawn-at-startup` block to the Niri configuration. It does
+not replace an existing XMB configuration or theme. Reload Niri after setup.
+
+Run `niri-xmb toggle` to open the navigator. The default settings detect all
+connected outputs. Copy the example only when you want to change the settings:
+
+```sh
+cp ~/.config/niri-xmb/config.toml.example ~/.config/niri-xmb/config.toml
+```
+
+Use `--init-config` to create this file during setup. The example contains
+explicit output names, so edit those names before you reload Niri:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | \
+  sh -s -- install --init-config
+```
+
+Remove the binary, user service, and managed Niri block:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | \
+  sh -s -- uninstall
+```
+
+Uninstall keeps `~/.config/niri-xmb`. Add `--purge` to remove that directory.
 
 ## Build
 
@@ -30,8 +70,8 @@ Install the binary in a directory on your `PATH`:
 install -Dm755 target/release/niri-xmb ~/.local/bin/niri-xmb
 ```
 
-Create a user configuration from the example. Review output names, placement, and theme settings
-before you use it:
+Create a user configuration only when you need custom settings. Review output
+names, placement, and theme settings before you use it:
 
 ```sh
 mkdir -p ~/.config/niri-xmb
@@ -53,10 +93,16 @@ Use `niri-xmb restart` only from an environment that has `NIRI_SOCKET`.
 niri-xmb daemon
 niri-xmb toggle
 niri-xmb restart
+niri-xmb update
 niri-xmb status
 niri-xmb subscribe
 niri-xmb print-default-config
 ```
+
+`niri-xmb update` downloads the latest setup script and verified release
+archive. It replaces the current binary and restarts the daemon when
+`NIRI_SOCKET` is available. Use `--version TAG` to install one release, or use
+`--no-restart` to defer the daemon restart.
 
 `subscribe` streams daemon state as newline-delimited JSON frames until
 interrupted, reconnecting with bounded backoff while the daemon restarts.
