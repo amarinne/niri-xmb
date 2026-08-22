@@ -12,9 +12,10 @@ NIRI_BLOCK_END='// <<< niri-xmb setup <<<'
 
 usage() {
     cat <<'EOF'
-Install or uninstall a prebuilt niri-xmb release.
+Install, update, or remove niri-xmb.
 
 Usage:
+  setup.sh [OPTIONS]
   setup.sh install [OPTIONS]
   setup.sh update [OPTIONS]
   setup.sh uninstall [--install-dir DIR] [--purge]
@@ -203,6 +204,10 @@ tar -xzf "$tmp_dir/$archive" -C "$tmp_dir/package"
 }
 
 install -d "$INSTALL_DIR" "$CONFIG_DIR/themes"
+install_result=Installed
+if [ -x "$INSTALL_DIR/niri-xmb" ]; then
+    install_result=Updated
+fi
 binary_tmp=$(mktemp "$INSTALL_DIR/.niri-xmb.XXXXXX")
 install -m 0755 "$tmp_dir/package/niri-xmb" "$binary_tmp"
 mv "$binary_tmp" "$INSTALL_DIR/niri-xmb"
@@ -275,7 +280,7 @@ if [ "$manage_niri_config" = true ]; then
     fi
 fi
 
-echo "Installed niri-xmb to $INSTALL_DIR/niri-xmb"
+echo "$install_result niri-xmb at $INSTALL_DIR/niri-xmb"
 echo "Default settings auto-detect connected Niri outputs."
 if [ "$manage_niri_config" = true ]; then
     echo "Reload Niri to start niri-xmb."

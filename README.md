@@ -15,42 +15,45 @@ A Rust toolchain that supports edition 2024 is only required for a source build.
 
 ## Quick setup
 
-Install the latest prebuilt release for Linux on `x86_64` or `aarch64`:
+Want to try it? Run this:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | sh
+curl -fsSL https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | sh
 ```
 
-The script verifies the release checksum. It installs the binary and examples.
-It also adds a marked `spawn-at-startup` block to the Niri configuration. It does
-not replace an existing XMB configuration or theme. Reload Niri after setup.
+That command works for both a first install and an update. It downloads the
+right build for your computer, checks the download, and puts `niri-xmb` in
+`~/.local/bin`. It also adds the startup line to your Niri config. Reload Niri
+when it finishes.
+
+Your existing XMB config and themes stay untouched.
 
 Run `niri-xmb toggle` to open the navigator. The default settings detect all
-connected outputs. Copy the example only when you want to change the settings:
+connected outputs, so you do not need a config file to get started.
+
+If you want to customize it later, copy the example:
 
 ```sh
 cp ~/.config/niri-xmb/config.toml.example ~/.config/niri-xmb/config.toml
 ```
 
-Use `--init-config` to create this file during setup. The example contains
-explicit output names, so edit those names before you reload Niri:
+You can also create that file during setup. The example uses placeholder output
+names, so change them before you reload Niri:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | \
+curl -fsSL https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | \
   sh -s -- install --init-config
 ```
 
-Remove the binary, user service, and managed Niri block:
+To remove niri-xmb:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | \
+curl -fsSL https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | \
   sh -s -- uninstall
 ```
 
-Uninstall keeps `~/.config/niri-xmb`. Add `--purge` to remove that directory.
+This keeps your config in `~/.config/niri-xmb`. Add `--purge` if you want to
+remove the config too.
 
 ## Build
 
