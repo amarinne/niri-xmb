@@ -15,16 +15,11 @@ Features:
 
 ## Installation
 
-Requires Linux, Niri, and an `x86_64` or `aarch64` system.
-
-Run:
-
 ```sh
 curl -fsSL https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | sh
 ```
 
-The script:
-
+The script will:
 - downloads and verifies the latest release
 - installs `niri-xmb` in `~/.local/bin`
 - installs the config example and themes in `~/.config/niri-xmb`
@@ -50,8 +45,6 @@ curl -fsSL https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | \
 
 ## Updating
 
-Run:
-
 ```sh
 niri-xmb update
 ```
@@ -62,8 +55,6 @@ the daemon. Use `niri-xmb update --no-restart` to restart it later.
 The installation command also updates an existing install.
 
 ## Uninstalling
-
-Run:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/amarinne/niri-xmb/main/setup.sh | \
@@ -140,33 +131,3 @@ generations, and outcome — without raising verbosity:
 ```sh
 niri-xmb status | jq .drop_transaction
 ```
-
-Rejected drops always answer with their exact reason, for example
-`error: drop rejected: target window changed workspace`. Logs contain window
-and workspace ids only, never window titles.
-
-### Output scale changes
-
-XMB handles live Niri output scale changes without a restart. When Wayland
-reports a new scale factor, XMB discards the old SHM buffers and damage history.
-XMB then renders and uploads one complete frame for each affected surface.
-
-This reset prevents old partial-damage data from producing horizontal stripes
-or repeated content after a scale change.
-
-## Repository layout
-
-```text
-crates/niri-xmb/       Rust daemon, CLI, panel, model, and icon code
-ports/noctalia-v5/     Maintained Noctalia integration
-archive/noctalia-v4/   Reference copy of the retired Quickshell integration
-config/                Example configuration
-themes/                Optional panel themes
-UX_SPEC.md             Product interaction specification
-niri-xmb.service       Optional user-service unit
-```
-
-## More information
-
-- See [UX_SPEC.md](UX_SPEC.md) for product interaction rules.
-- See [ports/noctalia-v5/README.md](ports/noctalia-v5/README.md) for Noctalia v5 setup.
