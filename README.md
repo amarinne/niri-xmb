@@ -2,6 +2,8 @@
 
 Workspace navigator and bar integration for [Niri](https://github.com/YaLTeR/niri).
 
+![niri-xmb workspace navigator](assets/niri-xmb.png)
+
 Features:
 
 - workspace and window navigation
