@@ -2528,12 +2528,13 @@ mod tests {
                 column: 1,
                 join: None,
             },
-            // An exact projection of a workspace that exists nowhere can never
-            // be observed, so confirmation only succeeds through the explicit
-            // paths that replace it below.
+            // A projection no live snapshot can ever satisfy: the workspace
+            // does not exist and the expectation is non-empty. (An empty
+            // expectation would be satisfied by absence, since Niri destroys
+            // emptied workspaces.)
             projection: drop_plan::DropProjection::Exact(vec![drop_plan::ProjectedWorkspace {
                 workspace_id: u64::MAX,
-                columns: Vec::new(),
+                columns: vec![vec![42]],
                 floating: Vec::new(),
             }]),
             confirmation: drop_plan::DropConfirmation::ExactProjection,

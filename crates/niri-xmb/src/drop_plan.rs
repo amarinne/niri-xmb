@@ -202,8 +202,17 @@ impl DropPlan {
                     return false;
                 };
                 expected.iter().all(|expected| {
-                    projected_workspace(snapshot, expected.workspace_id)
-                        .is_ok_and(|current| workspace_projection_matches(expected, &current))
+                    match projected_workspace(snapshot, expected.workspace_id) {
+                        Ok(current) => workspace_projection_matches(expected, &current),
+                        // Niri destroys a workspace once it empties. A drop
+                        // that takes the last window out therefore expects a
+                        // workspace the live snapshot no longer reports, and
+                        // absence satisfies an empty projection.
+                        Err(DropPlanError::MissingWorkspace) => {
+                            expected.columns.is_empty() && expected.floating.is_empty()
+                        }
+                        Err(_) => false,
+                    }
                 })
             }
             DropConfirmation::JoinedWith {
@@ -1203,6 +1212,87 @@ mod tests {
             .describe(),
             "joined with window 13 in workspace 2"
         );
+    }
+
+    #[test]
+    fn emptied_source_workspace_confirms_after_niri_destroys_it() {
+        // A drop that takes the last window off a workspace projects that
+        // workspace as empty. Niri then removes it, so confirmation must
+        // accept its absence instead of waiting for a snapshot that can
+        // never arrive.
+        let mut plan = plan_drop(
+            &snapshot(),
+            request(11, DropTarget::Workspace { workspace_id: 2 }),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.projection,
+            DropProjection::Exact(vec![
+                ProjectedWorkspace {
+                    workspace_id: 1,
+                    columns: vec![vec![12], vec![13]],
+                    floating: vec![31],
+                },
+                ProjectedWorkspace {
+                    workspace_id: 2,
+                    columns: vec![vec![21], vec![11]],
+                    floating: Vec::new(),
+                },
+            ])
+        );
+        // The live layout right after Niri executed the move.
+        let mut moved = snapshot();
+        let output = moved.outputs.get_mut("left").unwrap();
+        output.workspaces = vec![
+            workspace(
+                1,
+                &[
+                    (1, vec![window(12, 1, Some(1), false)]),
+                    (2, vec![window(13, 1, Some(2), false)]),
+                ],
+                vec![window(31, 1, None, true)],
+            ),
+            workspace(
+                2,
+                &[
+                    (1, vec![window(21, 2, Some(1), false)]),
+                    (2, vec![window(11, 2, Some(2), false)]),
+                ],
+                Vec::new(),
+            ),
+        ];
+        assert!(plan.postcondition_matches(&moved));
+
+        // The source empties only when every other window leaves too; model
+        // the whole source workspace vanishing and confirm against a live
+        // snapshot without it.
+        let mut vanished = moved;
+        let output = vanished.outputs.get_mut("left").unwrap();
+        output.workspaces.retain(|workspace| workspace.id != 1);
+        plan.projection = DropProjection::Exact(vec![
+            ProjectedWorkspace {
+                workspace_id: 1,
+                columns: Vec::new(),
+                floating: Vec::new(),
+            },
+            ProjectedWorkspace {
+                workspace_id: 2,
+                columns: vec![vec![21], vec![11]],
+                floating: Vec::new(),
+            },
+        ]);
+        assert!(
+            plan.postcondition_matches(&vanished),
+            "a destroyed empty workspace must satisfy an empty projection"
+        );
+
+        // A missing workspace with expected content is still a mismatch.
+        plan.projection = DropProjection::Exact(vec![ProjectedWorkspace {
+            workspace_id: 1,
+            columns: vec![vec![12]],
+            floating: Vec::new(),
+        }]);
+        assert!(!plan.postcondition_matches(&vanished));
     }
 
     #[test]

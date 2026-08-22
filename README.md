@@ -91,6 +91,29 @@ Rejected drops always answer with their exact reason, for example
 `error: drop rejected: target window changed workspace`. Logs contain window
 and workspace ids only, never window titles.
 
+### Output scale changes
+
+A live Niri output scale change can corrupt an existing XMB panel surface. This
+issue was reproduced when the internal display scale changed from `1.75` to
+`2.25` while the daemon was running.
+
+The panel showed horizontal stripes and incomplete repeated content. The daemon
+stayed active, and its log did not report a rendering error.
+
+Restart XMB after a live output scale change:
+
+```sh
+niri-xmb restart
+```
+
+The restart recreates the Wayland surfaces and buffers at the new scale. A future
+fix must detect output scale changes, recreate scale-dependent resources, and
+force a full redraw instead of using the previous damage state.
+
+The observed system also had high memory pressure from multiple JVM processes.
+That pressure caused a separate system stall. Do not treat the stall as evidence
+of an XMB memory leak without process-level memory data.
+
 ## Repository layout
 
 ```text
