@@ -573,6 +573,7 @@ impl Renderer {
             }),
         });
         if let Some(key) = bar_key
+            && !surface.needs_full_redraw
             && self
                 .surfaces
                 .get(&surface.id)
@@ -588,7 +589,7 @@ impl Renderer {
             SurfaceKind::Popup => self.anim.panel(&surface.output),
         };
         let blank = progress <= 0.004 && drag.is_none();
-        if blank && !self.blanked.insert(surface.id) {
+        if blank && !surface.needs_full_redraw && !self.blanked.insert(surface.id) {
             // Already cleared on a previous frame; nothing to upload.
             return None;
         }
@@ -1628,6 +1629,7 @@ mod tests {
             height: 38,
             configured: true,
             frame_ready: true,
+            needs_full_redraw: false,
         }
     }
 
@@ -1653,6 +1655,33 @@ mod tests {
             renderer
                 .render(&surface, &snapshot, &config, None, None)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn scale_invalidation_bypasses_unchanged_bar_cache() {
+        let mut renderer = Renderer::new();
+        let config = Config {
+            bars: vec![BarConfig {
+                output: "eDP-1".into(),
+                ..BarConfig::default()
+            }],
+            ..Config::default()
+        };
+        let snapshot = snapshot();
+        let mut surface = bar_surface(1, 0, "eDP-1", 420);
+
+        assert!(
+            renderer
+                .render(&surface, &snapshot, &config, None, None)
+                .is_some()
+        );
+        surface.needs_full_redraw = true;
+        assert!(
+            renderer
+                .render(&surface, &snapshot, &config, None, None)
+                .is_some(),
+            "scale invalidation must redraw an otherwise unchanged bar"
         );
     }
 

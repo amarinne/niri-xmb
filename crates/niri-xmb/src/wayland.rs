@@ -59,6 +59,7 @@ pub struct SurfaceInfo {
     pub height: u32,
     pub configured: bool,
     pub frame_ready: bool,
+    pub needs_full_redraw: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +254,7 @@ struct OutputRecord {
     y: i32,
     width: i32,
     height: i32,
+    scale_factor: i32,
 }
 
 /// Which input classes a popup surface accepts.
@@ -304,6 +306,15 @@ struct SurfaceEntry {
     frame_ready: bool,
     buffers: Vec<SurfaceBuffer>,
     last_damage: Option<DamageRect>,
+    scale_factor: i32,
+    needs_full_redraw: bool,
+}
+
+fn invalidate_surface_resources(surface: &mut SurfaceEntry) {
+    surface.buffers.clear();
+    surface.last_damage = None;
+    surface.input_rect = None;
+    surface.needs_full_redraw = true;
 }
 
 pub struct SurfaceManager {
@@ -445,9 +456,17 @@ impl SurfaceManager {
                     height: surface.height,
                     configured: surface.configured,
                     frame_ready: surface.frame_ready,
+                    needs_full_redraw: surface.needs_full_redraw,
                 }
             })
             .collect()
+    }
+
+    pub fn needs_redraw(&self) -> bool {
+        self.state
+            .surfaces
+            .iter()
+            .any(|surface| surface.visible && surface.needs_full_redraw)
     }
 
     pub fn present(
@@ -473,11 +492,14 @@ impl SurfaceManager {
             return Ok(false);
         }
 
-        let display_damage = match (surface.last_damage, current_damage) {
-            (Some(previous), Some(current)) => previous.union(current),
-            (Some(previous), None) => previous,
-            (None, Some(current)) => current,
-            (None, None) => return Ok(false),
+        let Some(display_damage) = presentation_damage(
+            surface.width,
+            surface.height,
+            surface.last_damage,
+            current_damage,
+            surface.needs_full_redraw,
+        ) else {
+            return Ok(false);
         };
 
         let mut available = None;
@@ -539,6 +561,7 @@ impl SurfaceManager {
             submitted_damage.height as i32,
         );
         surface.last_damage = current_damage;
+        surface.needs_full_redraw = false;
         surface.frame_ready = false;
         layer_surface.commit();
         Ok(true)
@@ -814,6 +837,29 @@ fn allocate_surface_buffer(surface: &mut SurfaceEntry) -> Result<()> {
     Ok(())
 }
 
+fn presentation_damage(
+    width: u32,
+    height: u32,
+    previous: Option<DamageRect>,
+    current: Option<DamageRect>,
+    force_full: bool,
+) -> Option<DamageRect> {
+    if force_full {
+        return Some(DamageRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        });
+    }
+    match (previous, current) {
+        (Some(previous), Some(current)) => Some(previous.union(current)),
+        (Some(previous), None) => Some(previous),
+        (None, Some(current)) => Some(current),
+        (None, None) => None,
+    }
+}
+
 /// Find the nontransparent bounds of a premultiplied RGBA frame.
 #[cfg(test)]
 fn alpha_bounds(source: &[u8], width: u32, height: u32) -> Option<DamageRect> {
@@ -895,7 +941,7 @@ fn copy_rgba_to_argb8888(destination: &mut [u8], source: &[u8]) {
 mod tests {
     use super::{
         DamageRect, SurfaceSpecKind, WheelStepAccumulator, alpha_bounds, copy_rgba_to_argb8888,
-        copy_rgba_to_argb8888_region, ensure_popup_spec,
+        copy_rgba_to_argb8888_region, ensure_popup_spec, presentation_damage,
     };
 
     #[test]
@@ -945,6 +991,35 @@ mod tests {
         assert_eq!(&destination[..4], &[0xaa; 4]);
         assert_eq!(&destination[4..8], &[30, 20, 10, 40]);
         assert_eq!(&destination[8..], &[0xaa; 8]);
+    }
+
+    #[test]
+    fn scale_invalidation_forces_full_surface_damage() {
+        let partial = DamageRect {
+            x: 10,
+            y: 12,
+            width: 30,
+            height: 40,
+        };
+        assert_eq!(
+            presentation_damage(1920, 1080, Some(partial), Some(partial), true),
+            Some(DamageRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            })
+        );
+        assert_eq!(
+            presentation_damage(1920, 1080, None, None, true),
+            Some(DamageRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }),
+            "a blank surface still needs a clean buffer after a scale change"
+        );
     }
 
     #[test]
@@ -1088,16 +1163,36 @@ impl WaylandState {
         }
         let (x, y) = info.logical_position.unwrap_or((0, 0));
         let (width, height) = info.logical_size.unwrap_or((1920, 1080));
+        let output_id = output.id().protocol_id();
+        let resources_changed = self.outputs.get(&output_id).is_some_and(|previous| {
+            previous.name == name
+                && (previous.width != width
+                    || previous.height != height
+                    || previous.scale_factor != info.scale_factor)
+        });
         for surface in &mut self.surfaces {
             if surface.output == name {
                 surface.output_x = x;
                 surface.output_y = y;
                 surface.output_width = width;
                 surface.output_height = height;
+                surface.scale_factor = info.scale_factor;
+                if resources_changed {
+                    invalidate_surface_resources(surface);
+                }
             }
         }
+        if resources_changed {
+            tracing::info!(
+                output = %name,
+                width,
+                height,
+                scale_factor = info.scale_factor,
+                "output scale or logical size changed; rebuilding render buffers"
+            );
+        }
         self.outputs.insert(
-            output.id().protocol_id(),
+            output_id,
             OutputRecord {
                 output: output.clone(),
                 name,
@@ -1105,6 +1200,7 @@ impl WaylandState {
                 y,
                 width,
                 height,
+                scale_factor: info.scale_factor,
             },
         );
     }
@@ -1189,6 +1285,8 @@ impl WaylandState {
                 frame_ready: true,
                 buffers: Vec::new(),
                 last_damage: None,
+                scale_factor: output.scale_factor,
+                needs_full_redraw: true,
             });
         }
     }
@@ -1303,9 +1401,28 @@ impl CompositorHandler for WaylandState {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: i32,
+        wl_surface: &wl_surface::WlSurface,
+        new_factor: i32,
     ) {
+        let Some(surface) = self.surfaces.iter_mut().find(|surface| {
+            surface
+                .layer_surface
+                .as_ref()
+                .is_some_and(|layer_surface| layer_surface.wl_surface() == wl_surface)
+        }) else {
+            return;
+        };
+        if surface.scale_factor == new_factor {
+            return;
+        }
+        tracing::info!(
+            output = %surface.output,
+            old_factor = surface.scale_factor,
+            new_factor,
+            "Wayland surface scale changed; rebuilding render buffers"
+        );
+        surface.scale_factor = new_factor;
+        invalidate_surface_resources(surface);
     }
     fn transform_changed(
         &mut self,

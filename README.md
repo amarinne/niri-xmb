@@ -93,26 +93,12 @@ and workspace ids only, never window titles.
 
 ### Output scale changes
 
-A live Niri output scale change can corrupt an existing XMB panel surface. This
-issue was reproduced when the internal display scale changed from `1.75` to
-`2.25` while the daemon was running.
+XMB handles live Niri output scale changes without a restart. When Wayland
+reports a new scale factor, XMB discards the old SHM buffers and damage history.
+XMB then renders and uploads one complete frame for each affected surface.
 
-The panel showed horizontal stripes and incomplete repeated content. The daemon
-stayed active, and its log did not report a rendering error.
-
-Restart XMB after a live output scale change:
-
-```sh
-niri-xmb restart
-```
-
-The restart recreates the Wayland surfaces and buffers at the new scale. A future
-fix must detect output scale changes, recreate scale-dependent resources, and
-force a full redraw instead of using the previous damage state.
-
-The observed system also had high memory pressure from multiple JVM processes.
-That pressure caused a separate system stall. Do not treat the stall as evidence
-of an XMB memory leak without process-level memory data.
+This reset prevents old partial-damage data from producing horizontal stripes
+or repeated content after a scale change.
 
 ## Repository layout
 

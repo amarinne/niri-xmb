@@ -852,6 +852,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     );
     while running {
         surfaces.dispatch(&wake, wait_timeout)?;
+        dirty |= surfaces.needs_redraw();
 
         while let Ok((x, y)) = cursor_restore_rx.try_recv() {
             if !surfaces.restore_pointer(x, y) {
