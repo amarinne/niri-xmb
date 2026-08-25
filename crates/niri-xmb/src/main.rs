@@ -124,7 +124,13 @@ enum Command {
     CycleWorkspace {
         #[arg(long)]
         output: String,
+        #[arg(long, allow_negative_numbers = true)]
+        delta: i32,
+    },
+    CycleWindow {
         #[arg(long)]
+        output: String,
+        #[arg(long, allow_negative_numbers = true)]
         delta: i32,
     },
     Drop {
@@ -490,6 +496,9 @@ fn main() -> Result<()> {
         }
         Command::CycleWorkspace { output, delta } => {
             print_control(ControlCommand::CycleWorkspace { output, delta })
+        }
+        Command::CycleWindow { output, delta } => {
+            print_control(ControlCommand::CycleWindow { output, delta })
         }
         Command::Drop {
             source_window_id,
@@ -1319,6 +1328,44 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                             }
                         }
                         None => "error: unknown output or no workspaces\n".into(),
+                    }
+                }
+                ControlCommand::CycleWindow { output, delta } => {
+                    let target = snapshot.outputs.get(&output).and_then(|model| {
+                        let workspace = model
+                            .workspaces
+                            .iter()
+                            .find(|workspace| workspace.active)
+                            .or_else(|| model.workspaces.first())?;
+                        let windows: Vec<u64> =
+                            workspace.windows().map(|window| window.id).collect();
+                        if windows.is_empty() {
+                            return None;
+                        }
+                        let current = windows
+                            .iter()
+                            .position(|id| Some(*id) == snapshot.focused_window)
+                            .or_else(|| {
+                                windows.iter().position(|id| Some(*id) == workspace.active_window)
+                            })
+                            .unwrap_or(0);
+                        let len = windows.len() as i64;
+                        let next = (current as i64 + i64::from(delta)).rem_euclid(len) as usize;
+                        Some(windows[next])
+                    });
+                    match target {
+                        Some(window_id) => {
+                            peek_suppressed_until = Instant::now() + SELF_FOCUS_GRACE;
+                            if niri_command_tx
+                                .send(NiriCommand::FocusWindow(window_id).into())
+                                .is_ok()
+                            {
+                                "ok\n".into()
+                            } else {
+                                "error: Niri command worker unavailable\n".into()
+                            }
+                        }
+                        None => "error: unknown output or no windows\n".into(),
                     }
                 }
                 ControlCommand::Drop {

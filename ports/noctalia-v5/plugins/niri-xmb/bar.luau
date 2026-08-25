@@ -772,11 +772,16 @@ end
 
 function onScroll(axis, steps, startsGesture)
     local validatedSteps = finiteNumber(steps)
-    if axis ~= "vertical" or validatedSteps == nil or validatedSteps == 0 then
+    if validatedSteps == nil or validatedSteps == 0 then
         return
     end
     local delta = validatedSteps > 0 and 1 or -1
-    runAction({ "cycle-workspace", "--output", targetOutput(), "--delta", tostring(delta) })
+    if axis == "vertical" then
+        runAction({ "cycle-workspace", "--output", targetOutput(), "--delta", tostring(delta) })
+    elseif axis == "horizontal" then
+        -- Wheel left/right moves window focus across the active workspace row.
+        runAction({ "cycle-window", "--output", targetOutput(), "--delta", tostring(delta) })
+    end
 end
 
 function onConfigChanged()

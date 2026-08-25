@@ -38,6 +38,10 @@ pub enum ControlCommand {
         output: String,
         delta: i32,
     },
+    CycleWindow {
+        output: String,
+        delta: i32,
+    },
     Drop {
         source_window_id: u64,
         target_workspace_id: u64,
@@ -361,6 +365,13 @@ fn parse_command(command: &str) -> std::result::Result<ControlCommand, String> {
                 delta,
             })
             .map_err(|_| "error: invalid cycle-workspace command\n".into()),
+        ["cycle-window", output, delta] => delta
+            .parse()
+            .map(|delta| ControlCommand::CycleWindow {
+                output: (*output).to_string(),
+                delta,
+            })
+            .map_err(|_| "error: invalid cycle-window command\n".into()),
         ["quit"] => Ok(ControlCommand::Quit),
         ["subscribe", version] => version
             .parse()
@@ -398,6 +409,7 @@ fn parse_command(command: &str) -> std::result::Result<ControlCommand, String> {
         ["focus-window", ..] => Err("error: invalid focus-window command\n".into()),
         ["focus-workspace", ..] => Err("error: invalid focus-workspace command\n".into()),
         ["cycle-workspace", ..] => Err("error: invalid cycle-workspace command\n".into()),
+        ["cycle-window", ..] => Err("error: invalid cycle-window command\n".into()),
         ["drop", ..] => Err("error: invalid drop command\n".into()),
         ["subscribe", ..] => Err("error: invalid subscribe command\n".into()),
         _ => Err("error: unknown command\n".into()),
@@ -444,6 +456,9 @@ fn serialize_command(command: ControlCommand) -> String {
         }
         ControlCommand::CycleWorkspace { output, delta } => {
             format!("cycle-workspace {output} {delta}")
+        }
+        ControlCommand::CycleWindow { output, delta } => {
+            format!("cycle-window {output} {delta}")
         }
         ControlCommand::Drop {
             source_window_id,
@@ -619,8 +634,27 @@ mod tests {
     fn parser_rejects_trailing_fields_and_invalid_numbers() {
         assert!(parse_command("status extra").is_err());
         assert!(parse_command("cycle-workspace DP-1 1 extra").is_err());
+        assert!(parse_command("cycle-window DP-1 nope").is_err());
         assert!(parse_command("drop 1 2 0 NaN").is_err());
         assert!(parse_command("drop 1 2 0 0.5 10").is_err());
+    }
+
+    #[test]
+    fn cycle_commands_accept_negative_deltas() {
+        assert_eq!(
+            parse_command("cycle-workspace DP-1 -1"),
+            Ok(ControlCommand::CycleWorkspace {
+                output: "DP-1".into(),
+                delta: -1,
+            })
+        );
+        assert_eq!(
+            parse_command("cycle-window DP-1 -1"),
+            Ok(ControlCommand::CycleWindow {
+                output: "DP-1".into(),
+                delta: -1,
+            })
+        );
     }
 
     #[test]
@@ -647,6 +681,10 @@ mod tests {
                 output: Some("eDP-1".into()),
             },
             ControlCommand::Subscribe { version: 1 },
+            ControlCommand::CycleWindow {
+                output: "DP-1".into(),
+                delta: -1,
+            },
             ControlCommand::Drop {
                 source_window_id: 1,
                 target_workspace_id: 2,
