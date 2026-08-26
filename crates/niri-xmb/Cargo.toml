@@ -18,6 +18,7 @@ libc = "0.2"
 niri-ipc = "26.4.0"
 png = "0.17"
 rustix = { workspace = true }
+semver = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 smithay-client-toolkit = { workspace = true }

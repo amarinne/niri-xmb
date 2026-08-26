@@ -31,6 +31,7 @@ use selection::{
     normalize as normalize_selection, reset as reset_selection, selected_window,
     selected_workspace, visual as selection_visual, wrap_index,
 };
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -161,6 +162,9 @@ enum Command {
         /// Install without asking for confirmation.
         #[arg(short, long)]
         yes: bool,
+        /// Install the requested version even if it is older than the running binary.
+        #[arg(long)]
+        force: bool,
     },
     /// Print the fully commented configuration template.
     PrintDefaultConfig,
@@ -523,10 +527,12 @@ fn main() -> Result<()> {
             version,
             no_restart,
             yes,
+            force,
         } => update_binary(
             version.as_deref(),
             no_restart,
             yes,
+            force,
             cli.config.unwrap_or_else(Config::default_path),
             cli.verbose,
         ),
@@ -631,6 +637,7 @@ fn update_binary(
     version: Option<&str>,
     no_restart: bool,
     yes: bool,
+    force: bool,
     config_path: PathBuf,
     verbosity: u8,
 ) -> Result<()> {
@@ -639,15 +646,20 @@ fn update_binary(
         None => latest_release_version()?,
     };
     let current_version = env!("CARGO_PKG_VERSION");
-    if versions_match(current_version, &target_version) {
-        println!("niri-xmb {current_version} is already up to date");
-        return Ok(());
+    match plan_update(current_version, &target_version, force)? {
+        UpdatePlan::AlreadyCurrent => {
+            println!("niri-xmb {current_version} is already up to date");
+            return Ok(());
+        }
+        UpdatePlan::Upgrade => println!(
+            "New niri-xmb version available: {current_version} -> {}",
+            normalized_version(&target_version)
+        ),
+        UpdatePlan::ForcedDowngrade => println!(
+            "Downgrading niri-xmb: {current_version} -> {}",
+            normalized_version(&target_version)
+        ),
     }
-
-    println!(
-        "New niri-xmb version available: {current_version} -> {}",
-        normalized_version(&target_version)
-    );
     if !yes {
         print!("Install update? [y/N] ");
         io::stdout()
@@ -770,8 +782,35 @@ fn normalized_version(version: &str) -> &str {
     version.trim().strip_prefix('v').unwrap_or(version.trim())
 }
 
-fn versions_match(current: &str, target: &str) -> bool {
-    normalized_version(current) == normalized_version(target)
+/// What `update` should do about a requested target version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdatePlan {
+    /// The target is the version already running; nothing to install.
+    AlreadyCurrent,
+    /// The target is newer than the running binary.
+    Upgrade,
+    /// The target is older, and the user asked for it explicitly.
+    ForcedDowngrade,
+}
+
+/// Order the running version against a requested release tag. Refuses to
+/// go backwards unless `force` is set, so a mistyped `--version` cannot
+/// silently replace a newer build with an older one.
+fn plan_update(current: &str, target: &str, force: bool) -> Result<UpdatePlan> {
+    let running = semver::Version::parse(normalized_version(current))
+        .with_context(|| format!("could not parse the running version {current:?}"))?;
+    let requested = semver::Version::parse(normalized_version(target))
+        .with_context(|| format!("could not parse the requested version {target:?}"))?;
+    match requested.cmp(&running) {
+        Ordering::Equal => Ok(UpdatePlan::AlreadyCurrent),
+        Ordering::Greater => Ok(UpdatePlan::Upgrade),
+        Ordering::Less if force => Ok(UpdatePlan::ForcedDowngrade),
+        Ordering::Less => anyhow::bail!(
+            "refusing to install {} over the running {}; pass --force to downgrade",
+            normalized_version(target),
+            normalized_version(current)
+        ),
+    }
 }
 
 fn confirmation_is_yes(answer: &str) -> bool {
@@ -2583,15 +2622,43 @@ mod tests {
                 version: Some(ref version),
                 no_restart: true,
                 yes: true,
+                force: false,
             }) if version == "v0.2.0"
         ));
     }
 
     #[test]
     fn update_version_comparison_accepts_v_prefix() {
-        assert!(versions_match("0.1.2", "v0.1.2"));
-        assert!(versions_match("0.1.2", "0.1.2"));
-        assert!(!versions_match("0.1.1", "v0.1.2"));
+        assert_eq!(
+            plan_update("0.1.2", "v0.1.2", false).unwrap(),
+            UpdatePlan::AlreadyCurrent
+        );
+        assert_eq!(
+            plan_update("0.1.2", "0.1.2", false).unwrap(),
+            UpdatePlan::AlreadyCurrent
+        );
+        assert_eq!(
+            plan_update("0.1.1", "v0.1.2", false).unwrap(),
+            UpdatePlan::Upgrade
+        );
+    }
+
+    #[test]
+    fn update_refuses_downgrade() {
+        let error = plan_update("0.1.2", "v0.1.1", false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--force"), "unexpected error: {error}");
+        assert_eq!(
+            plan_update("0.1.2", "v0.1.1", true).unwrap(),
+            UpdatePlan::ForcedDowngrade
+        );
+        // Ordering is numeric, not lexicographic: 0.1.10 is newer than 0.1.9.
+        assert_eq!(
+            plan_update("0.1.9", "v0.1.10", false).unwrap(),
+            UpdatePlan::Upgrade
+        );
+        assert!(plan_update("0.1.2", "not-a-version", false).is_err());
     }
 
     #[test]
