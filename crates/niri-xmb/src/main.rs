@@ -175,8 +175,9 @@ enum Command {
 }
 
 /// Why the popup is currently on screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum PopupMode {
+    #[default]
     Hidden,
     /// Opened by the user; takes input and stages a selection.
     Manual,
@@ -1059,12 +1060,10 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     subscriptions.publish(snapshot.generation, &snapshot_json(&snapshot, None));
     let mut niri_health = NiriHealth::default();
     let mut drop_transactions = DropTransactionState::default();
-    let mut popup_outputs = HashSet::new();
     let mut panel = PanelState::default();
     let mut bar_scrolls: HashMap<String, BarScrollState> = HashMap::new();
     let mut selection = Selection::default();
     let mut popup_was_open = false;
-    let mut popup_mode = PopupMode::Hidden;
     // Focus changes we caused ourselves must not bounce back as a peek.
     let mut peek_suppressed_until = Instant::now();
     let mut window_first_seen: HashMap<u64, Instant> = HashMap::new();
@@ -1120,13 +1119,11 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             if changed {
                 if should_close_on_external_focus_change(
                     &config,
-                    popup_mode,
+                    panel.mode(),
                     now,
                     peek_suppressed_until,
                 ) {
                     surfaces.hide_all_popups()?;
-                    popup_outputs.clear();
-                    popup_mode = PopupMode::Hidden;
                     panel.close();
                 }
                 if Instant::now() >= peek_suppressed_until {
@@ -1188,19 +1185,23 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     && !focused_is_new
                     && now >= peek_suppressed_until
                 {
-                    let was_hidden = popup_mode == PopupMode::Hidden;
+                    let was_hidden = panel.mode() == PopupMode::Hidden;
+                    let pointer_live = panel.peek().pointer_live();
+                    let mut mode = panel.mode();
                     let deadline = trigger_peek(
                         &mut surfaces,
                         &snapshot,
                         &config,
-                        &mut popup_outputs,
-                        &mut popup_mode,
+                        panel.outputs_mut(),
+                        &mut mode,
                         &mut selection,
                         peek_suppressed_until,
-                        panel.peek().pointer_live(),
+                        pointer_live,
                     )?;
+                    panel.set_mode(mode);
                     panel.peek_mut().set_deadline(deadline);
-                    if was_hidden && popup_mode == PopupMode::Peek && config.peek.pointer_promote {
+                    if was_hidden && panel.mode() == PopupMode::Peek && config.peek.pointer_promote
+                    {
                         panel.peek_mut().arm_pointer(
                             Instant::now() + Duration::from_millis(config.peek.arm_grace_ms),
                         );
@@ -1216,9 +1217,9 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         // gets out of the way immediately.
         // An armed overlay has no deadline to reach: the pointer resting on it
         // holds it open. The overview still clears it either way.
-        if popup_mode.is_peek()
+        if panel.mode().is_peek()
             && (snapshot.overview_open
-                || (popup_mode == PopupMode::Peek
+                || (panel.mode() == PopupMode::Peek
                     && peek_deadline_reached(
                         panel.peek().deadline(),
                         pending_focus_since,
@@ -1226,9 +1227,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     )))
         {
             surfaces.hide_all_popups()?;
-            popup_outputs.clear();
-            popup_mode = PopupMode::Hidden;
-            panel.peek_mut().disarm();
+            panel.close();
             dirty = true;
         }
 
@@ -1236,7 +1235,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         // the panel rectangle only, and never the keyboard, so everything
         // outside the panel — and every keybind — behaves as before.
         if let Some(at) = panel.peek().pointer_at()
-            && popup_mode.is_peek()
+            && panel.mode().is_peek()
             && Instant::now() >= at
         {
             panel.peek_mut().take_pointer();
@@ -1247,28 +1246,25 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         while let Ok(request) = control_rx.try_recv() {
             let response = match request.command {
                 ControlCommand::Show => {
-                    if popup_mode != PopupMode::Manual {
+                    if panel.mode() != PopupMode::Manual {
                         panel.set_origin_focus(snapshot.focused_window);
                     }
+                    let origin_focus = panel.origin_focus();
                     show_popup(
                         &mut surfaces,
                         &snapshot,
                         &config,
-                        &mut popup_outputs,
+                        panel.outputs_mut(),
                         PopupInput::FULL,
                     )?;
-                    popup_mode = PopupMode::Manual;
                     // Taking control cancels the peek countdown.
-                    panel.peek_mut().disarm();
-                    panel.clear_follow_candidate();
+                    panel.promote(origin_focus);
                     reset_selection(&mut selection, &snapshot);
                     dirty = true;
                     "ok\n".into()
                 }
                 ControlCommand::Hide => {
                     surfaces.hide_all_popups()?;
-                    popup_outputs.clear();
-                    popup_mode = PopupMode::Hidden;
                     panel.close();
                     dirty = true;
                     "ok\n".into()
@@ -1276,31 +1272,27 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 ControlCommand::Toggle => {
                     // A peek overlay is promoted rather than dismissed: the
                     // keybind means "let me drive this", not "hide it".
-                    if popup_mode == PopupMode::Manual {
+                    if panel.mode() == PopupMode::Manual {
                         surfaces.hide_all_popups()?;
-                        popup_outputs.clear();
-                        popup_mode = PopupMode::Hidden;
                         panel.close();
                     } else {
-                        panel.set_origin_focus(snapshot.focused_window);
+                        let origin_focus = snapshot.focused_window;
                         show_popup(
                             &mut surfaces,
                             &snapshot,
                             &config,
-                            &mut popup_outputs,
+                            panel.outputs_mut(),
                             PopupInput::FULL,
                         )?;
-                        popup_mode = PopupMode::Manual;
-                        panel.peek_mut().disarm();
-                        panel.clear_follow_candidate();
+                        panel.promote(origin_focus);
                         reset_selection(&mut selection, &snapshot);
                     }
                     dirty = true;
                     "ok\n".into()
                 }
                 ControlCommand::Status => status_response(
-                    &popup_outputs,
-                    popup_mode,
+                    panel.outputs(),
+                    panel.mode(),
                     selection_visual(&selection, &snapshot),
                     &snapshot,
                     surfaces.cursor_restore_available(),
@@ -1467,8 +1459,8 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                         &mut drop_transactions,
                         Some(request.reply),
                         &niri_command_tx,
-                        popup_mode,
-                        !popup_outputs.is_empty(),
+                        panel.mode(),
+                        panel.is_open(),
                     );
                     continue;
                 }
@@ -1489,34 +1481,27 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             // A peek overlay decides what a pointer event means to it before
             // the event is handled as panel input, so the click that promotes
             // it is also the click that acts.
-            if popup_mode.is_peek() {
+            if panel.mode().is_peek() {
                 match classify_peek_pointer(&event) {
                     PeekPointer::Promote => {
-                        panel.set_origin_focus(snapshot.focused_window);
                         let capture = popup_capture_outside(&config, PopupInput::FULL);
                         surfaces.set_popup_input(PopupInput::FULL, capture)?;
-                        popup_mode = PopupMode::Manual;
-                        panel.peek_mut().disarm();
-                        panel.clear_follow_candidate();
+                        panel.promote(snapshot.focused_window);
                         reset_selection(&mut selection, &snapshot);
                         dirty = true;
                     }
                     PeekPointer::Arm => {
-                        if popup_mode != PopupMode::PeekArmed {
-                            popup_mode = PopupMode::PeekArmed;
+                        if panel.mode() != PopupMode::PeekArmed {
                             dirty = true;
                         }
-                        panel.peek_mut().set_deadline(None);
+                        panel.arm();
                     }
                     PeekPointer::Disarm => {
-                        if popup_mode == PopupMode::PeekArmed {
-                            popup_mode = PopupMode::Peek;
-                            // Moving away is a refusal, so the overlay leaves
-                            // sooner than the countdown it never started would.
-                            panel.peek_mut().set_deadline(Some(
+                        if panel.mode() == PopupMode::PeekArmed {
+                            panel.disarm(
                                 Instant::now()
                                     + Duration::from_millis(config.peek.demote_ms.max(1)),
-                            ));
+                            );
                             dirty = true;
                         }
                     }
@@ -1526,7 +1511,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 // cursor-positioned panel re-anchors itself on one. An overlay
                 // that jumped out from under the hand reaching for it would
                 // undo the whole point, so peek ignores enter entirely.
-                if popup_mode.is_peek()
+                if panel.mode().is_peek()
                     && matches!(event.kind, SurfaceKind::Popup)
                     && matches!(event.event, UiEventKind::Enter)
                 {
@@ -1542,8 +1527,6 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 &config,
                 &niri_command_tx,
                 &mut drop_transactions,
-                &mut popup_outputs,
-                popup_mode,
                 origin_focus,
                 &mut panel,
                 &mut bar_scrolls,
@@ -1555,25 +1538,23 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         // Only the manual popup uses the delayed follow. A peek overlay is
         // re-placed on the focused output the moment focus moves, and routing
         // it through here would re-show it as an input-grabbing surface.
-        if popup_mode == PopupMode::Manual {
+        if panel.mode() == PopupMode::Manual {
             let pressed = panel.is_pressed();
             dirty |= update_following_popup(
                 &mut surfaces,
                 &snapshot,
                 &config,
-                &mut popup_outputs,
+                &mut panel,
                 pressed,
-                panel.follow_candidate_mut(),
                 &mut selection,
             )?;
         }
 
         // Catch every way the popup can close — Escape, outside click, a
         // confirmed pick, IPC — in one place, and end the staging session.
-        let popup_open = !popup_outputs.is_empty();
+        let popup_open = panel.is_open();
         if popup_was_open && !popup_open {
             selection.clear_session();
-            popup_mode = PopupMode::Hidden;
             // Escape and outside clicks land here with a press still
             // tracked; closing must cancel it, or the release that follows
             // completes a drop the user just cancelled.
@@ -1587,8 +1568,10 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         // Animation targets are recomputed every iteration, not only on
         // The accent means XMB has an active input mode. An armed peek has
         // claimed the pointer region, but normal peek remains passive.
-        dirty |= renderer
-            .set_panel_input_active(panel_input_active(popup_mode, panel.peek().pointer_live()));
+        dirty |= renderer.set_panel_input_active(panel_input_active(
+            panel.mode(),
+            panel.peek().pointer_live(),
+        ));
 
         // redraw, so a settled UI stops requesting frames entirely.
         let selection_visual = selection_visual(&selection, &snapshot);
@@ -1596,14 +1579,14 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             &snapshot,
             &config,
             selection_visual.as_ref(),
-            &popup_outputs,
+            panel.outputs(),
         );
         dirty |= animating;
 
         // The panel rectangle is what a pointer region is built from. A peek
         // overlay needs it too, and needs it before the pointer arrives, so it
         // is published from the same place whichever mode asks for it.
-        let panel_input_rect_wanted = match popup_mode {
+        let panel_input_rect_wanted = match panel.mode() {
             PopupMode::Manual => !config.behavior.close_on_outside_click,
             PopupMode::Peek | PopupMode::PeekArmed => config.peek.pointer_promote,
             PopupMode::Hidden => false,
@@ -1921,50 +1904,50 @@ fn update_following_popup(
     surfaces: &mut SurfaceManager,
     snapshot: &Snapshot,
     config: &Config,
-    visible: &mut HashSet<String>,
+    panel: &mut PanelState,
     pointer_active: bool,
-    candidate: &mut Option<(String, Instant)>,
     selection: &mut Selection,
 ) -> Result<bool> {
-    if visible.is_empty()
+    if !panel.is_open()
         || config.popup.surface_mode != PopupSurfaceMode::FollowActive
         || config.popup.outputs == PopupOutputs::All
         || pointer_active
     {
-        *candidate = None;
+        *panel.follow_candidate_mut() = None;
         return Ok(false);
     }
 
     let Some(active_output) = snapshot.focused_output().map(str::to_string) else {
-        *candidate = None;
+        *panel.follow_candidate_mut() = None;
         return Ok(false);
     };
-    if visible.contains(&active_output) {
-        *candidate = None;
+    if panel.outputs().contains(&active_output) {
+        *panel.follow_candidate_mut() = None;
         return Ok(false);
     }
 
     let now = Instant::now();
-    match candidate {
+    match panel.follow_candidate() {
         Some((output, since)) if output == &active_output => {
             if now.duration_since(*since) < Duration::from_millis(config.popup.follow_delay_ms) {
                 return Ok(false);
             }
         }
         _ => {
-            *candidate = Some((active_output, now));
+            *panel.follow_candidate_mut() = Some((active_output, now));
             return Ok(false);
         }
     }
 
-    let active_output = candidate
+    let active_output = panel
+        .follow_candidate_mut()
         .take()
         .map(|(output, _)| output)
         .unwrap_or(active_output);
     let capture_outside = should_capture_outside_click(config);
     surfaces.show_popups(std::slice::from_ref(&active_output), capture_outside)?;
-    visible.clear();
-    visible.insert(active_output.clone());
+    panel.outputs_mut().clear();
+    panel.outputs_mut().insert(active_output.clone());
     selection.select_output(active_output, snapshot);
     Ok(true)
 }
@@ -1978,8 +1961,6 @@ fn handle_ui_event(
     config: &Config,
     niri_tx: &crossbeam_channel::Sender<NiriRequest>,
     transactions: &mut DropTransactionState,
-    popup_outputs: &mut HashSet<String>,
-    popup_mode: PopupMode,
     popup_origin_focus: Option<u64>,
     panel: &mut PanelState,
     bar_scrolls: &mut HashMap<String, BarScrollState>,
@@ -2025,7 +2006,7 @@ fn handle_ui_event(
                             && config.behavior.close_on_workspace_click
                         {
                             surfaces.hide_all_popups()?;
-                            popup_outputs.clear();
+                            panel.outputs_mut().clear();
                         }
                     }
                     HitTarget::Canvas { .. } | HitTarget::Panel => {}
@@ -2034,7 +2015,7 @@ fn handle_ui_event(
                 && config.behavior.close_on_outside_click
             {
                 surfaces.hide_all_popups()?;
-                popup_outputs.clear();
+                panel.outputs_mut().clear();
                 if config.behavior.replay_outside_click {
                     surfaces.replay_pointer_click(event.global_x, event.global_y, button);
                 }
@@ -2065,6 +2046,8 @@ fn handle_ui_event(
                 if let Some((_surface, target, local_x, local_y)) =
                     renderer.hit_test_global(&surface_infos, released.current_x, released.current_y)
                 {
+                    let mode = panel.mode();
+                    let is_open = panel.is_open();
                     let dropped = dispatch_drop(
                         released.window_id,
                         target,
@@ -2072,11 +2055,7 @@ fn handle_ui_event(
                         local_y,
                         snapshot,
                         config,
-                        if popup_outputs.is_empty() {
-                            None
-                        } else {
-                            popup_origin_focus
-                        },
+                        if !is_open { None } else { popup_origin_focus },
                         if config.behavior.snap_cursor_after_drop {
                             None
                         } else {
@@ -2085,15 +2064,15 @@ fn handle_ui_event(
                         transactions,
                         None,
                         niri_tx,
-                        popup_mode,
-                        !popup_outputs.is_empty(),
+                        mode,
+                        is_open,
                     );
                     if dropped {
                         *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
                     }
-                    if dropped && config.behavior.close_on_drop && !popup_outputs.is_empty() {
+                    if dropped && config.behavior.close_on_drop && panel.is_open() {
                         surfaces.hide_all_popups()?;
-                        popup_outputs.clear();
+                        panel.outputs_mut().clear();
                     }
                 }
             } else {
@@ -2107,7 +2086,7 @@ fn handle_ui_event(
                     && config.behavior.close_on_window_click
                 {
                     surfaces.hide_all_popups()?;
-                    popup_outputs.clear();
+                    panel.outputs_mut().clear();
                 }
             }
             Ok(true)
@@ -2117,7 +2096,7 @@ fn handle_ui_event(
                 KEY_ESCAPE => {
                     if config.behavior.close_on_escape {
                         surfaces.hide_all_popups()?;
-                        popup_outputs.clear();
+                        panel.outputs_mut().clear();
                     }
                 }
                 KEY_LEFT => {
@@ -2169,7 +2148,7 @@ fn handle_ui_event(
                     }
                     if submitted && close {
                         surfaces.hide_all_popups()?;
-                        popup_outputs.clear();
+                        panel.outputs_mut().clear();
                     }
                 }
                 _ => {}

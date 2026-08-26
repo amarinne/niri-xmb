@@ -1,6 +1,7 @@
 //! Panel state for the daemon loop.
 
-use crate::PressState;
+use crate::{PopupMode, PressState};
+use std::collections::HashSet;
 use std::time::Instant;
 
 /// Timing state for the peek overlay.
@@ -68,6 +69,10 @@ impl PeekState {
 /// `close` is the one way to end a session, so that subset cannot drift again.
 #[derive(Debug, Default)]
 pub struct PanelState {
+    /// Why the panel is on screen, or `Hidden` when it is not.
+    mode: PopupMode,
+    /// Outputs currently showing the panel. Empty means nothing is up.
+    outputs: HashSet<String>,
     /// Where Niri's focus was when the session opened, so a drop can put it
     /// back if it fails.
     origin_focus: Option<u64>,
@@ -81,6 +86,49 @@ pub struct PanelState {
 }
 
 impl PanelState {
+    pub fn mode(&self) -> PopupMode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: PopupMode) {
+        self.mode = mode;
+    }
+
+    pub fn outputs(&self) -> &HashSet<String> {
+        &self.outputs
+    }
+
+    pub fn outputs_mut(&mut self) -> &mut HashSet<String> {
+        &mut self.outputs
+    }
+
+    /// Whether the panel is on screen at all.
+    pub fn is_open(&self) -> bool {
+        !self.outputs.is_empty()
+    }
+
+    /// Take control of an overlay that is already up, or open a fresh manual
+    /// session. Cancels the peek countdown, because the user is now driving.
+    pub fn promote(&mut self, origin_focus: Option<u64>) {
+        self.mode = PopupMode::Manual;
+        self.origin_focus = origin_focus;
+        self.follow_candidate = None;
+        self.peek.disarm();
+    }
+
+    /// The pointer came to rest on a peek overlay: hold it open.
+    pub fn arm(&mut self) {
+        self.mode = PopupMode::PeekArmed;
+        self.peek.set_deadline(None);
+    }
+
+    /// The pointer left an armed overlay. Moving away is a refusal, so it
+    /// leaves sooner than the countdown it never started would.
+    pub fn disarm(&mut self, deadline: Instant) {
+        self.mode = PopupMode::Peek;
+        self.peek.set_deadline(Some(deadline));
+    }
+
     pub fn origin_focus(&self) -> Option<u64> {
         self.origin_focus
     }
@@ -95,10 +143,6 @@ impl PanelState {
 
     pub fn follow_candidate(&self) -> Option<&(String, Instant)> {
         self.follow_candidate.as_ref()
-    }
-
-    pub fn clear_follow_candidate(&mut self) {
-        self.follow_candidate = None;
     }
 
     pub fn is_pressed(&self) -> bool {
@@ -133,6 +177,8 @@ impl PanelState {
     /// is up goes at once -- including the tracked press, so a drag the user
     /// cancelled cannot be completed by the release that follows.
     pub fn close(&mut self) {
+        self.mode = PopupMode::Hidden;
+        self.outputs.clear();
         self.origin_focus = None;
         self.follow_candidate = None;
         self.press = None;
@@ -210,6 +256,8 @@ mod tests {
     fn close_clears_every_session_field() {
         let mut panel = PanelState::default();
         panel.set_origin_focus(Some(1));
+        panel.promote(Some(1));
+        panel.outputs_mut().insert("DP-1".to_string());
         *panel.follow_candidate_mut() = Some(("DP-1".to_string(), Instant::now()));
         panel.begin_press(drag_press());
         panel.peek_mut().arm_pointer(Instant::now());
@@ -217,6 +265,8 @@ mod tests {
 
         panel.close();
 
+        assert_eq!(panel.mode(), PopupMode::Hidden);
+        assert!(!panel.is_open());
         assert_eq!(panel.origin_focus(), None);
         assert!(panel.follow_candidate().is_none());
         assert!(!panel.is_pressed());
