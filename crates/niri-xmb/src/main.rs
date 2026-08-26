@@ -978,12 +978,13 @@ fn status_response(
         + "\n"
 }
 
-fn run_daemon(config_path: PathBuf) -> Result<()> {
-    let mut config = Config::load(&config_path)?;
-    let output_names = connected_outputs()?;
-    if output_names.is_empty() {
-        anyhow::bail!("Niri reported no connected outputs");
-    }
+/// Match configured bars against the connected outputs.
+///
+/// An empty `[[bars]]` list means "one bar per connected output", which is
+/// what a fresh install should get. A non-empty list is filtered down to
+/// connectors that actually exist; if that drops every bar the daemon would
+/// otherwise start silently bar-less, so name both sides loudly instead.
+fn resolve_bars(config: &mut Config, output_names: &[String]) {
     if config.bars_enabled && config.bars.is_empty() {
         config.bars = output_names
             .iter()
@@ -992,7 +993,10 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 ..BarConfig::default()
             })
             .collect();
+        return;
     }
+
+    let configured: Vec<String> = config.bars.iter().map(|bar| bar.output.clone()).collect();
     config.bars.retain(|bar| {
         if output_names.contains(&bar.output) {
             true
@@ -1001,6 +1005,23 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             false
         }
     });
+
+    if config.bars_enabled && config.bars.is_empty() && !configured.is_empty() {
+        tracing::error!(
+            configured = %configured.join(", "),
+            connected = %output_names.join(", "),
+            "no configured bar output is connected; starting without any bar"
+        );
+    }
+}
+
+fn run_daemon(config_path: PathBuf) -> Result<()> {
+    let mut config = Config::load(&config_path)?;
+    let output_names = connected_outputs()?;
+    if output_names.is_empty() {
+        anyhow::bail!("Niri reported no connected outputs");
+    }
+    resolve_bars(&mut config, &output_names);
 
     let (snapshot_tx, snapshot_rx) = unbounded();
     let (niri_command_tx, niri_command_rx) = unbounded();
@@ -3073,6 +3094,65 @@ mod tests {
             reply_rx.try_recv().unwrap(),
             "error: Niri event stream unavailable\n"
         );
+    }
+
+    #[test]
+    fn empty_bar_list_auto_detects_every_connected_output() {
+        let mut config = Config {
+            bars_enabled: true,
+            bars: vec![],
+            ..Default::default()
+        };
+
+        resolve_bars(&mut config, &["eDP-1".to_string(), "DP-3".to_string()]);
+
+        let outputs: Vec<&str> = config.bars.iter().map(|bar| bar.output.as_str()).collect();
+        assert_eq!(outputs, vec!["eDP-1", "DP-3"]);
+    }
+
+    /// The shipped example is what the README tells a new user to copy, so it
+    /// has to produce bars on hardware that is not the author's.
+    #[test]
+    fn shipped_example_auto_detects_bars_on_unfamiliar_outputs() {
+        let source = include_str!("../../../config/niri-xmb.toml.example");
+        let mut config: Config = toml::from_str(source).unwrap();
+        config.validate().unwrap();
+
+        resolve_bars(&mut config, &["eDP-1".to_string(), "DP-3".to_string()]);
+
+        let outputs: Vec<&str> = config.bars.iter().map(|bar| bar.output.as_str()).collect();
+        assert_eq!(outputs, vec!["eDP-1", "DP-3"]);
+    }
+
+    #[test]
+    fn bars_naming_disconnected_outputs_are_dropped() {
+        let mut config = Config {
+            bars_enabled: true,
+            bars: vec![
+                BarConfig {
+                    output: "HDMI-A-1".to_string(),
+                    ..BarConfig::default()
+                },
+                BarConfig {
+                    output: "eDP-1".to_string(),
+                    ..BarConfig::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        resolve_bars(&mut config, &["eDP-1".to_string()]);
+
+        let outputs: Vec<&str> = config.bars.iter().map(|bar| bar.output.as_str()).collect();
+        assert_eq!(outputs, vec!["eDP-1"]);
+
+        // Every bar disconnected must not silently re-auto-detect.
+        config.bars = vec![BarConfig {
+            output: "HDMI-A-1".to_string(),
+            ..BarConfig::default()
+        }];
+        resolve_bars(&mut config, &["eDP-1".to_string()]);
+        assert!(config.bars.is_empty());
     }
 }
 
