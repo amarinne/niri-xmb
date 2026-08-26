@@ -6,6 +6,7 @@ mod icons;
 mod ipc;
 mod model;
 mod niri;
+mod panel;
 mod render;
 mod selection;
 mod subscribe;
@@ -25,6 +26,7 @@ use niri::{
 };
 use niri_ipc::socket::Socket;
 use niri_ipc::{Request, Response};
+use panel::PeekState;
 use render::{DragVisual, HitTarget, Renderer, SelectionVisual};
 use selection::{
     Selection, move_output as move_output_selection, move_within as move_selection,
@@ -1065,18 +1067,9 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut selection = Selection::default();
     let mut popup_was_open = false;
     let mut popup_mode = PopupMode::Hidden;
-    let mut peek_deadline: Option<Instant> = None;
+    let mut peek = PeekState::default();
     // Focus changes we caused ourselves must not bounce back as a peek.
     let mut peek_suppressed_until = Instant::now();
-    // When the peek overlay stops being click-through. The pointer region is
-    // withheld for a moment after it appears so that a click already on its way
-    // to whatever the overlay just covered still lands there.
-    let mut peek_pointer_at: Option<Instant> = None;
-    // Whether the peek overlay is currently claiming the panel rectangle. It
-    // outlives arming, and following focus to another output has to carry it
-    // across: re-showing the overlay as passive would drop the region with
-    // nothing left to hand it back.
-    let mut peek_pointer_live = false;
     let mut window_first_seen: HashMap<u64, Instant> = HashMap::new();
     // Focus state as last observed, versus as last acted on. The gap between
     // them is the burst of events still settling.
@@ -1201,7 +1194,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     && now >= peek_suppressed_until
                 {
                     let was_hidden = popup_mode == PopupMode::Hidden;
-                    peek_deadline = trigger_peek(
+                    let deadline = trigger_peek(
                         &mut surfaces,
                         &snapshot,
                         &config,
@@ -1209,11 +1202,13 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                         &mut popup_mode,
                         &mut selection,
                         peek_suppressed_until,
-                        peek_pointer_live,
+                        peek.pointer_live(),
                     )?;
+                    peek.set_deadline(deadline);
                     if was_hidden && popup_mode == PopupMode::Peek && config.peek.pointer_promote {
-                        peek_pointer_at =
-                            Some(Instant::now() + Duration::from_millis(config.peek.arm_grace_ms));
+                        peek.arm_pointer(
+                            Instant::now() + Duration::from_millis(config.peek.arm_grace_ms),
+                        );
                     }
                     dirty = true;
                 }
@@ -1229,26 +1224,23 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         if popup_mode.is_peek()
             && (snapshot.overview_open
                 || (popup_mode == PopupMode::Peek
-                    && peek_deadline_reached(peek_deadline, pending_focus_since, Instant::now())))
+                    && peek_deadline_reached(peek.deadline(), pending_focus_since, Instant::now())))
         {
             surfaces.hide_all_popups()?;
             popup_outputs.clear();
             popup_mode = PopupMode::Hidden;
-            peek_deadline = None;
-            peek_pointer_at = None;
-            peek_pointer_live = false;
+            peek.disarm();
             dirty = true;
         }
 
         // Hand the overlay to the pointer once the grace has passed. It keeps
         // the panel rectangle only, and never the keyboard, so everything
         // outside the panel — and every keybind — behaves as before.
-        if let Some(at) = peek_pointer_at
+        if let Some(at) = peek.pointer_at()
             && popup_mode.is_peek()
             && Instant::now() >= at
         {
-            peek_pointer_at = None;
-            peek_pointer_live = true;
+            peek.take_pointer();
             surfaces.set_popup_input(PopupInput::POINTER, false)?;
             dirty = true;
         }
@@ -1268,9 +1260,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     )?;
                     popup_mode = PopupMode::Manual;
                     // Taking control cancels the peek countdown.
-                    peek_deadline = None;
-                    peek_pointer_at = None;
-                    peek_pointer_live = false;
+                    peek.disarm();
                     follow_candidate = None;
                     reset_selection(&mut selection, &snapshot);
                     dirty = true;
@@ -1306,9 +1296,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                             PopupInput::FULL,
                         )?;
                         popup_mode = PopupMode::Manual;
-                        peek_deadline = None;
-                        peek_pointer_at = None;
-                        peek_pointer_live = false;
+                        peek.disarm();
                         follow_candidate = None;
                         reset_selection(&mut selection, &snapshot);
                     }
@@ -1513,9 +1501,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                         let capture = popup_capture_outside(&config, PopupInput::FULL);
                         surfaces.set_popup_input(PopupInput::FULL, capture)?;
                         popup_mode = PopupMode::Manual;
-                        peek_deadline = None;
-                        peek_pointer_at = None;
-                        peek_pointer_live = false;
+                        peek.disarm();
                         follow_candidate = None;
                         reset_selection(&mut selection, &snapshot);
                         dirty = true;
@@ -1525,17 +1511,17 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                             popup_mode = PopupMode::PeekArmed;
                             dirty = true;
                         }
-                        peek_deadline = None;
+                        peek.set_deadline(None);
                     }
                     PeekPointer::Disarm => {
                         if popup_mode == PopupMode::PeekArmed {
                             popup_mode = PopupMode::Peek;
                             // Moving away is a refusal, so the overlay leaves
                             // sooner than the countdown it never started would.
-                            peek_deadline = Some(
+                            peek.set_deadline(Some(
                                 Instant::now()
                                     + Duration::from_millis(config.peek.demote_ms.max(1)),
-                            );
+                            ));
                             dirty = true;
                         }
                     }
@@ -1591,9 +1577,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         if popup_was_open && !popup_open {
             selection.clear_session();
             popup_mode = PopupMode::Hidden;
-            peek_deadline = None;
-            peek_pointer_at = None;
-            peek_pointer_live = false;
+            peek.disarm();
             // Confirming a pick moves Niri's focus, which would otherwise come
             // straight back as a peek for the move just made.
             peek_suppressed_until = Instant::now() + SELF_FOCUS_GRACE;
@@ -1603,7 +1587,8 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         // Animation targets are recomputed every iteration, not only on
         // The accent means XMB has an active input mode. An armed peek has
         // claimed the pointer region, but normal peek remains passive.
-        dirty |= renderer.set_panel_input_active(panel_input_active(popup_mode, peek_pointer_live));
+        dirty |=
+            renderer.set_panel_input_active(panel_input_active(popup_mode, peek.pointer_live()));
 
         // redraw, so a settled UI stops requesting frames entirely.
         let selection_visual = selection_visual(&selection, &snapshot);
@@ -1675,10 +1660,10 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             wait_timeout =
                 wait_timeout.min(FOCUS_SETTLE.saturating_sub(now.saturating_duration_since(since)));
         }
-        if let Some(deadline) = peek_deadline {
+        if let Some(deadline) = peek.deadline() {
             wait_timeout = wait_timeout.min(deadline.saturating_duration_since(now));
         }
-        if let Some(at) = peek_pointer_at {
+        if let Some(at) = peek.pointer_at() {
             wait_timeout = wait_timeout.min(at.saturating_duration_since(now));
         }
         if let Some((_, since)) = &follow_candidate {
