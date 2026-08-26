@@ -1,7 +1,9 @@
 use crate::ipc;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -121,22 +123,52 @@ impl SubscriptionHub {
             }
             state.active += 1;
         }
+        // One release per connection, whichever side notices the client left
+        // first: the reader seeing EOF, or a failed write.
+        let closed = Arc::new(AtomicBool::new(false));
         let hello = format!(
             "{{\"type\":\"hello\",\"protocol\":{STREAM_PROTOCOL},\"schema\":{SNAPSHOT_SCHEMA},\
              \"instance\":\"{}\"}}\n",
             self.instance
         );
         let _ = writer.write_all(hello.as_bytes());
+        // Watch for the client hanging up. run_writer blocks on the condvar
+        // until a newer generation exists, so without this a disconnected
+        // subscriber would hold its slot until the next publish -- on an idle
+        // desktop, forever.
+        if let Ok(reader) = stream.try_clone() {
+            let hub = Arc::clone(self);
+            let closed = Arc::clone(&closed);
+            thread::Builder::new()
+                .name("niri-xmb-subscribe-eof".into())
+                .spawn(move || {
+                    let mut reader = reader;
+                    let mut discard = [0u8; 64];
+                    // Subscribers are not expected to say anything; anything
+                    // they do send is ignored. Only EOF or an error matters.
+                    while let Ok(read) = reader.read(&mut discard) {
+                        if read == 0 {
+                            break;
+                        }
+                    }
+                    if !closed.swap(true, Ordering::SeqCst) {
+                        hub.release();
+                    }
+                    let _ = reader.shutdown(Shutdown::Both);
+                })
+                .expect("failed to spawn subscription reader");
+        }
+
         let hub = Arc::clone(self);
         thread::Builder::new()
             .name("niri-xmb-subscribe".into())
             .spawn(move || {
-                hub.run_writer(writer);
+                hub.run_writer(writer, closed);
             })
             .expect("failed to spawn subscription writer");
     }
 
-    fn run_writer(&self, mut writer: UnixStream) {
+    fn run_writer(&self, mut writer: UnixStream, closed: Arc<AtomicBool>) {
         let _ = writer.set_write_timeout(Some(WRITE_TIMEOUT));
         let mut last_sent: Option<u64> = None;
         loop {
@@ -160,7 +192,9 @@ impl SubscriptionHub {
             match next.as_ref() {
                 Published::Snapshot { generation, line } => {
                     if writer.write_all(line.as_bytes()).is_err() {
-                        self.release();
+                        if !closed.swap(true, Ordering::SeqCst) {
+                            self.release();
+                        }
                         return;
                     }
                     last_sent = Some(*generation);
@@ -173,7 +207,9 @@ impl SubscriptionHub {
                         false,
                         &self.instance,
                     );
-                    self.release();
+                    if !closed.swap(true, Ordering::SeqCst) {
+                        self.release();
+                    }
                     return;
                 }
             }
@@ -437,9 +473,33 @@ mod tests {
         assert_eq!(hub.subscriber_count(), 0);
     }
 
+    /// A subscriber that hangs up while the daemon is idle must not keep its
+    /// slot. run_writer is blocked on the condvar in that state, so only the
+    /// read side can notice.
+    #[test]
+    fn a_disconnected_subscriber_releases_its_slot_without_a_publish() {
+        let hub = hub();
+        let (client, server) = UnixStream::pair().unwrap();
+        hub.attach(server, STREAM_PROTOCOL);
+        assert_eq!(hub.subscriber_count(), 1);
+
+        // The client goes away, and nothing is ever published afterwards.
+        drop(client);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while hub.subscriber_count() != 0 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            hub.subscriber_count(),
+            0,
+            "an idle daemon must still reclaim the slot of a client that hung up"
+        );
+    }
+
     fn read_one_line(mut stream: UnixStream) -> String {
         let mut line = String::new();
-        BufReader::new(stream.by_ref())
+        BufReader::new(Read::by_ref(&mut stream))
             .read_line(&mut line)
             .unwrap();
         line
