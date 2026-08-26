@@ -270,6 +270,10 @@ fn publish_health(
     }
 }
 
+/// Re-read the output layout and the overview flag.
+///
+/// This runs from the event-read path, so it asks both questions on one
+/// connection rather than dialling twice.
 fn refresh_outputs(state: &mut NiriState) {
     let Ok(mut socket) = Socket::connect() else {
         return;
@@ -279,9 +283,6 @@ fn refresh_outputs(state: &mut NiriState) {
     }
     // Overview state only arrives as an event on change, so seed it here. Niri
     // sends ConfigLoaded on connect, which brings us through this path.
-    let Ok(mut socket) = Socket::connect() else {
-        return;
-    };
     if let Ok(Ok(Response::OverviewState(overview))) = socket.send(Request::OverviewState) {
         state.set_overview_open(overview.is_open);
     }
