@@ -137,7 +137,7 @@ pub fn spawn(
                 match request {
                     NiriRequest::Command(command) => {
                         let restore_cursor = command.restore_cursor();
-                        let mut transport = SocketActionTransport;
+                        let mut transport = SocketActionTransport::default();
                         let mut result = execute_command(command, &mut transport);
                         restore_cursor_position(
                             restore_cursor,
@@ -155,7 +155,7 @@ pub fn spawn(
                         command,
                     } => {
                         let restore_cursor = command.restore_cursor();
-                        let mut transport = SocketActionTransport;
+                        let mut transport = SocketActionTransport::default();
                         let mut execution = execute_command(command, &mut transport);
                         restore_cursor_position(
                             restore_cursor,
@@ -381,16 +381,41 @@ trait ActionTransport {
     fn send(&mut self, action: Action) -> anyhow::Result<()>;
 }
 
-struct SocketActionTransport;
+/// A Niri action socket held open across the steps of one command.
+///
+/// A tiled move issues up to six actions. Reconnecting for each one spent
+/// most of the transaction's budget on socket setup, which is what made a
+/// successful move look like a timeout to the caller. Niri serves many
+/// requests per connection, so keep one and rebuild it only on error --
+/// that way a compositor restart still recovers on the next action.
+#[derive(Default)]
+struct SocketActionTransport {
+    socket: Option<Socket>,
+}
 
-impl ActionTransport for SocketActionTransport {
-    fn send(&mut self, action: Action) -> anyhow::Result<()> {
-        let mut socket = Socket::connect()?;
+impl SocketActionTransport {
+    /// Send on the existing connection, opening one if there is none.
+    fn send_once(&mut self, action: Action) -> anyhow::Result<()> {
+        let socket = match self.socket {
+            Some(ref mut socket) => socket,
+            None => self.socket.insert(Socket::connect()?),
+        };
         match socket.send(Request::Action(action))? {
             Ok(Response::Handled) => Ok(()),
             Ok(response) => anyhow::bail!("unexpected Niri response: {response:?}"),
             Err(error) => anyhow::bail!(error),
         }
+    }
+}
+
+impl ActionTransport for SocketActionTransport {
+    fn send(&mut self, action: Action) -> anyhow::Result<()> {
+        let Err(error) = self.send_once(action.clone()) else {
+            return Ok(());
+        };
+        tracing::debug!(%error, "retrying Niri action on a fresh socket");
+        self.socket = None;
+        self.send_once(action)
     }
 }
 
@@ -671,6 +696,7 @@ fn execute_command<T: ActionTransport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     #[test]
     fn health_keeps_last_errors_across_reconnects() {
@@ -682,5 +708,41 @@ mod tests {
         assert!(health.event_stream_connected);
         assert_eq!(health.last_event_error.as_deref(), Some("lost stream"));
         assert_eq!(health.last_action_error.as_deref(), Some("focus failed"));
+    }
+
+    /// Records every action it is handed, and fails the next send once when
+    /// `fail_next` is set.
+    #[derive(Default)]
+    struct FlakyTransport {
+        sent: RefCell<Vec<Action>>,
+        fail_next: RefCell<bool>,
+    }
+
+    impl ActionTransport for FlakyTransport {
+        fn send(&mut self, action: Action) -> anyhow::Result<()> {
+            self.sent.borrow_mut().push(action);
+            if *self.fail_next.borrow() {
+                *self.fail_next.borrow_mut() = false;
+                anyhow::bail!("transport is down");
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_step_records_the_failure_and_stops() {
+        let mut transport = FlakyTransport::default();
+        *transport.fail_next.borrow_mut() = true;
+        let execution = execute_command(NiriCommand::FocusWindow(1), &mut transport);
+        assert!(execution.failure.is_some());
+        assert!(execution.completed_steps.is_empty());
+    }
+
+    #[test]
+    fn a_successful_step_is_recorded() {
+        let mut transport = FlakyTransport::default();
+        let execution = execute_command(NiriCommand::FocusWindow(1), &mut transport);
+        assert!(execution.failure.is_none());
+        assert_eq!(execution.completed_steps, vec![ActionStep::FocusWindow]);
     }
 }
