@@ -1413,36 +1413,32 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     // The planner owns every rejection reason, so the target is
                     // built unconditionally and an unknown workspace surfaces
                     // as its own exact error instead of a generic refusal.
-                    let target = target_window_id
-                        .map(|window_id| HitTarget::Window {
+                    let fraction = clamp_fraction(fraction);
+                    let target = match target_window_id {
+                        Some(window_id) => DropTarget::Window {
                             workspace_id: target_workspace_id,
                             window_id,
-                            rect: render::Rect {
-                                x: 0.0,
-                                y: 0.0,
-                                width: 1.0,
-                                height: 1.0,
-                            },
-                            canvas: None,
-                        })
-                        .unwrap_or_else(|| HitTarget::Canvas {
+                            fraction,
+                            canvas_point: None,
+                        },
+                        None => DropTarget::Canvas {
                             workspace_id: target_workspace_id,
-                            rect: render::Rect {
-                                x: 0.0,
-                                y: 0.0,
-                                width: 1.0,
-                                height: 1.0,
+                            point: DropPoint {
+                                x: fraction,
+                                y: 0.5,
                             },
-                        });
+                        },
+                    };
+                    let allow_column_join = target_window_id.is_some()
+                        && column_join_allowed(&snapshot, &config, target_workspace_id);
                     // A drop is answered by its transaction, not here: the
                     // reply is staged until Niri confirms the move, the action
                     // fails, or the confirmation times out. Rejections before a
                     // transaction exists also go out through that channel.
                     dispatch_drop(
                         source_window_id,
-                        &target,
-                        fraction as f64,
-                        0.5,
+                        target,
+                        allow_column_join,
                         &snapshot,
                         &config,
                         None,
@@ -2045,11 +2041,12 @@ fn handle_ui_event(
                 {
                     let mode = panel.mode();
                     let is_open = panel.is_open();
+                    let (drop_target, allow_column_join) =
+                        drop_target_from_hit(target, local_x, local_y, snapshot, config);
                     let dropped = dispatch_drop(
                         released.window_id,
-                        target,
-                        local_x,
-                        local_y,
+                        drop_target,
+                        allow_column_join,
                         snapshot,
                         config,
                         if !is_open { None } else { popup_origin_focus },
@@ -2299,23 +2296,34 @@ fn queue_workspace_scroll(
     (next != current).then_some(output.workspaces[next].id)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn dispatch_drop(
-    source_window_id: u64,
+/// Whether the bar showing this workspace lets a centre drop join a column.
+fn column_join_allowed(snapshot: &Snapshot, config: &Config, workspace_id: u64) -> bool {
+    snapshot
+        .outputs
+        .values()
+        .find(|output| {
+            output
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == workspace_id)
+        })
+        .and_then(|output| config.bars.iter().find(|bar| bar.output == output.name))
+        .is_some_and(|bar| bar.allow_column_join)
+}
+
+/// Turn a pointer hit into a drop target.
+///
+/// Only the pointer has pixels to convert. The control socket already
+/// speaks in fractions and builds its target directly, rather than
+/// inventing a unit rectangle for `normalized_fraction` to undo.
+fn drop_target_from_hit(
     target: &HitTarget,
     local_x: f64,
     local_y: f64,
     snapshot: &Snapshot,
     config: &Config,
-    preserved_focus: Option<u64>,
-    restore_cursor: Option<(f64, f64)>,
-    transactions: &mut DropTransactionState,
-    reply: Option<crossbeam_channel::Sender<String>>,
-    niri_tx: &crossbeam_channel::Sender<NiriRequest>,
-    panel_mode: PopupMode,
-    panel_visible: bool,
-) -> bool {
-    let (target, allow_column_join) = match target {
+) -> (DropTarget, bool) {
+    match target {
         HitTarget::Panel => (DropTarget::Panel, false),
         HitTarget::Workspace { workspace_id, .. } => (
             DropTarget::Workspace {
@@ -2345,19 +2353,26 @@ fn dispatch_drop(
                 fraction: normalized_fraction(local_x as f32, rect.x, rect.width),
                 canvas_point: canvas.map(|canvas| normalized_drop_point(canvas, local_x, local_y)),
             },
-            snapshot
-                .outputs
-                .values()
-                .find(|output| {
-                    output
-                        .workspaces
-                        .iter()
-                        .any(|workspace| workspace.id == *workspace_id)
-                })
-                .and_then(|output| config.bars.iter().find(|bar| bar.output == output.name))
-                .is_some_and(|bar| bar.allow_column_join),
+            column_join_allowed(snapshot, config, *workspace_id),
         ),
-    };
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_drop(
+    source_window_id: u64,
+    target: DropTarget,
+    allow_column_join: bool,
+    snapshot: &Snapshot,
+    config: &Config,
+    preserved_focus: Option<u64>,
+    restore_cursor: Option<(f64, f64)>,
+    transactions: &mut DropTransactionState,
+    reply: Option<crossbeam_channel::Sender<String>>,
+    niri_tx: &crossbeam_channel::Sender<NiriRequest>,
+    panel_mode: PopupMode,
+    panel_visible: bool,
+) -> bool {
     tracing::info!(
         source = source_window_id,
         target = %target.describe(),
@@ -2416,13 +2431,18 @@ fn normalized_drop_point(rect: render::Rect, local_x: f64, local_y: f64) -> Drop
     }
 }
 
-fn normalized_fraction(value: f32, origin: f32, length: f32) -> f32 {
-    let fraction = (value - origin) / length.max(1.0);
+/// Hold a fraction inside the unit range, leaving a non-finite value alone
+/// so the planner rejects it rather than silently reading it as an edge.
+fn clamp_fraction(fraction: f32) -> f32 {
     if fraction.is_finite() {
         fraction.clamp(0.0, 1.0)
     } else {
         fraction
     }
+}
+
+fn normalized_fraction(value: f32, origin: f32, length: f32) -> f32 {
+    clamp_fraction((value - origin) / length.max(1.0))
 }
 
 /// In live mode, apply the selection to Niri as soon as it moves.
@@ -2701,19 +2721,13 @@ mod tests {
 
         let submitted = dispatch_drop(
             42,
-            &HitTarget::Window {
+            DropTarget::Window {
                 workspace_id: 7,
                 window_id: 999,
-                rect: render::Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 100.0,
-                    height: 20.0,
-                },
-                canvas: None,
+                fraction: normalized_fraction(10.0, 0.0, 100.0),
+                canvas_point: None,
             },
-            10.0,
-            10.0,
+            false,
             &snapshot,
             &Config::default(),
             None,
@@ -2741,17 +2755,14 @@ mod tests {
 
         let submitted = dispatch_drop(
             42,
-            &HitTarget::Canvas {
+            DropTarget::Canvas {
                 workspace_id: 999,
-                rect: render::Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 1.0,
-                    height: 1.0,
+                point: DropPoint {
+                    x: normalized_fraction(0.5, 0.0, 1.0),
+                    y: normalized_fraction(0.5, 0.0, 1.0),
                 },
             },
-            0.5,
-            0.5,
+            false,
             &snapshot,
             &Config::default(),
             None,
