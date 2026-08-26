@@ -1651,21 +1651,31 @@ fn truncate_label_to_width(
     if text.measure(ELLIPSIS, size) > max_width {
         return String::new();
     }
-    let mut shortened = String::new();
-    for character in label.chars() {
-        let mut candidate = shortened.clone();
-        candidate.push(character);
+
+    let mut boundaries: Vec<usize> = label.char_indices().map(|(at, _)| at).collect();
+    boundaries.push(label.len());
+    let mut candidate = String::with_capacity(label.len() + ELLIPSIS.len());
+    let mut fits = 0usize;
+    let mut over = boundaries.len() - 1;
+    while over - fits > 1 {
+        let middle = fits + (over - fits) / 2;
+        candidate.clear();
+        candidate.push_str(&label[..boundaries[middle]]);
         candidate.push_str(ELLIPSIS);
-        if text.measure(&candidate, size) > max_width {
-            break;
+        if text.measure(&candidate, size) <= max_width {
+            fits = middle;
+        } else {
+            over = middle;
         }
-        shortened.push(character);
     }
-    if shortened.is_empty() {
+
+    if fits == 0 {
         ELLIPSIS.into()
     } else {
-        shortened.push_str(ELLIPSIS);
-        shortened
+        let mut result = String::with_capacity(boundaries[fits] + ELLIPSIS.len());
+        result.push_str(&label[..boundaries[fits]]);
+        result.push_str(ELLIPSIS);
+        result
     }
 }
 
@@ -1831,5 +1841,33 @@ mod tests {
 
         assert!(renderer.surfaces.is_empty());
         assert!(renderer.hit_zones.is_empty());
+    }
+
+    /// Truncation must still produce the longest prefix that fits, and must
+    /// not measure every prefix on the way there.
+    #[test]
+    fn truncation_keeps_the_longest_prefix_that_fits() {
+        let mut text = TextRenderer::new();
+        let label = "a very long window title that will not fit";
+        let full = text.measure(label, 14.0);
+
+        // Room for everything: unchanged.
+        assert_eq!(
+            truncate_label_to_width(&mut text, label, full + 10.0, 14.0),
+            label
+        );
+        // No room at all.
+        assert_eq!(truncate_label_to_width(&mut text, label, 0.0, 14.0), "");
+
+        let clipped = truncate_label_to_width(&mut text, label, full / 2.0, 14.0);
+        assert!(
+            clipped.ends_with('…'),
+            "clipped label must be marked: {clipped:?}"
+        );
+        assert!(
+            text.measure(&clipped, 14.0) <= full / 2.0,
+            "clipped label must actually fit"
+        );
+        assert!(clipped.chars().count() < label.chars().count());
     }
 }

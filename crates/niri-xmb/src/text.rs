@@ -13,6 +13,13 @@ use fontdue::{
 use std::collections::HashMap;
 use tiny_skia::{Color, Pixmap};
 
+/// Bound for the two string-keyed caches.
+///
+/// Titles change many times a second and every distinct string measured
+/// used to stay for the life of the process. `glyph_cache` is deliberately
+/// not bounded: it is keyed by (font, char, size), so the charset bounds it.
+const STRING_CACHE_CAPACITY: usize = 512;
+
 #[derive(Hash, PartialEq, Eq, Clone)]
 struct GlyphKey(u8, char, u16);
 
@@ -35,8 +42,11 @@ pub struct TextRenderer {
     layout: Layout,
     has_nerd_font: bool,
     glyph_cache: HashMap<GlyphKey, CachedGlyph>,
-    measure_cache: HashMap<MeasureKey, f32>,
-    layout_cache: HashMap<MeasureKey, LayoutEntry>,
+    measure_cache: HashMap<MeasureKey, (f32, u64)>,
+    layout_cache: HashMap<MeasureKey, (LayoutEntry, u64)>,
+    /// Monotonic tick stamped onto each cache hit, so the cheapest entries
+    /// to drop can be found without keeping a second ordering structure.
+    cache_clock: u64,
 }
 
 impl Default for TextRenderer {
@@ -99,6 +109,7 @@ impl TextRenderer {
             glyph_cache: HashMap::with_capacity(512),
             measure_cache: HashMap::with_capacity(256),
             layout_cache: HashMap::with_capacity(256),
+            cache_clock: 0,
         }
     }
 
@@ -129,6 +140,7 @@ impl TextRenderer {
         let size_key = (size * 2.0).round() as u16;
         let lkey = MeasureKey(text.into(), size_key);
 
+        self.cache_clock += 1;
         if !self.layout_cache.contains_key(&lkey) {
             let mut entry = LayoutEntry {
                 glyphs: Vec::new(),
@@ -158,13 +170,20 @@ impl TextRenderer {
                     .fold(0.0f32, f32::max);
                 entry.advance += run_w;
             });
-            self.layout_cache.insert(lkey.clone(), entry);
+            self.layout_cache
+                .insert(lkey.clone(), (entry, self.cache_clock));
+            evict_least_recently_used(&mut self.layout_cache, STRING_CACHE_CAPACITY);
+        }
+
+        if let Some(entry) = self.layout_cache.get_mut(&lkey) {
+            entry.1 = self.cache_clock;
         }
 
         // Populate missing bitmaps before borrowing the cached layout for the
         // draw pass. This keeps the hot path on borrowed layout data instead
         // of cloning every positioned glyph for every animated frame.
         let missing = self.layout_cache[&lkey]
+            .0
             .glyphs
             .iter()
             .map(|(key, _, _)| key)
@@ -184,7 +203,7 @@ impl TextRenderer {
             );
         }
 
-        let entry = &self.layout_cache[&lkey];
+        let entry = &self.layout_cache[&lkey].0;
         let advance = entry.advance;
 
         let pixels = pixmap.pixels_mut();
@@ -232,8 +251,10 @@ impl TextRenderer {
         }
         let size_key = (size * 2.0).round() as u16;
         let key = MeasureKey(text.into(), size_key);
-        if let Some(&cached) = self.measure_cache.get(&key) {
-            return cached;
+        self.cache_clock += 1;
+        if let Some(entry) = self.measure_cache.get_mut(&key) {
+            entry.1 = self.cache_clock;
+            return entry.0;
         }
         let mut total = 0.0f32;
         for_each_run(text, self.has_nerd_font, |run_text, font_idx| {
@@ -251,8 +272,16 @@ impl TextRenderer {
                 .fold(0.0f32, f32::max);
             total += w;
         });
-        self.measure_cache.insert(key, total);
+        self.measure_cache.insert(key, (total, self.cache_clock));
+        evict_least_recently_used(&mut self.measure_cache, STRING_CACHE_CAPACITY);
         total
+    }
+
+    /// Number of cached string measurements. Exposed so a test can show the
+    /// cache stays bounded under title churn.
+    #[cfg(test)]
+    pub fn measure_cache_len(&self) -> usize {
+        self.measure_cache.len()
     }
 }
 
@@ -315,4 +344,41 @@ fn load_font(paths: &[&str]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// Drop the least recently used half once a cache passes its bound.
+///
+/// Evicting in one block rather than one entry per insert keeps the hit
+/// path free of bookkeeping beyond a counter bump, at the cost of a scan
+/// that only runs when the cache is actually full.
+fn evict_least_recently_used<V>(cache: &mut HashMap<MeasureKey, (V, u64)>, capacity: usize) {
+    if cache.len() <= capacity {
+        return;
+    }
+    let mut stamps: Vec<u64> = cache.values().map(|(_, used)| *used).collect();
+    let keep = capacity / 2;
+    stamps.sort_unstable();
+    let cutoff = stamps[stamps.len() - keep];
+    cache.retain(|_, (_, used)| *used >= cutoff);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A long title used to leave one cache entry per prefix behind, and the
+    /// cache never shrank. Churn through far more distinct strings than the
+    /// bound and confirm it holds.
+    #[test]
+    fn measure_cache_stays_bounded_under_title_churn() {
+        let mut text = TextRenderer::new();
+        for index in 0..(STRING_CACHE_CAPACITY * 4) {
+            text.measure(&format!("window title number {index}"), 14.0);
+        }
+        assert!(
+            text.measure_cache_len() <= STRING_CACHE_CAPACITY,
+            "measure cache grew to {} with a bound of {STRING_CACHE_CAPACITY}",
+            text.measure_cache_len()
+        );
+    }
 }
