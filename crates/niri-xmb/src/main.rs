@@ -1346,7 +1346,9 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                             .iter()
                             .position(|id| Some(*id) == snapshot.focused_window)
                             .or_else(|| {
-                                windows.iter().position(|id| Some(*id) == workspace.active_window)
+                                windows
+                                    .iter()
+                                    .position(|id| Some(*id) == workspace.active_window)
                             })
                             .unwrap_or(0);
                         let len = windows.len() as i64;
