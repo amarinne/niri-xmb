@@ -26,6 +26,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Verify tag matches crate version
+        run: |
+          crate_version="$(cargo metadata --no-deps --format-version 1 \
+            | sed -n 's/.*"name":"niri-xmb".*"version":"\([^"]*\)".*/\1/p')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$crate_version" != "$tag_version" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${crate_version}" >&2
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches crate version ${crate_version}"
       - name: Install native build dependencies
         run: |
           sudo apt-get update
