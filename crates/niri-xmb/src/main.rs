@@ -966,6 +966,9 @@ fn status_response(
         "outputs": popup_outputs,
         "generation": snapshot.generation,
         "socket": ipc::socket_path(),
+        // The dock polls this file instead of forking a process per tick; it
+        // cannot read the environment, so the path is published here.
+        "snapshot_mirror": mirror::mirror_path(),
         "cursor_restore": cursor_restore,
         "niri": {
             "event_stream_connected": niri_health.event_stream_connected,
@@ -2614,6 +2617,13 @@ mod tests {
         assert_eq!(value["niri"]["event_stream_connected"], false);
         assert_eq!(value["niri"]["last_event_error"], "stream lost");
         assert_eq!(value["niri"]["last_action_error"], "focus failed");
+
+        // The dock discovers the mirror through status; without this it would
+        // have to keep forking a process every tick.
+        assert!(
+            value.get("snapshot_mirror").is_some(),
+            "status must publish where the snapshot mirror lives"
+        );
     }
 
     #[test]
