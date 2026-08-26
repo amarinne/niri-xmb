@@ -1510,11 +1510,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 match classify_peek_pointer(&event) {
                     PeekPointer::Promote => {
                         popup_origin_focus = snapshot.focused_window;
-                        let capture = popup_capture_outside(
-                            &config,
-                            surfaces.cursor_restore_available(),
-                            PopupInput::FULL,
-                        );
+                        let capture = popup_capture_outside(&config, PopupInput::FULL);
                         surfaces.set_popup_input(PopupInput::FULL, capture)?;
                         popup_mode = PopupMode::Manual;
                         peek_deadline = None;
@@ -1890,11 +1886,13 @@ fn popup_output_targets(snapshot: &Snapshot, config: &Config) -> Vec<String> {
     }
 }
 
-/// Capture outside clicks whenever the popup must dismiss.
+/// Whether the popup should capture clicks landing outside its rectangle.
 ///
-/// A virtual pointer can replay the click after dismissal. Without one, the
-/// click still closes the popup instead of trapping the user in it.
-fn should_capture_outside_click(config: &Config, _virtual_pointer_available: bool) -> bool {
+/// This follows `behavior.close_on_outside_click` and nothing else.
+/// Replaying the click needs a virtual pointer, but that is decided at the
+/// dismissal site, not here, so pointer availability does not belong in
+/// this predicate.
+fn should_capture_outside_click(config: &Config) -> bool {
     config.behavior.close_on_outside_click
 }
 
@@ -1914,12 +1912,8 @@ fn should_close_on_external_focus_change(
 /// Only a manual session may do this. A peek overlay claiming the full output
 /// would turn a passive readout into a modal one, so it is held to the panel
 /// rectangle whatever the outside-click settings say.
-fn popup_capture_outside(
-    config: &Config,
-    virtual_pointer_available: bool,
-    input: PopupInput,
-) -> bool {
-    input.keyboard && should_capture_outside_click(config, virtual_pointer_available)
+fn popup_capture_outside(config: &Config, input: PopupInput) -> bool {
+    input.keyboard && should_capture_outside_click(config)
 }
 
 fn show_popup(
@@ -1930,7 +1924,7 @@ fn show_popup(
     input: PopupInput,
 ) -> Result<()> {
     let outputs = popup_output_targets(snapshot, config);
-    let capture_outside = popup_capture_outside(config, surfaces.cursor_restore_available(), input);
+    let capture_outside = popup_capture_outside(config, input);
     surfaces.show_popups_with(&outputs, input, capture_outside)?;
     visible.clear();
     visible.extend(outputs);
@@ -1982,7 +1976,7 @@ fn update_following_popup(
         .take()
         .map(|(output, _)| output)
         .unwrap_or(active_output);
-    let capture_outside = should_capture_outside_click(config, surfaces.cursor_restore_available());
+    let capture_outside = should_capture_outside_click(config);
     surfaces.show_popups(std::slice::from_ref(&active_output), capture_outside)?;
     visible.clear();
     visible.insert(active_output.clone());
@@ -2817,17 +2811,21 @@ mod tests {
         );
     }
 
+    /// Capture follows `close_on_outside_click` alone; the replay setting
+    /// governs what happens after dismissal, not whether the click is caught.
     #[test]
-    fn outside_click_replay_requires_virtual_pointer() {
+    fn outside_click_capture_ignores_the_replay_setting() {
         let mut config = Config::default();
         config.behavior.close_on_outside_click = true;
-        config.behavior.replay_outside_click = true;
 
-        assert!(should_capture_outside_click(&config, false));
-        assert!(should_capture_outside_click(&config, true));
+        config.behavior.replay_outside_click = true;
+        assert!(should_capture_outside_click(&config));
 
         config.behavior.replay_outside_click = false;
-        assert!(should_capture_outside_click(&config, false));
+        assert!(should_capture_outside_click(&config));
+
+        config.behavior.close_on_outside_click = false;
+        assert!(!should_capture_outside_click(&config));
     }
 
     #[test]
@@ -3310,9 +3308,9 @@ mod selection_tests {
         config.behavior.close_on_outside_click = true;
         config.behavior.replay_outside_click = false;
 
-        assert!(popup_capture_outside(&config, true, PopupInput::FULL));
-        assert!(!popup_capture_outside(&config, true, PopupInput::POINTER));
-        assert!(!popup_capture_outside(&config, true, PopupInput::NONE));
+        assert!(popup_capture_outside(&config, PopupInput::FULL));
+        assert!(!popup_capture_outside(&config, PopupInput::POINTER));
+        assert!(!popup_capture_outside(&config, PopupInput::NONE));
     }
 
     #[test]
