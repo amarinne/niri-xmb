@@ -16,7 +16,27 @@ const MAX_REQUEST_BYTES: usize = 4096;
 const CLIENT_WORKERS: usize = 4;
 const CLIENT_QUEUE_CAPACITY: usize = 16;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(1);
-const DAEMON_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Everything a drop is allowed, end to end: the Niri actions, then the
+/// wait for the event stream to confirm them.
+const DROP_BUDGET_MS: u64 = 2400;
+
+/// The share of the budget reserved for confirmation, measured from when
+/// the last Niri action returns. What is left is what the actions get.
+pub const DROP_CONFIRM_TIMEOUT: Duration = Duration::from_millis(1200);
+
+/// How long the control socket waits for the daemon's reply.
+///
+/// This must strictly outlast the transaction it is waiting on. When it
+/// did not, the socket reported "daemon timeout" and dropped the reply
+/// channel for a drop that was still being confirmed -- and the drop then
+/// replied into a dead channel, so a move that succeeded was reported to
+/// the dock as a failure. The margin covers scheduling, not work.
+const DAEMON_REPLY_TIMEOUT: Duration = Duration::from_millis(DROP_BUDGET_MS + 600);
+
+/// The budget as a `Duration`, for the assertions that keep the two sides
+/// from drifting apart again.
+#[cfg(test)]
+const DROP_BUDGET: Duration = Duration::from_millis(DROP_BUDGET_MS);
 const COMMAND_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -750,5 +770,20 @@ mod tests {
         let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(frame["type"], "error");
         assert_eq!(frame["code"], "unsupported_protocol");
+    }
+
+    /// The two sides of a drop are derived from one budget precisely so they
+    /// cannot invert again. If they do, a successful move gets reported as a
+    /// failure.
+    #[test]
+    fn the_control_socket_outlasts_the_drop_it_waits_on() {
+        assert!(
+            DAEMON_REPLY_TIMEOUT > DROP_BUDGET,
+            "the reply wait must outlast the whole drop budget"
+        );
+        assert!(
+            DROP_BUDGET > DROP_CONFIRM_TIMEOUT,
+            "confirmation cannot be allowed the entire budget; the actions need some"
+        );
     }
 }

@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 use config::{BarConfig, Config, NavigationMode, PopupOutputs, PopupPosition, PopupSurfaceMode};
 use crossbeam_channel::unbounded;
 use drop_plan::{DropPoint, DropPolicy, DropRequest, DropTarget, plan_drop};
-use ipc::{ControlCommand, ControlRequest};
+use ipc::{ControlCommand, ControlRequest, DROP_CONFIRM_TIMEOUT};
 use model::Snapshot;
 use niri::{
     ActionStep, ActionTransactionResult, NiriCommand, NiriHealth, NiriRequest, RestorationStatus,
@@ -63,9 +63,6 @@ const FOCUS_SETTLE: Duration = Duration::from_millis(120);
 /// any fixed grace period, and the focus event on its own is indistinguishable
 /// from navigation unless the window's age is known.
 const NEW_WINDOW_GRACE: Duration = Duration::from_millis(1200);
-
-/// Maximum time to wait for the event stream after all Niri actions complete.
-const DROP_CONFIRM_TIMEOUT: Duration = Duration::from_millis(1200);
 
 /// Let events from a failed partial action sequence reach the canonical model.
 const DROP_FAILURE_RECONCILE: Duration = Duration::from_millis(120);
@@ -2984,6 +2981,43 @@ mod tests {
             reply_rx.try_recv().unwrap(),
             "error: drop confirmation timeout\n"
         );
+    }
+
+    /// Niri actions used to have to finish inside about 800 ms or the control
+    /// socket gave up and reported a failure for a drop that was still being
+    /// confirmed. A slow action sequence must still be able to reply ok.
+    #[test]
+    fn a_slow_action_sequence_still_confirms() {
+        let snapshot = protocol_snapshot();
+        let (niri_tx, _niri_rx) = crossbeam_channel::unbounded();
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let mut state = DropTransactionState::default();
+
+        let request_id = state
+            .submit(
+                confirmed_plan(snapshot.generation),
+                &snapshot,
+                Some(reply_tx),
+                &niri_tx,
+            )
+            .unwrap();
+
+        // The actions take longer than the old 2 s reply bound allowed.
+        let submitted_at = Instant::now();
+        let result_at = submitted_at + Duration::from_millis(2500);
+        state.record_action_result(
+            niri::ActionTransactionResult {
+                request_id,
+                completed_steps: vec![ActionStep::MoveColumn],
+                failure: None,
+                focus_restoration: niri::RestorationStatus::Completed,
+                cursor_restoration: niri::RestorationStatus::NotRequested,
+            },
+            result_at,
+        );
+        state.reconcile(&snapshot, true, result_at + Duration::from_millis(1));
+
+        assert_eq!(reply_rx.try_recv().unwrap(), "ok\n");
     }
 
     #[test]
