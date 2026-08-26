@@ -278,8 +278,8 @@ impl DropTransactionState {
         );
         let command = plan.clone().into_command();
         niri_tx
-            .send(NiriRequest::Transaction {
-                request_id,
+            .send(NiriRequest {
+                request_id: Some(request_id),
                 command,
             })
             .map_err(|_| "Niri command worker unavailable")?;
@@ -2212,9 +2212,7 @@ fn focus_adjacent_workspace(
         return false;
     };
     niri_tx
-        .send(NiriRequest::Command(NiriCommand::FocusWorkspace(
-            workspace_id,
-        )))
+        .send(NiriCommand::FocusWorkspace(workspace_id).into())
         .is_ok()
 }
 

@@ -59,18 +59,21 @@ pub enum NiriCommand {
     },
 }
 
+/// One command for the action worker.
 #[derive(Debug, Clone)]
-pub enum NiriRequest {
-    Command(NiriCommand),
-    Transaction {
-        request_id: u64,
-        command: NiriCommand,
-    },
+pub struct NiriRequest {
+    /// Set when the caller is waiting for a structured result -- a drop
+    /// transaction. `None` is fire-and-forget: run it and log any failure.
+    pub request_id: Option<u64>,
+    pub command: NiriCommand,
 }
 
 impl From<NiriCommand> for NiriRequest {
     fn from(command: NiriCommand) -> Self {
-        Self::Command(command)
+        Self {
+            request_id: None,
+            command,
+        }
     }
 }
 
@@ -133,50 +136,39 @@ pub fn spawn(
     thread::Builder::new()
         .name("niri-xmb-actions".into())
         .spawn(move || {
-            while let Ok(request) = command_rx.recv() {
-                match request {
-                    NiriRequest::Command(command) => {
-                        let restore_cursor = command.restore_cursor();
-                        let mut transport = SocketActionTransport::default();
-                        let mut result = execute_command(command, &mut transport);
-                        restore_cursor_position(
-                            restore_cursor,
-                            &cursor_restore_tx,
-                            &mut result.cursor_restoration,
-                        );
-                        if let Some(failure) = result.failure {
-                            tracing::warn!(step = ?failure.step, error = %failure.error, "Niri action failed");
-                            let _ = health_tx.send(NiriHealthUpdate::ActionFailed(failure.error));
-                        }
-                        wake.wake();
-                    }
-                    NiriRequest::Transaction {
-                        request_id,
-                        command,
-                    } => {
-                        let restore_cursor = command.restore_cursor();
-                        let mut transport = SocketActionTransport::default();
-                        let mut execution = execute_command(command, &mut transport);
-                        restore_cursor_position(
-                            restore_cursor,
-                            &cursor_restore_tx,
-                            &mut execution.cursor_restoration,
-                        );
-                        if let Some(failure) = &execution.failure {
-                            tracing::warn!(request_id, step = ?failure.step, error = %failure.error, "Niri transaction failed");
-                            let _ = health_tx
-                                .send(NiriHealthUpdate::ActionFailed(failure.error.clone()));
-                        }
-                        let _ = transaction_tx.send(ActionTransactionResult {
-                            request_id,
-                            completed_steps: execution.completed_steps,
-                            failure: execution.failure,
-                            focus_restoration: execution.focus_restoration,
-                            cursor_restoration: execution.cursor_restoration,
-                        });
-                        wake.wake();
-                    }
+            while let Ok(NiriRequest {
+                request_id,
+                command,
+            }) = command_rx.recv()
+            {
+                let restore_cursor = command.restore_cursor();
+                let mut transport = SocketActionTransport::default();
+                let mut execution = execute_command(command, &mut transport);
+                restore_cursor_position(
+                    restore_cursor,
+                    &cursor_restore_tx,
+                    &mut execution.cursor_restoration,
+                );
+                if let Some(failure) = &execution.failure {
+                    tracing::warn!(
+                        request_id = ?request_id,
+                        step = ?failure.step,
+                        error = %failure.error,
+                        "Niri action failed"
+                    );
+                    let _ = health_tx.send(NiriHealthUpdate::ActionFailed(failure.error.clone()));
                 }
+                // Only a transaction has someone waiting on a structured result.
+                if let Some(request_id) = request_id {
+                    let _ = transaction_tx.send(ActionTransactionResult {
+                        request_id,
+                        completed_steps: execution.completed_steps,
+                        failure: execution.failure,
+                        focus_restoration: execution.focus_restoration,
+                        cursor_restoration: execution.cursor_restoration,
+                    });
+                }
+                wake.wake();
             }
         })
         .expect("failed to spawn niri action thread");
