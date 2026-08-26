@@ -5,44 +5,52 @@
 
 bars_enabled = true # false runs only the popup/peek daemon
 
-# Replace these connector names with `niri msg --json outputs` results.
-[[bars]]
-output = "HDMI-A-1"          # exact Niri connector name
-edge = "top"                 # "top", "bottom", "left", or "right"
-align = "center"             # "start", "center", or "end" along that edge
-width = 1000                 # 1-8192 px horizontal; 1-512 px vertical
-height = 42                  # 1-512 px horizontal; 1-8192 px vertical
-margin = 56                  # edge distance, 0-8192 logical pixels
-offset = 0                   # aligned shift, -8192 to 8192 logical pixels
-allow_column_join = false    # center drops join a Niri column when true
-show_workspace_labels = false # show workspace names/numbers beside icons
-hide_empty_workspaces = false # omit empty workspaces when true
-show_capsule = true          # draw each workspace as its own pill
-show_active_indicator = true # mark the active window in each workspace
-scroll_to_switch = true      # one ratchet click changes one workspace
-scroll_wrap = true           # wheel navigation wraps at the ends
-scroll_reverse = false       # reverse the wheel direction
-scroll_repeat_ms = 75        # free-spin limit, 0-5000 milliseconds
-
+# With no [[bars]] entries, one bar is created per connected output using the
+# defaults below. That is what a fresh install wants, so leave this list empty
+# unless you need per-monitor settings.
+#
+# To configure bars explicitly, uncomment a block and replace the connector
+# name with one from `niri msg --json outputs`. A connector that is not
+# connected is dropped, so a stale name means no bar on that monitor.
+#
+# [[bars]]
+# output = "HDMI-A-1"          # exact Niri connector name
+# edge = "top"                 # "top", "bottom", "left", or "right"
+# align = "center"             # "start", "center", or "end" along that edge
+# width = 1000                 # 1-8192 px horizontal; 1-512 px vertical
+# height = 42                  # 1-512 px horizontal; 1-8192 px vertical
+# margin = 56                  # edge distance, 0-8192 logical pixels
+# offset = 0                   # aligned shift, -8192 to 8192 logical pixels
+# allow_column_join = false    # center drops join a Niri column when true
+# show_workspace_labels = false # show workspace names/numbers beside icons
+# hide_empty_workspaces = false # omit empty workspaces when true
+# show_capsule = true          # draw each workspace as its own pill
+# show_active_indicator = true # mark the active window in each workspace
+# scroll_to_switch = true      # one ratchet click changes one workspace
+# scroll_wrap = true           # wheel navigation wraps at the ends
+# scroll_reverse = false       # reverse the wheel direction
+# scroll_repeat_ms = 75        # free-spin limit, 0-5000 milliseconds
+#
 # Additional bars use the same parameters and can differ per monitor. A
 # portrait output can opt into the center join zone independently.
-[[bars]]
-output = "HDMI-A-2"
-edge = "top"
-align = "center"
-width = 1000
-height = 42
-margin = 56
-offset = 0
-allow_column_join = true
-show_workspace_labels = false
-hide_empty_workspaces = false
-show_capsule = true
-show_active_indicator = true
-scroll_to_switch = true
-scroll_wrap = true
-scroll_reverse = false
-scroll_repeat_ms = 75
+#
+# [[bars]]
+# output = "HDMI-A-2"
+# edge = "top"
+# align = "center"
+# width = 1000
+# height = 42
+# margin = 56
+# offset = 0
+# allow_column_join = true
+# show_workspace_labels = false
+# hide_empty_workspaces = false
+# show_capsule = true
+# show_active_indicator = true
+# scroll_to_switch = true
+# scroll_wrap = true
+# scroll_reverse = false
+# scroll_repeat_ms = 75
 
 [popup]
 outputs = "combined" # "focused", "all", or "combined"

@@ -1033,9 +1033,13 @@ mod tests {
         let source = include_str!("../../../config/niri-xmb.toml.example");
         let config = toml::from_str::<Config>(source).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.bars.len(), 2);
-        assert!(!config.bars[0].allow_column_join);
-        assert!(config.bars[1].allow_column_join);
+        // The example must not name this developer's connectors: a copied
+        // config has to auto-detect bars on whatever monitors the user has.
+        assert!(config.bars_enabled);
+        assert!(
+            config.bars.is_empty(),
+            "shipped example must not pin [[bars]] to specific connectors"
+        );
     }
 
     #[test]
