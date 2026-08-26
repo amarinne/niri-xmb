@@ -663,6 +663,7 @@ mod tests {
             focused_window: Some(11),
             overview_open: false,
             generation: 1,
+            content_revision: 0,
         }
     }
 

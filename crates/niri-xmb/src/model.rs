@@ -8,6 +8,11 @@ pub struct Snapshot {
     /// Whether Niri's own overview is on screen.
     pub overview_open: bool,
     pub generation: u64,
+    /// Counts changes that alter what is written on screen without moving
+    /// anything: window titles today. Split from `generation` so a title
+    /// churning at 10 Hz cannot drive relayouts and hit-test rebuilds,
+    /// while still reaching consumers that display it.
+    pub content_revision: u64,
 }
 
 impl Snapshot {
@@ -157,6 +162,7 @@ pub struct NiriState {
     windows: HashMap<u64, Window>,
     overview_open: bool,
     generation: u64,
+    content_revision: u64,
 }
 
 impl NiriState {
@@ -253,6 +259,12 @@ impl NiriState {
                 || previous.is_urgent != window.is_urgent
                 || previous.layout != window.layout
         });
+        // Titles move without anything moving. Tracked separately so they
+        // reach the navigator and the stream without forcing a relayout.
+        let content_changed = self
+            .windows
+            .get(&window.id)
+            .is_some_and(|previous| previous.title != window.title);
         if window.is_focused {
             for other in self.windows.values_mut() {
                 if other.id != window.id && other.is_focused {
@@ -265,7 +277,12 @@ impl NiriState {
         if changed {
             self.generation += 1;
         }
-        changed
+        if content_changed {
+            self.content_revision += 1;
+        }
+        // Either kind of change is worth publishing; only `changed` means the
+        // layout moved.
+        changed || content_changed
     }
 
     pub fn set_overview_open(&mut self, open: bool) {
@@ -393,6 +410,7 @@ impl NiriState {
             focused_window,
             overview_open: self.overview_open,
             generation: self.generation,
+            content_revision: self.content_revision,
         }
     }
 }
@@ -422,18 +440,25 @@ mod tests {
         }
     }
 
+    /// A title change must reach consumers without being mistaken for a
+    /// layout change: the navigator draws titles, but a title churning at
+    /// 10 Hz must not drive relayouts and hit-test rebuilds.
     #[test]
-    fn title_only_window_update_does_not_bump_generation() {
+    fn title_only_window_update_bumps_content_not_layout() {
         let mut state = NiriState::default();
         assert!(state.upsert_window(test_window()));
         let generation = state.snapshot().generation;
+        let content = state.snapshot().content_revision;
 
         let mut update = test_window();
         update.title = Some("spinner changed".into());
         update.pid = Some(2000);
-        assert!(!state.upsert_window(update));
+        // Worth publishing...
+        assert!(state.upsert_window(update));
 
+        // ...but not a layout change.
         assert_eq!(state.snapshot().generation, generation);
+        assert_eq!(state.snapshot().content_revision, content + 1);
         assert_eq!(
             state
                 .windows
@@ -445,6 +470,20 @@ mod tests {
             state.windows.get(&10).and_then(|window| window.pid),
             Some(2000)
         );
+    }
+
+    /// A layout change must not be mistaken for a content change either.
+    #[test]
+    fn a_layout_change_leaves_content_revision_alone() {
+        let mut state = NiriState::default();
+        assert!(state.upsert_window(test_window()));
+        let content = state.snapshot().content_revision;
+
+        let mut update = test_window();
+        update.is_focused = !update.is_focused;
+        assert!(state.upsert_window(update));
+
+        assert_eq!(state.snapshot().content_revision, content);
     }
 
     #[test]

@@ -920,6 +920,7 @@ fn snapshot_json(snapshot: &Snapshot, output_filter: Option<&str>) -> String {
 
     serde_json::json!({
         "generation": snapshot.generation,
+        "content_revision": snapshot.content_revision,
         "focused_window": snapshot.focused_window,
         "outputs": outputs,
     })
@@ -2556,6 +2557,7 @@ mod tests {
             focused_window: Some(42),
             overview_open: false,
             generation: 9,
+            content_revision: 0,
         }
     }
 
@@ -2565,6 +2567,7 @@ mod tests {
             serde_json::from_str(&snapshot_json(&protocol_snapshot(), None)).unwrap();
 
         assert_eq!(value["generation"], 9);
+        assert_eq!(value["content_revision"], 0);
         assert_eq!(value["focused_window"], 42);
         assert_eq!(value["outputs"][0]["name"], "eDP-1");
         assert_eq!(value["outputs"][0]["workspaces"][0]["label"], "main");
@@ -2576,7 +2579,12 @@ mod tests {
         assert_eq!(value["outputs"][0]["workspaces"][0]["windows"][0]["row"], 3);
         assert_eq!(
             value.as_object().unwrap().keys().collect::<Vec<_>>(),
-            vec!["focused_window", "generation", "outputs"]
+            vec![
+                "content_revision",
+                "focused_window",
+                "generation",
+                "outputs"
+            ]
         );
     }
 
@@ -3258,6 +3266,7 @@ mod selection_tests {
             focused_window: None,
             overview_open: false,
             generation: 1,
+            content_revision: 0,
         }
     }
 
