@@ -422,7 +422,7 @@ fn load_png_rgba(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
         png::ColorType::Rgb => {
             let src = &buf[..n * 3];
             let mut out = Vec::with_capacity(n * 4);
-            for chunk in src.chunks_exact(3) {
+            for chunk in src.as_chunks::<3>().0 {
                 out.push(chunk[0]);
                 out.push(chunk[1]);
                 out.push(chunk[2]);
@@ -433,7 +433,7 @@ fn load_png_rgba(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
         png::ColorType::GrayscaleAlpha => {
             let src = &buf[..n * 2];
             let mut out = Vec::with_capacity(n * 4);
-            for chunk in src.chunks_exact(2) {
+            for chunk in src.as_chunks::<2>().0 {
                 let v = chunk[0];
                 out.push(v);
                 out.push(v);

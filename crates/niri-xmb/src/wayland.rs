@@ -912,7 +912,8 @@ fn copy_rgba_to_argb8888_region(
         let Some(src_row) = source.get(start..end) else {
             continue;
         };
-        for (dst, src) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
+        let (dst_chunks, _) = dst_row.as_chunks_mut::<4>();
+        for (dst, src) in dst_chunks.iter_mut().zip(src_row.as_chunks::<4>().0) {
             dst[0] = src[2];
             dst[1] = src[1];
             dst[2] = src[0];
