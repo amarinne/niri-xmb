@@ -8,6 +8,17 @@ local state = {
     hoveredWindowId = nil,
     pendingDrop = nil,
     dropErrorUntil = nil,
+    -- Set while the one-off `status` call that learns the mirror path is
+    -- outstanding, so ticks in between do not pile up more of them.
+    learningMirror = false,
+    -- Path of the daemon's snapshot mirror, learned once from `status`.
+    mirrorPath = nil,
+    -- When the in-flight poll must be considered lost. Without this a
+    -- callback that never fires leaves `polling` true and freezes the widget.
+    pollDeadline = nil,
+    -- Coalesced wheel steps waiting to be sent, per axis.
+    pendingScroll = { vertical = 0, horizontal = 0 },
+    scrollFlushAt = nil,
 }
 
 local render
@@ -706,67 +717,148 @@ render = function()
     }, children))
 end
 
-poll = function(force)
-    if state.polling then
-        return
-    end
-    state.polling = true
-    local started = noctalia.runAsync(command({ "snapshot" }), function(result)
-        state.polling = false
-        if result.exitCode ~= 0 then
-            local message = tostring(result.stderr or result.stdout or "snapshot failed")
-            if state.lastError ~= message then
-                state.lastError = message
-                noctalia.log("niri-xmb snapshot failed: " .. message)
-            end
-            render()
+-- Everything that happens once a snapshot has been decoded, whether it
+-- came from the mirror file or from a `snapshot` process.
+local function applySnapshot(decoded, force)
+    state.lastError = nil
+    if state.pendingDrop ~= nil then
+        local now = noctalia.nowMs()
+        if now >= state.pendingDrop.deadline then
+            state.pendingDrop = nil
+        elseif pendingDropMatches(decoded, state.pendingDrop) then
+            state.pendingDrop = nil
+        else
             return
         end
+    end
+    state.snapshot = decoded
+    local dropErrorExpired = state.dropErrorUntil ~= nil
+        and noctalia.nowMs() >= state.dropErrorUntil
+    if dropErrorExpired then
+        state.dropErrorUntil = nil
+    end
+    if force or dropErrorExpired or decoded.generation ~= state.lastGeneration then
+        state.lastGeneration = decoded.generation
+        render()
+    end
+end
 
-        local decoded, errorMessage = noctalia.json.decode(result.stdout or "")
+-- One `status` call teaches the widget where the snapshot mirror lives.
+-- After that every tick is a file read: no process, no socket.
+local function learnMirrorPath()
+    if state.mirrorPath ~= nil or state.learningMirror then
+        return
+    end
+    state.learningMirror = true
+    local started = noctalia.runAsync(command({ "status" }), function(result)
+        state.learningMirror = false
+        if result.exitCode ~= 0 then
+            return
+        end
+        local decoded = noctalia.json.decode(result.stdout or "")
+        if type(decoded) == "table" and type(decoded.snapshot_mirror) == "string" then
+            state.mirrorPath = decoded.snapshot_mirror
+        end
+    end)
+    if not started then
+        state.learningMirror = false
+    end
+end
+
+poll = function(force)
+    local now = noctalia.nowMs()
+    if state.polling then
+        if state.pollDeadline ~= nil and now >= state.pollDeadline then
+            state.polling = false
+            state.pollDeadline = nil
+        else
+            return
+        end
+    end
+
+    learnMirrorPath()
+
+    local interval = finiteNumber(config("poll_interval_ms", 250)) or 250
+    local function beginPoll()
+        state.polling = true
+        state.pollDeadline = now + math.max(interval * 4, 1000)
+    end
+    local function endPoll()
+        state.polling = false
+        state.pollDeadline = nil
+    end
+
+    local function handleDecoded(decoded, errorMessage)
         if decoded == nil then
             state.lastError = tostring(errorMessage or "invalid JSON")
             noctalia.log("niri-xmb snapshot JSON failed: " .. state.lastError)
             render()
             return
         end
+        applySnapshot(decoded, force)
+    end
 
-        state.lastError = nil
-        if state.pendingDrop ~= nil then
-            local now = noctalia.nowMs()
-            if now >= state.pendingDrop.deadline then
-                -- The daemon never answered in time; stop trusting the
-                -- preview and show whatever canonical state arrived.
-                state.pendingDrop = nil
-            elseif pendingDropMatches(decoded, state.pendingDrop) then
-                state.pendingDrop = nil
-            else
-                -- A drop is in flight and Niri reports intermediate layout.
-                -- Hold the optimistic order until the reply or the deadline;
-                -- unrelated updates are delayed by at most that window.
+    local function pollByProcess()
+        beginPoll()
+        local started = noctalia.runAsync(command({ "snapshot" }), function(result)
+            endPoll()
+            if result.exitCode ~= 0 then
+                local message = tostring(result.stderr or result.stdout or "snapshot failed")
+                if state.lastError ~= message then
+                    state.lastError = message
+                    noctalia.log("niri-xmb snapshot failed: " .. message)
+                end
+                render()
                 return
             end
+            local decoded, errorMessage = noctalia.json.decode(result.stdout or "")
+            handleDecoded(decoded, errorMessage)
+        end)
+        if not started then
+            endPoll()
         end
-        state.snapshot = decoded
-        local dropErrorExpired = state.dropErrorUntil ~= nil
-            and noctalia.nowMs() >= state.dropErrorUntil
-        if dropErrorExpired then
-            state.dropErrorUntil = nil
+    end
+
+    if state.mirrorPath ~= nil and type(noctalia.readFileAsync) == "function" then
+        beginPoll()
+        local started = noctalia.readFileAsync(state.mirrorPath, function(contents, err)
+            endPoll()
+            if err ~= nil or contents == nil then
+                state.mirrorPath = nil
+                pollByProcess()
+                return
+            end
+            local decoded, errorMessage = noctalia.json.decode(contents)
+            handleDecoded(decoded, errorMessage)
+        end)
+        if started then
+            return
         end
-        if force or dropErrorExpired or decoded.generation ~= state.lastGeneration then
-            state.lastGeneration = decoded.generation
-            render()
-        end
-    end)
-    if not started then
-        -- The first top-level poll can run before Noctalia has attached the
-        -- async result handler to a newly-created plugin host. Do not leave the
-        -- poll latch stuck: update() will retry after the host is ready.
-        state.polling = false
+        endPoll()
+    end
+
+    pollByProcess()
+end
+
+local function flushScroll()
+    if state.scrollFlushAt == nil or noctalia.nowMs() < state.scrollFlushAt then
+        return
+    end
+    state.scrollFlushAt = nil
+    local vertical = state.pendingScroll.vertical
+    local horizontal = state.pendingScroll.horizontal
+    state.pendingScroll.vertical = 0
+    state.pendingScroll.horizontal = 0
+    if vertical ~= 0 then
+        runAction({ "cycle-workspace", "--output", targetOutput(), "--delta", idString(vertical) })
+    end
+    if horizontal ~= 0 then
+        runAction({ "cycle-window", "--output", targetOutput(), "--delta", idString(horizontal) })
     end
 end
 
 function update()
+    flushScroll()
     poll(false)
 end
 
@@ -775,13 +867,23 @@ function onScroll(axis, steps, startsGesture)
     if validatedSteps == nil or validatedSteps == 0 then
         return
     end
-    local delta = validatedSteps > 0 and 1 or -1
-    if axis == "vertical" then
-        runAction({ "cycle-workspace", "--output", targetOutput(), "--delta", tostring(delta) })
-    elseif axis == "horizontal" then
-        -- Wheel left/right moves window focus across the active workspace row.
-        runAction({ "cycle-window", "--output", targetOutput(), "--delta", tostring(delta) })
+    if axis ~= "vertical" and axis ~= "horizontal" then
+        return
     end
+    local whole = validatedSteps
+    if whole > 0 then
+        whole = math.floor(whole)
+        if whole < 1 then
+            whole = 1
+        end
+    else
+        whole = math.ceil(whole)
+        if whole > -1 then
+            whole = -1
+        end
+    end
+    state.pendingScroll[axis] = state.pendingScroll[axis] + whole
+    state.scrollFlushAt = noctalia.nowMs() + 40
 end
 
 function onConfigChanged()

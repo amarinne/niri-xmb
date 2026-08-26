@@ -3,7 +3,7 @@ name = "Niri XMB"
 version = "0.3.3"
 description = "Per-output Niri workspace and window strip backed by niri-xmb."
 icon = "layout-grid"
-plugin_api = 16
+plugin_api = 23
 min_noctalia = "5.0.0"
 license = "GPL-3.0-only"
 
