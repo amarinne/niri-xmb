@@ -375,6 +375,26 @@ impl NiriCommand {
             Self::FocusWindow(_) | Self::FocusWorkspace(_) => None,
         }
     }
+
+    /// The window a move acts on, if the command moves one.
+    fn window_id(&self) -> Option<u64> {
+        match self {
+            Self::MoveTiled { window_id, .. } | Self::MoveFloating { window_id, .. } => {
+                Some(*window_id)
+            }
+            Self::FocusWindow(_) | Self::FocusWorkspace(_) => None,
+        }
+    }
+
+    /// The window focus should return to if the move fails partway.
+    fn restore_focus(&self) -> Option<u64> {
+        match self {
+            Self::MoveTiled { restore_focus, .. } | Self::MoveFloating { restore_focus, .. } => {
+                *restore_focus
+            }
+            Self::FocusWindow(_) | Self::FocusWorkspace(_) => None,
+        }
+    }
 }
 
 trait ActionTransport {
@@ -515,30 +535,22 @@ fn restore_cursor_position(
     };
 }
 
-fn execute_command<T: ActionTransport>(
-    command: NiriCommand,
-    transport: &mut T,
-) -> CommandExecution {
-    let mut execution = CommandExecution::new(&command);
+/// The ordered actions a command turns into.
+///
+/// Deciding the whole sequence up front is what lets the failure path --
+/// run the compensating focus restore, then stop -- be written once in
+/// `execute_command` instead of at every step boundary.
+fn command_steps(command: &NiriCommand) -> Vec<(ActionStep, Action)> {
     match command {
         NiriCommand::FocusWindow(id) => {
-            run_step(
-                transport,
-                &mut execution,
-                ActionStep::FocusWindow,
-                Action::FocusWindow { id },
-            );
+            vec![(ActionStep::FocusWindow, Action::FocusWindow { id: *id })]
         }
-        NiriCommand::FocusWorkspace(id) => {
-            run_step(
-                transport,
-                &mut execution,
-                ActionStep::FocusWorkspace,
-                Action::FocusWorkspace {
-                    reference: WorkspaceReferenceArg::Id(id),
-                },
-            );
-        }
+        NiriCommand::FocusWorkspace(id) => vec![(
+            ActionStep::FocusWorkspace,
+            Action::FocusWorkspace {
+                reference: WorkspaceReferenceArg::Id(*id),
+            },
+        )],
         NiriCommand::MoveTiled {
             window_id,
             source_workspace_id,
@@ -549,85 +561,54 @@ fn execute_command<T: ActionTransport>(
             restore_focus,
             restore_cursor: _,
         } => {
-            if source_joined
-                && !run_step(
-                    transport,
-                    &mut execution,
+            let window_id = *window_id;
+            let mut steps = Vec::with_capacity(7);
+            if *source_joined {
+                steps.push((
                     ActionStep::DetachJoinedSource,
                     Action::ConsumeOrExpelWindowLeft {
                         id: Some(window_id),
                     },
-                )
-            {
-                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
-                return execution;
+                ));
             }
-            if !run_step(
-                transport,
-                &mut execution,
+            steps.push((
                 ActionStep::MoveToTiling,
                 Action::MoveWindowToTiling {
                     id: Some(window_id),
                 },
-            ) {
-                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
-                return execution;
-            }
-            if source_workspace_id != workspace_id
-                && !run_step(
-                    transport,
-                    &mut execution,
+            ));
+            if source_workspace_id != workspace_id {
+                steps.push((
                     ActionStep::MoveToWorkspace,
                     Action::MoveWindowToWorkspace {
                         window_id: Some(window_id),
-                        reference: WorkspaceReferenceArg::Id(workspace_id),
+                        reference: WorkspaceReferenceArg::Id(*workspace_id),
                         focus: false,
                     },
-                )
-            {
-                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
-                return execution;
+                ));
             }
-            if !run_step(
-                transport,
-                &mut execution,
+            steps.push((
                 ActionStep::FocusMovedWindow,
                 Action::FocusWindow { id: window_id },
-            ) || !run_step(
-                transport,
-                &mut execution,
+            ));
+            steps.push((
                 ActionStep::MoveColumn,
                 Action::MoveColumnToIndex {
-                    index: column.max(1),
+                    index: (*column).max(1),
                 },
-            ) {
-                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
-                return execution;
-            }
+            ));
             if let Some(direction) = join {
                 let action = match direction {
                     JoinDirection::Left => Action::ConsumeOrExpelWindowLeft {
                         id: Some(window_id),
                     },
                 };
-                if !run_step(transport, &mut execution, ActionStep::JoinLeft, action) {
-                    restore_focus_after_failure(
-                        transport,
-                        &mut execution,
-                        window_id,
-                        restore_focus,
-                    );
-                    return execution;
-                }
+                steps.push((ActionStep::JoinLeft, action));
             }
             if let Some(id) = restore_focus.filter(|id| *id != window_id) {
-                run_step(
-                    transport,
-                    &mut execution,
-                    ActionStep::RestoreFocus,
-                    Action::FocusWindow { id },
-                );
+                steps.push((ActionStep::RestoreFocus, Action::FocusWindow { id }));
             }
+            steps
         }
         NiriCommand::MoveFloating {
             window_id,
@@ -639,56 +620,60 @@ fn execute_command<T: ActionTransport>(
             restore_focus,
             restore_cursor: _,
         } => {
-            if make_floating
-                && !run_step(
-                    transport,
-                    &mut execution,
+            let window_id = *window_id;
+            let mut steps = Vec::with_capacity(4);
+            if *make_floating {
+                steps.push((
                     ActionStep::MoveToFloating,
                     Action::MoveWindowToFloating {
                         id: Some(window_id),
                     },
-                )
-            {
-                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
-                return execution;
+                ));
             }
-            if source_workspace_id != workspace_id
-                && !run_step(
-                    transport,
-                    &mut execution,
+            if source_workspace_id != workspace_id {
+                steps.push((
                     ActionStep::MoveToWorkspace,
                     Action::MoveWindowToWorkspace {
                         window_id: Some(window_id),
-                        reference: WorkspaceReferenceArg::Id(workspace_id),
+                        reference: WorkspaceReferenceArg::Id(*workspace_id),
                         focus: false,
                     },
-                )
-            {
-                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
-                return execution;
+                ));
             }
-            if !run_step(
-                transport,
-                &mut execution,
+            steps.push((
                 ActionStep::MoveFloatingWindow,
                 Action::MoveFloatingWindow {
                     id: Some(window_id),
-                    x: niri_ipc::PositionChange::SetFixed(x),
-                    y: niri_ipc::PositionChange::SetFixed(y),
+                    x: niri_ipc::PositionChange::SetFixed(*x),
+                    y: niri_ipc::PositionChange::SetFixed(*y),
                 },
-            ) {
-                restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
-                return execution;
-            }
+            ));
             if let Some(id) = restore_focus.filter(|id| *id != window_id) {
-                run_step(
-                    transport,
-                    &mut execution,
-                    ActionStep::RestoreFocus,
-                    Action::FocusWindow { id },
-                );
+                steps.push((ActionStep::RestoreFocus, Action::FocusWindow { id }));
             }
+            steps
         }
+    }
+}
+
+fn execute_command<T: ActionTransport>(
+    command: NiriCommand,
+    transport: &mut T,
+) -> CommandExecution {
+    let mut execution = CommandExecution::new(&command);
+    let window_id = command.window_id();
+    let restore_focus = command.restore_focus();
+    for (step, action) in command_steps(&command) {
+        if run_step(transport, &mut execution, step, action) {
+            continue;
+        }
+        // A move that stops partway leaves focus wherever it landed, so put
+        // it back. restore_focus_after_failure is a no-op when the step that
+        // failed was the restore itself.
+        if let Some(window_id) = window_id {
+            restore_focus_after_failure(transport, &mut execution, window_id, restore_focus);
+        }
+        break;
     }
     execution
 }
@@ -744,5 +729,60 @@ mod tests {
         let execution = execute_command(NiriCommand::FocusWindow(1), &mut transport);
         assert!(execution.failure.is_none());
         assert_eq!(execution.completed_steps, vec![ActionStep::FocusWindow]);
+    }
+
+    /// The exact action sequence for a cross-workspace tiled move, in order.
+    /// This is the shape the compositor sees; changing it changes behaviour.
+    #[test]
+    fn a_cross_workspace_tiled_move_runs_its_steps_in_order() {
+        let steps = command_steps(&NiriCommand::MoveTiled {
+            window_id: 5,
+            source_workspace_id: 1,
+            workspace_id: 2,
+            column: 3,
+            join: None,
+            source_joined: true,
+            restore_focus: Some(9),
+            restore_cursor: None,
+        });
+
+        let order: Vec<ActionStep> = steps.iter().map(|(step, _)| *step).collect();
+        assert_eq!(
+            order,
+            vec![
+                ActionStep::DetachJoinedSource,
+                ActionStep::MoveToTiling,
+                ActionStep::MoveToWorkspace,
+                ActionStep::FocusMovedWindow,
+                ActionStep::MoveColumn,
+                ActionStep::RestoreFocus,
+            ]
+        );
+    }
+
+    /// A move that stays on its own workspace skips the workspace hop, and a
+    /// restore target equal to the moved window is not a restore at all.
+    #[test]
+    fn a_same_workspace_move_skips_the_workspace_step() {
+        let steps = command_steps(&NiriCommand::MoveTiled {
+            window_id: 5,
+            source_workspace_id: 1,
+            workspace_id: 1,
+            column: 1,
+            join: None,
+            source_joined: false,
+            restore_focus: Some(5),
+            restore_cursor: None,
+        });
+
+        let order: Vec<ActionStep> = steps.iter().map(|(step, _)| *step).collect();
+        assert_eq!(
+            order,
+            vec![
+                ActionStep::MoveToTiling,
+                ActionStep::FocusMovedWindow,
+                ActionStep::MoveColumn,
+            ]
+        );
     }
 }
