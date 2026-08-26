@@ -4,6 +4,7 @@ mod draw;
 mod drop_plan;
 mod icons;
 mod ipc;
+mod mirror;
 mod model;
 mod niri;
 mod panel;
@@ -1015,6 +1016,26 @@ fn resolve_bars(config: &mut Config, output_names: &[String]) {
     }
 }
 
+/// Mirror the newest snapshot and hand it to any stream subscribers.
+///
+/// Serialising is the expensive part, so it happens once. The hub is only
+/// given the result when someone is actually listening -- in the normal
+/// deployment nobody is, and the mirror is the only reader that justifies
+/// serialising at all.
+fn publish_snapshot(
+    snapshot: &Snapshot,
+    subscriptions: &subscribe::SubscriptionHub,
+    mirror: Option<&mirror::SnapshotMirror>,
+) {
+    let body = snapshot_json(snapshot, None);
+    if let Some(mirror) = mirror {
+        mirror.write(&body);
+    }
+    if subscriptions.subscriber_count() > 0 {
+        subscriptions.publish(snapshot.generation, &body);
+    }
+}
+
 fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut config = Config::load(&config_path)?;
     let output_names = connected_outputs()?;
@@ -1050,11 +1071,13 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
 
     let (control_tx, control_rx) = unbounded::<ControlRequest>();
     let subscriptions = std::sync::Arc::new(subscribe::SubscriptionHub::new());
+    // Dropped with the daemon, which removes the file.
+    let mirror = mirror::SnapshotMirror::new();
     let _control_server =
         ipc::serve_with_subscriptions(control_tx, wake.handle(), Arc::clone(&subscriptions))?;
 
     let mut snapshot = wait_for_snapshot(&snapshot_rx).unwrap_or_default();
-    subscriptions.publish(snapshot.generation, &snapshot_json(&snapshot, None));
+    publish_snapshot(&snapshot, &subscriptions, mirror.as_ref());
     let mut niri_health = NiriHealth::default();
     let mut drop_transactions = DropTransactionState::default();
     let mut panel = PanelState::default();
@@ -1096,7 +1119,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
 
         while let Ok(next) = snapshot_rx.try_recv() {
             snapshot = next;
-            subscriptions.publish(snapshot.generation, &snapshot_json(&snapshot, None));
+            publish_snapshot(&snapshot, &subscriptions, mirror.as_ref());
             normalize_selection(&mut selection, &snapshot);
             let now = Instant::now();
             let windows = live_window_ids(&snapshot);
