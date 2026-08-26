@@ -26,7 +26,7 @@ use niri::{
 };
 use niri_ipc::socket::Socket;
 use niri_ipc::{Request, Response};
-use panel::PeekState;
+use panel::PanelState;
 use render::{DragVisual, HitTarget, Renderer, SelectionVisual};
 use selection::{
     Selection, move_output as move_output_selection, move_within as move_selection,
@@ -1060,14 +1060,11 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut niri_health = NiriHealth::default();
     let mut drop_transactions = DropTransactionState::default();
     let mut popup_outputs = HashSet::new();
-    let mut popup_origin_focus: Option<u64> = None;
-    let mut follow_candidate: Option<(String, Instant)> = None;
-    let mut press: Option<PressState> = None;
+    let mut panel = PanelState::default();
     let mut bar_scrolls: HashMap<String, BarScrollState> = HashMap::new();
     let mut selection = Selection::default();
     let mut popup_was_open = false;
     let mut popup_mode = PopupMode::Hidden;
-    let mut peek = PeekState::default();
     // Focus changes we caused ourselves must not bounce back as a peek.
     let mut peek_suppressed_until = Instant::now();
     let mut window_first_seen: HashMap<u64, Instant> = HashMap::new();
@@ -1130,9 +1127,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     surfaces.hide_all_popups()?;
                     popup_outputs.clear();
                     popup_mode = PopupMode::Hidden;
-                    popup_origin_focus = None;
-                    follow_candidate = None;
-                    press = None;
+                    panel.close();
                 }
                 if Instant::now() >= peek_suppressed_until {
                     // Whatever the popup is showing, it now shows where Niri
@@ -1202,11 +1197,11 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                         &mut popup_mode,
                         &mut selection,
                         peek_suppressed_until,
-                        peek.pointer_live(),
+                        panel.peek().pointer_live(),
                     )?;
-                    peek.set_deadline(deadline);
+                    panel.peek_mut().set_deadline(deadline);
                     if was_hidden && popup_mode == PopupMode::Peek && config.peek.pointer_promote {
-                        peek.arm_pointer(
+                        panel.peek_mut().arm_pointer(
                             Instant::now() + Duration::from_millis(config.peek.arm_grace_ms),
                         );
                     }
@@ -1224,23 +1219,27 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         if popup_mode.is_peek()
             && (snapshot.overview_open
                 || (popup_mode == PopupMode::Peek
-                    && peek_deadline_reached(peek.deadline(), pending_focus_since, Instant::now())))
+                    && peek_deadline_reached(
+                        panel.peek().deadline(),
+                        pending_focus_since,
+                        Instant::now(),
+                    )))
         {
             surfaces.hide_all_popups()?;
             popup_outputs.clear();
             popup_mode = PopupMode::Hidden;
-            peek.disarm();
+            panel.peek_mut().disarm();
             dirty = true;
         }
 
         // Hand the overlay to the pointer once the grace has passed. It keeps
         // the panel rectangle only, and never the keyboard, so everything
         // outside the panel — and every keybind — behaves as before.
-        if let Some(at) = peek.pointer_at()
+        if let Some(at) = panel.peek().pointer_at()
             && popup_mode.is_peek()
             && Instant::now() >= at
         {
-            peek.take_pointer();
+            panel.peek_mut().take_pointer();
             surfaces.set_popup_input(PopupInput::POINTER, false)?;
             dirty = true;
         }
@@ -1249,7 +1248,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             let response = match request.command {
                 ControlCommand::Show => {
                     if popup_mode != PopupMode::Manual {
-                        popup_origin_focus = snapshot.focused_window;
+                        panel.set_origin_focus(snapshot.focused_window);
                     }
                     show_popup(
                         &mut surfaces,
@@ -1260,8 +1259,8 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     )?;
                     popup_mode = PopupMode::Manual;
                     // Taking control cancels the peek countdown.
-                    peek.disarm();
-                    follow_candidate = None;
+                    panel.peek_mut().disarm();
+                    panel.clear_follow_candidate();
                     reset_selection(&mut selection, &snapshot);
                     dirty = true;
                     "ok\n".into()
@@ -1270,9 +1269,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     surfaces.hide_all_popups()?;
                     popup_outputs.clear();
                     popup_mode = PopupMode::Hidden;
-                    popup_origin_focus = None;
-                    follow_candidate = None;
-                    press = None;
+                    panel.close();
                     dirty = true;
                     "ok\n".into()
                 }
@@ -1283,11 +1280,9 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                         surfaces.hide_all_popups()?;
                         popup_outputs.clear();
                         popup_mode = PopupMode::Hidden;
-                        popup_origin_focus = None;
-                        follow_candidate = None;
-                        press = None;
+                        panel.close();
                     } else {
-                        popup_origin_focus = snapshot.focused_window;
+                        panel.set_origin_focus(snapshot.focused_window);
                         show_popup(
                             &mut surfaces,
                             &snapshot,
@@ -1296,8 +1291,8 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                             PopupInput::FULL,
                         )?;
                         popup_mode = PopupMode::Manual;
-                        peek.disarm();
-                        follow_candidate = None;
+                        panel.peek_mut().disarm();
+                        panel.clear_follow_candidate();
                         reset_selection(&mut selection, &snapshot);
                     }
                     dirty = true;
@@ -1497,12 +1492,12 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             if popup_mode.is_peek() {
                 match classify_peek_pointer(&event) {
                     PeekPointer::Promote => {
-                        popup_origin_focus = snapshot.focused_window;
+                        panel.set_origin_focus(snapshot.focused_window);
                         let capture = popup_capture_outside(&config, PopupInput::FULL);
                         surfaces.set_popup_input(PopupInput::FULL, capture)?;
                         popup_mode = PopupMode::Manual;
-                        peek.disarm();
-                        follow_candidate = None;
+                        panel.peek_mut().disarm();
+                        panel.clear_follow_candidate();
                         reset_selection(&mut selection, &snapshot);
                         dirty = true;
                     }
@@ -1511,14 +1506,14 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                             popup_mode = PopupMode::PeekArmed;
                             dirty = true;
                         }
-                        peek.set_deadline(None);
+                        panel.peek_mut().set_deadline(None);
                     }
                     PeekPointer::Disarm => {
                         if popup_mode == PopupMode::PeekArmed {
                             popup_mode = PopupMode::Peek;
                             // Moving away is a refusal, so the overlay leaves
                             // sooner than the countdown it never started would.
-                            peek.set_deadline(Some(
+                            panel.peek_mut().set_deadline(Some(
                                 Instant::now()
                                     + Duration::from_millis(config.peek.demote_ms.max(1)),
                             ));
@@ -1538,6 +1533,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     continue;
                 }
             }
+            let origin_focus = panel.origin_focus();
             dirty |= handle_ui_event(
                 event,
                 &mut surfaces,
@@ -1548,8 +1544,8 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 &mut drop_transactions,
                 &mut popup_outputs,
                 popup_mode,
-                popup_origin_focus,
-                &mut press,
+                origin_focus,
+                &mut panel,
                 &mut bar_scrolls,
                 &mut selection,
                 &mut peek_suppressed_until,
@@ -1560,13 +1556,14 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         // re-placed on the focused output the moment focus moves, and routing
         // it through here would re-show it as an input-grabbing surface.
         if popup_mode == PopupMode::Manual {
+            let pressed = panel.is_pressed();
             dirty |= update_following_popup(
                 &mut surfaces,
                 &snapshot,
                 &config,
                 &mut popup_outputs,
-                press.is_some(),
-                &mut follow_candidate,
+                pressed,
+                panel.follow_candidate_mut(),
                 &mut selection,
             )?;
         }
@@ -1577,7 +1574,10 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         if popup_was_open && !popup_open {
             selection.clear_session();
             popup_mode = PopupMode::Hidden;
-            peek.disarm();
+            // Escape and outside clicks land here with a press still
+            // tracked; closing must cancel it, or the release that follows
+            // completes a drop the user just cancelled.
+            panel.close();
             // Confirming a pick moves Niri's focus, which would otherwise come
             // straight back as a peek for the move just made.
             peek_suppressed_until = Instant::now() + SELF_FOCUS_GRACE;
@@ -1587,8 +1587,8 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         // Animation targets are recomputed every iteration, not only on
         // The accent means XMB has an active input mode. An armed peek has
         // claimed the pointer region, but normal peek remains passive.
-        dirty |=
-            renderer.set_panel_input_active(panel_input_active(popup_mode, peek.pointer_live()));
+        dirty |= renderer
+            .set_panel_input_active(panel_input_active(popup_mode, panel.peek().pointer_live()));
 
         // redraw, so a settled UI stops requesting frames entirely.
         let selection_visual = selection_visual(&selection, &snapshot);
@@ -1616,8 +1616,8 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 .iter()
                 .all(|surface| surface.configured && surface.frame_ready);
             if all_ready {
-                let drag = press
-                    .as_ref()
+                let drag = panel
+                    .press()
                     .filter(|press| press.dragging)
                     .map(|press| DragVisual {
                         window_id: press.window_id,
@@ -1660,13 +1660,13 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             wait_timeout =
                 wait_timeout.min(FOCUS_SETTLE.saturating_sub(now.saturating_duration_since(since)));
         }
-        if let Some(deadline) = peek.deadline() {
+        if let Some(deadline) = panel.peek().deadline() {
             wait_timeout = wait_timeout.min(deadline.saturating_duration_since(now));
         }
-        if let Some(at) = peek.pointer_at() {
+        if let Some(at) = panel.peek().pointer_at() {
             wait_timeout = wait_timeout.min(at.saturating_duration_since(now));
         }
-        if let Some((_, since)) = &follow_candidate {
+        if let Some((_, since)) = panel.follow_candidate() {
             let delay = Duration::from_millis(config.popup.follow_delay_ms);
             wait_timeout =
                 wait_timeout.min(delay.saturating_sub(now.saturating_duration_since(*since)));
@@ -1981,7 +1981,7 @@ fn handle_ui_event(
     popup_outputs: &mut HashSet<String>,
     popup_mode: PopupMode,
     popup_origin_focus: Option<u64>,
-    press: &mut Option<PressState>,
+    panel: &mut PanelState,
     bar_scrolls: &mut HashMap<String, BarScrollState>,
     selection: &mut Selection,
     suppress_peek: &mut Instant,
@@ -2003,7 +2003,7 @@ fn handle_ui_event(
                 match target {
                     HitTarget::Window { window_id, .. } => {
                         if let Some(window) = snapshot.window(window_id) {
-                            *press = Some(PressState {
+                            panel.begin_press(PressState {
                                 window_id,
                                 app_id: window.app_id.clone(),
                                 start_x: event.global_x,
@@ -2042,7 +2042,7 @@ fn handle_ui_event(
             Ok(true)
         }
         UiEventKind::Motion => {
-            if let Some(press) = press {
+            if let Some(press) = panel.press_mut() {
                 press.current_x = event.global_x;
                 press.current_y = event.global_y;
                 let dx = press.current_x - press.start_x;
@@ -2057,7 +2057,7 @@ fn handle_ui_event(
         UiEventKind::Enter => Ok(renderer.update_hover(event.surface_id, event.x, event.y)),
         UiEventKind::Leave => Ok(renderer.clear_hover(event.surface_id)),
         UiEventKind::Release { button } if button == BTN_LEFT => {
-            let Some(released) = press.take() else {
+            let Some(released) = panel.take_press() else {
                 return Ok(false);
             };
             if released.dragging {
