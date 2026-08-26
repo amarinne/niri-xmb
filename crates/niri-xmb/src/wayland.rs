@@ -60,6 +60,7 @@ pub struct SurfaceInfo {
     pub configured: bool,
     pub frame_ready: bool,
     pub needs_full_redraw: bool,
+    pub scale_factor: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,6 +458,7 @@ impl SurfaceManager {
                     configured: surface.configured,
                     frame_ready: surface.frame_ready,
                     needs_full_redraw: surface.needs_full_redraw,
+                    scale_factor: surface.scale_factor,
                 }
             })
             .collect()
@@ -492,9 +494,13 @@ impl SurfaceManager {
             return Ok(false);
         }
 
+        let scale = surface.scale_factor.max(1) as u32;
+        let device_width = surface.width * scale;
+        let device_height = surface.height * scale;
+
         let Some(display_damage) = presentation_damage(
-            surface.width,
-            surface.height,
+            device_width,
+            device_height,
             surface.last_damage,
             current_damage,
             surface.needs_full_redraw,
@@ -505,8 +511,8 @@ impl SurfaceManager {
         let mut available = None;
         let mut index = 0;
         while index < surface.buffers.len() {
-            let size_matches = surface.buffers[index].width == surface.width
-                && surface.buffers[index].height == surface.height;
+            let size_matches = surface.buffers[index].width == device_width
+                && surface.buffers[index].height == device_height;
             let released = surface
                 .pool
                 .canvas(&surface.buffers[index].buffer)
@@ -530,7 +536,7 @@ impl SurfaceManager {
                 .pool
                 .canvas(&surface.buffers[index].buffer)
                 .context("reusable SHM buffer became unavailable")?;
-            copy_rgba_to_argb8888_region(canvas, pixels, surface.width, submitted_damage);
+            copy_rgba_to_argb8888_region(canvas, pixels, device_width, submitted_damage);
             surface.buffers[index].content = current_damage;
             (index, submitted_damage)
         } else {
@@ -540,7 +546,7 @@ impl SurfaceManager {
                 .pool
                 .canvas(&surface.buffers[index].buffer)
                 .context("new SHM buffer became unavailable")?;
-            copy_rgba_to_argb8888_region(canvas, pixels, surface.width, display_damage);
+            copy_rgba_to_argb8888_region(canvas, pixels, device_width, display_damage);
             surface.buffers[index].content = current_damage;
             (index, display_damage)
         };
@@ -550,6 +556,7 @@ impl SurfaceManager {
         };
         let wl_surface = layer_surface.wl_surface();
         wl_surface.frame(&self.queue.handle(), wl_surface.clone());
+        wl_surface.set_buffer_scale(scale as i32);
         surface.buffers[buffer_index]
             .buffer
             .attach_to(wl_surface)
@@ -818,20 +825,23 @@ impl SurfaceManager {
 }
 
 fn allocate_surface_buffer(surface: &mut SurfaceEntry) -> Result<()> {
-    let stride = surface.width * 4;
+    let scale = surface.scale_factor.max(1) as u32;
+    let width = surface.width * scale;
+    let height = surface.height * scale;
+    let stride = width * 4;
     let (buffer, _) = surface
         .pool
         .create_buffer(
-            surface.width as i32,
-            surface.height as i32,
+            width as i32,
+            height as i32,
             stride as i32,
             wl_shm::Format::Argb8888,
         )
         .context("failed to create SHM buffer")?;
     surface.buffers.push(SurfaceBuffer {
         buffer,
-        width: surface.width,
-        height: surface.height,
+        width,
+        height,
         content: None,
     });
     Ok(())
@@ -1430,8 +1440,17 @@ impl CompositorHandler for WaylandState {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_surface::WlSurface,
-        _: wl_output::Transform,
+        transform: wl_output::Transform,
     ) {
+        // Rotated outputs are not supported: every layout number here is
+        // computed in unrotated logical space, and the bar anchors to an edge
+        // that a transform would move. Rendering would need the transform
+        // applied to both the buffer and the anchor, which is a separate
+        // change; say so rather than silently drawing the wrong way up.
+        tracing::warn!(
+            ?transform,
+            "output transform changed; niri-xmb does not support rotated outputs"
+        );
     }
     fn frame(
         &mut self,

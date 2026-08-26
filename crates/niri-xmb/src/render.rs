@@ -89,7 +89,13 @@ fn clamp_rect(rect: Rect, canvas: Rect) -> Rect {
 }
 
 /// Panel background: soft drop shadow, vertical gradient body, hairline edge.
-fn draw_panel_chrome(pixmap: &mut Pixmap, panel: Rect, config: &Config, panel_input_active: bool) {
+fn draw_panel_chrome(
+    pixmap: &mut Pixmap,
+    panel: Rect,
+    config: &Config,
+    panel_input_active: bool,
+    scale: f32,
+) {
     let radius = config.style.panel_radius;
     let offset = config.style.shadow_offset;
     let spread = config.style.shadow_spread;
@@ -106,6 +112,7 @@ fn draw_panel_chrome(pixmap: &mut Pixmap, panel: Rect, config: &Config, panel_in
         panel.height + spread,
         radius + spread,
         outer,
+        scale,
     );
     fill_rounded_rect(
         pixmap,
@@ -115,6 +122,7 @@ fn draw_panel_chrome(pixmap: &mut Pixmap, panel: Rect, config: &Config, panel_in
         panel.height,
         radius,
         shadow,
+        scale,
     );
     fill_gradient_rounded_rect(
         pixmap,
@@ -125,6 +133,7 @@ fn draw_panel_chrome(pixmap: &mut Pixmap, panel: Rect, config: &Config, panel_in
         radius,
         hex_color(&config.style.background),
         hex_color(&config.style.background_end),
+        scale,
     );
     stroke_rounded_rect(
         pixmap,
@@ -139,6 +148,7 @@ fn draw_panel_chrome(pixmap: &mut Pixmap, panel: Rect, config: &Config, panel_in
             hex_color(&config.style.border)
         },
         config.style.border_width,
+        scale,
     );
 }
 
@@ -281,6 +291,9 @@ pub struct Renderer {
     hovered_surface: Option<usize>,
     hovered_target: Option<HoverTarget>,
     render_surface: Option<usize>,
+    /// Device pixels per logical pixel for the surface being rendered.
+    /// Layout stays in logical units; this is what maps it onto the buffer.
+    render_scale: f32,
     panel_input_active: bool,
     anim: Animator,
     /// Scratch buffers and damage history belong to one Wayland surface.
@@ -306,6 +319,7 @@ struct BarRenderKey {
     generation: u64,
     width: u32,
     height: u32,
+    scale: u32,
     hover: Option<HoverTarget>,
     drag: Option<DragRenderKey>,
 }
@@ -327,6 +341,7 @@ impl Renderer {
             hovered_surface: None,
             hovered_target: None,
             render_surface: None,
+            render_scale: 1.0,
             panel_input_active: false,
             anim: Animator::new(),
             surfaces: HashMap::new(),
@@ -559,10 +574,16 @@ impl Renderer {
         selection: Option<&SelectionVisual>,
     ) -> Option<RenderedFrame<'_>> {
         let (width, height) = (surface.width.max(1), surface.height.max(1));
+        // The compositor is told this scale via set_buffer_scale, so the
+        // buffer must be this many device pixels per logical pixel.
+        let scale = surface.scale_factor.max(1) as u32;
+        self.render_scale = scale as f32;
+        let (device_width, device_height) = (width * scale, height * scale);
         let bar_key = matches!(surface.kind, SurfaceKind::Bar(_)).then(|| BarRenderKey {
             generation: snapshot.generation,
             width,
             height,
+            scale,
             hover: (self.hovered_surface == Some(surface.id))
                 .then_some(self.hovered_target)
                 .flatten(),
@@ -598,12 +619,11 @@ impl Renderer {
         }
 
         let mut state = self.surfaces.remove(&surface.id).unwrap_or_default();
-        let reusable = state
-            .canvas
-            .as_ref()
-            .is_some_and(|pixmap| pixmap.width() == width && pixmap.height() == height);
+        let reusable = state.canvas.as_ref().is_some_and(|pixmap| {
+            pixmap.width() == device_width && pixmap.height() == device_height
+        });
         if !reusable {
-            state.canvas = Pixmap::new(width, height);
+            state.canvas = Pixmap::new(device_width, device_height);
             state.canvas_damage = None;
         }
         let Some(mut pixmap) = state.canvas.take() else {
@@ -627,8 +647,8 @@ impl Renderer {
                     damage = Some(DamageRect {
                         x: 0,
                         y: 0,
-                        width,
-                        height,
+                        width: device_width,
+                        height: device_height,
                     });
                 }
             }
@@ -647,7 +667,18 @@ impl Renderer {
                     damage = panel.and_then(|panel| {
                         let padding =
                             config.style.shadow_spread + config.style.shadow_offset.abs() + 4.0;
-                        damage_for_rect(panel, padding, width, height)
+                        let device_panel = Rect {
+                            x: panel.x * self.render_scale,
+                            y: panel.y * self.render_scale,
+                            width: panel.width * self.render_scale,
+                            height: panel.height * self.render_scale,
+                        };
+                        damage_for_rect(
+                            device_panel,
+                            padding * self.render_scale,
+                            device_width,
+                            device_height,
+                        )
                     });
                 }
             }
@@ -655,7 +686,20 @@ impl Renderer {
 
         if let Some(drag) = drag
             && let Some(rect) = self.render_drag_ghost(&mut pixmap, surface, drag, config)
-            && let Some(ghost) = damage_for_rect(rect, 6.0, width, height)
+            && let Some(ghost) = {
+                let device_rect = Rect {
+                    x: rect.x * self.render_scale,
+                    y: rect.y * self.render_scale,
+                    width: rect.width * self.render_scale,
+                    height: rect.height * self.render_scale,
+                };
+                damage_for_rect(
+                    device_rect,
+                    6.0 * self.render_scale,
+                    device_width,
+                    device_height,
+                )
+            }
         {
             damage = Some(damage.map_or(ghost, |current| current.union(ghost)));
         }
@@ -683,15 +727,17 @@ impl Renderer {
         zones: &mut Vec<HitZone>,
     ) {
         let horizontal = matches!(bar.edge, Edge::Top | Edge::Bottom);
+        let logical_width = pixmap.width() as f32 / self.render_scale;
+        let logical_height = pixmap.height() as f32 / self.render_scale;
         let length = if horizontal {
-            pixmap.width() as f32
+            logical_width
         } else {
-            pixmap.height() as f32
+            logical_height
         };
         let cross = if horizontal {
-            pixmap.height() as f32
+            logical_height
         } else {
-            pixmap.width() as f32
+            logical_width
         };
         let gap = config.style.gap;
         let icon_size = config
@@ -814,8 +860,14 @@ impl Renderer {
                         rect.y + 6.0,
                     )
                 };
-                self.text
-                    .draw(pixmap, &label, label_x, label_y, label_font, color);
+                self.text.draw(
+                    pixmap,
+                    &label,
+                    label_x * self.render_scale,
+                    label_y * self.render_scale,
+                    label_font * self.render_scale,
+                    color,
+                );
             }
             main += cell_length + gap;
         }
@@ -846,7 +898,14 @@ impl Renderer {
         // transparent pixmap was the dominant opening-frame cost.
         let panel = self.render_popup(pixmap, host_output, snapshot, config, selection, zones)?;
         let padding = config.style.shadow_spread + config.style.shadow_offset.abs() + 4.0;
-        let damage = damage_for_rect(panel, padding, pixmap.width(), pixmap.height())?;
+        let s = self.render_scale;
+        let device_panel = Rect {
+            x: panel.x * s,
+            y: panel.y * s,
+            width: panel.width * s,
+            height: panel.height * s,
+        };
+        let damage = damage_for_rect(device_panel, padding * s, pixmap.width(), pixmap.height())?;
         let reusable = layer
             .as_ref()
             .is_some_and(|layer| layer.width() == damage.width && layer.height() == damage.height);
@@ -903,8 +962,10 @@ impl Renderer {
             0.0
         };
         let count = outputs.len() as f32;
-        let output_width = pixmap.width() as f32;
-        let output_height = pixmap.height() as f32;
+        let logical_width = pixmap.width() as f32 / self.render_scale;
+        let logical_height = pixmap.height() as f32 / self.render_scale;
+        let output_width = logical_width;
+        let output_height = logical_height;
         // A configured canvas can be larger than the panel maximum. Fit the
         // canvas inside the final panel so its focal point stays centred and
         // content never extends beyond the panel chrome.
@@ -912,19 +973,19 @@ impl Renderer {
             .popup
             .width
             .resolve(output_width)
-            .min(pixmap.width().saturating_sub(24) as f32)
+            .min(logical_width - 24.0)
             .max(1.0);
         let max_panel_height = config
             .popup
             .height
             .resolve(output_height)
-            .min(pixmap.height().saturating_sub(24) as f32)
+            .min(logical_height - 24.0)
             .max(1.0);
         let canvas_width_limit =
             ((max_panel_width - padding * 2.0 - gap * (count - 1.0)) / count).max(1.0);
         let canvas_height_limit = (max_panel_height - padding * 2.0 - header).max(1.0);
-        let output_canvas_width_limit = (pixmap.width().saturating_sub(64) as f32 / count).max(1.0);
-        let output_canvas_height_limit = pixmap.height().saturating_sub(64) as f32;
+        let output_canvas_width_limit = ((logical_width - 64.0) / count).max(1.0);
+        let output_canvas_height_limit = logical_height - 64.0;
         let canvas_width = config
             .popup
             .canvas_width
@@ -944,8 +1005,8 @@ impl Renderer {
 
         let (mut panel_x, mut panel_y) = match config.popup.position {
             PopupPosition::Center => (
-                (pixmap.width() as f32 - panel_width) * 0.5,
-                (pixmap.height() as f32 - panel_height) * 0.5,
+                (logical_width - panel_width) * 0.5,
+                (logical_height - panel_height) * 0.5,
             ),
             PopupPosition::Fixed => (
                 config.popup.fixed_x.resolve(output_width),
@@ -956,11 +1017,11 @@ impl Renderer {
                 .get(host_output)
                 .copied()
                 .map(|(x, y)| (x - panel_width * 0.5, y + 18.0))
-                .unwrap_or(((pixmap.width() as f32 - panel_width) * 0.5, 80.0)),
+                .unwrap_or(((logical_width - panel_width) * 0.5, 80.0)),
             PopupPosition::Anchored => {
                 let placement = config.popup.placement(host_output);
-                let free_x = pixmap.width() as f32 - panel_width;
-                let free_y = pixmap.height() as f32 - panel_height;
+                let free_x = logical_width - panel_width;
+                let free_y = logical_height - panel_height;
                 let margin_x = placement.margin.resolve(output_width);
                 let margin_y = placement.margin.resolve(output_height);
                 (
@@ -977,11 +1038,8 @@ impl Renderer {
                 )
             }
         };
-        panel_x = panel_x.clamp(12.0, (pixmap.width() as f32 - panel_width - 12.0).max(12.0));
-        panel_y = panel_y.clamp(
-            12.0,
-            (pixmap.height() as f32 - panel_height - 12.0).max(12.0),
-        );
+        panel_x = panel_x.clamp(12.0, (logical_width - panel_width - 12.0).max(12.0));
+        panel_y = panel_y.clamp(12.0, (logical_height - panel_height - 12.0).max(12.0));
         let panel = Rect {
             x: panel_x,
             y: panel_y,
@@ -989,7 +1047,13 @@ impl Renderer {
             height: panel_height,
         };
 
-        draw_panel_chrome(pixmap, panel, config, self.panel_input_active);
+        draw_panel_chrome(
+            pixmap,
+            panel,
+            config,
+            self.panel_input_active,
+            self.render_scale,
+        );
         zones.push(HitZone {
             rect: panel,
             target: HitTarget::Panel,
@@ -1006,15 +1070,16 @@ impl Renderer {
                     1.0,
                     (canvas_height - 12.0).max(0.0),
                     hex_color(&config.style.border_soft),
+                    self.render_scale,
                 );
             }
             if config.popup.show_labels {
                 self.text.draw(
                     pixmap,
                     &output.name,
-                    origin_x + 4.0,
-                    panel_y + padding,
-                    config.style.label_font_size,
+                    (origin_x + 4.0) * self.render_scale,
+                    (panel_y + padding) * self.render_scale,
+                    config.style.label_font_size * self.render_scale,
                     hex_color(&config.style.muted),
                 );
             }
@@ -1145,7 +1210,14 @@ impl Renderer {
             // An empty workspace still occupies a rung on the vertical axis.
             let mut dot = hex_color(&config.style.border_soft);
             dot.set_alpha(dot.alpha() * base_alpha);
-            fill_circle(pixmap, start_x, row_y, config.style.empty_dot_radius, dot);
+            fill_circle(
+                pixmap,
+                start_x,
+                row_y,
+                config.style.empty_dot_radius,
+                dot,
+                self.render_scale,
+            );
             return;
         }
 
@@ -1255,8 +1327,14 @@ impl Renderer {
             );
             let mut color = hex_color(&config.style.text);
             color.set_alpha(color.alpha() * alpha);
-            self.text
-                .draw(pixmap, &title, x, center_y - size * 0.42, size, color);
+            self.text.draw(
+                pixmap,
+                &title,
+                x * self.render_scale,
+                (center_y - size * 0.42) * self.render_scale,
+                size * self.render_scale,
+                color,
+            );
         } else if config.popup.show_titles && selected_window == Some(window.id) {
             let label = self
                 .icons
@@ -1270,9 +1348,10 @@ impl Renderer {
             self.text.draw(
                 pixmap,
                 &title,
-                center_x - width * 0.5,
-                (rect.y + rect.height + 4.0).min(canvas.y + canvas.height - size - 1.0),
-                size,
+                (center_x - width * 0.5) * self.render_scale,
+                ((rect.y + rect.height + 4.0).min(canvas.y + canvas.height - size - 1.0))
+                    * self.render_scale,
+                size * self.render_scale,
                 color,
             );
         }
@@ -1300,6 +1379,7 @@ impl Renderer {
                 } else {
                     hex_color(&config.style.surface)
                 },
+                self.render_scale,
             );
             stroke_rounded_rect(
                 pixmap,
@@ -1320,6 +1400,7 @@ impl Renderer {
                 } else {
                     config.style.border_width
                 },
+                self.render_scale,
             );
         }
         if bar.show_active_indicator && (workspace.active || workspace.focused || workspace.urgent)
@@ -1335,6 +1416,7 @@ impl Renderer {
                 } else {
                     hex_color(&config.style.accent)
                 },
+                self.render_scale,
             );
         }
     }
@@ -1356,6 +1438,7 @@ impl Renderer {
             rect.y + rect.height * 0.5,
             rect.width * 0.56,
             color,
+            self.render_scale,
         );
     }
 
@@ -1381,11 +1464,12 @@ impl Renderer {
         // Emphasis lifts an icon back to full opacity as it eases into focus.
         let alpha = lerp(alpha.clamp(0.0, 1.0), 1.0, emphasis);
         if let Some((width, height, pixels)) = self.icons.get(&window.app_id) {
+            let icon_size = rect.width.min(rect.height).round() * self.render_scale;
             blit_icon_alpha(
                 pixmap,
-                rect.x.round() as i32,
-                rect.y.round() as i32,
-                rect.width.min(rect.height).round() as u32,
+                (rect.x * self.render_scale).round() as i32,
+                (rect.y * self.render_scale).round() as i32,
+                icon_size.round() as u32,
                 pixels,
                 *width,
                 *height,
@@ -1402,6 +1486,7 @@ impl Renderer {
                 rect.height,
                 rect.width * 0.22,
                 plate,
+                self.render_scale,
             );
             let fallback = window
                 .app_id
@@ -1417,9 +1502,9 @@ impl Renderer {
             self.text.draw(
                 pixmap,
                 &fallback,
-                rect.x + (rect.width - text_width) * 0.5,
-                rect.y + rect.height * 0.2,
-                font_size,
+                (rect.x + (rect.width - text_width) * 0.5) * self.render_scale,
+                (rect.y + rect.height * 0.2) * self.render_scale,
+                font_size * self.render_scale,
                 text_color,
             );
         }
@@ -1445,6 +1530,7 @@ impl Renderer {
                         config.style.radius + padding,
                         urgent,
                         width,
+                        self.render_scale,
                     );
                 }
             }
@@ -1462,6 +1548,7 @@ impl Renderer {
                     rect.y + rect.height * 0.5,
                     rect.width.max(rect.height) * 0.5 + spread,
                     color,
+                    self.render_scale,
                 );
             }
             UrgentIndicator::Badge => {
@@ -1473,8 +1560,8 @@ impl Renderer {
                 let y = rect.y + radius * 0.15;
                 let mut backing = hex_color(&config.style.background_end);
                 backing.set_alpha(backing.alpha().max(0.82));
-                fill_circle(pixmap, x, y, radius + 1.25, backing);
-                fill_circle(pixmap, x, y, radius, urgent);
+                fill_circle(pixmap, x, y, radius + 1.25, backing, self.render_scale);
+                fill_circle(pixmap, x, y, radius, urgent, self.render_scale);
             }
         }
     }
@@ -1510,6 +1597,7 @@ impl Renderer {
             rect.height + 10.0,
             config.style.radius,
             hex_color(&config.style.floating_backing),
+            self.render_scale,
         );
         let ghost_window = WindowModel {
             id: drag.window_id,
@@ -1630,6 +1718,7 @@ mod tests {
             configured: true,
             frame_ready: true,
             needs_full_redraw: false,
+            scale_factor: 1,
         }
     }
 

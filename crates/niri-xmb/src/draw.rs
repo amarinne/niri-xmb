@@ -27,7 +27,7 @@ pub fn hex_color(s: &str) -> Color {
 }
 
 /// Fill a solid rectangle.
-pub fn fill_rect(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, color: Color) {
+pub fn fill_rect(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, color: Color, scale: f32) {
     if w <= 0.0 || h <= 0.0 {
         return;
     }
@@ -37,10 +37,11 @@ pub fn fill_rect(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, color: Col
     let mut paint = Paint::default();
     paint.set_color(color);
     paint.anti_alias = false;
-    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+    pixmap.fill_rect(rect, &paint, Transform::from_scale(scale, scale), None);
 }
 
 /// Fill a rounded rectangle.
+#[allow(clippy::too_many_arguments)]
 pub fn fill_rounded_rect(
     pixmap: &mut Pixmap,
     x: f32,
@@ -49,12 +50,13 @@ pub fn fill_rounded_rect(
     h: f32,
     r: f32,
     color: Color,
+    scale: f32,
 ) {
     if w <= 0.0 || h <= 0.0 {
         return;
     }
     if r <= 0.0 || w < r * 2.0 || h < r * 2.0 {
-        fill_rect(pixmap, x, y, w, h, color);
+        fill_rect(pixmap, x, y, w, h, color, scale);
         return;
     }
     let mut paint = Paint::default();
@@ -65,7 +67,7 @@ pub fn fill_rounded_rect(
             &path,
             &paint,
             FillRule::Winding,
-            Transform::identity(),
+            Transform::from_scale(scale, scale),
             None,
         );
     }
@@ -85,12 +87,13 @@ pub fn fill_gradient_rounded_rect(
     r: f32,
     top: Color,
     bottom: Color,
+    scale: f32,
 ) {
     if w <= 0.0 || h <= 0.0 {
         return;
     }
     if top == bottom {
-        fill_rounded_rect(pixmap, x, y, w, h, r, top);
+        fill_rounded_rect(pixmap, x, y, w, h, r, top, scale);
         return;
     }
     let shader = LinearGradient::new(
@@ -101,7 +104,7 @@ pub fn fill_gradient_rounded_rect(
         Transform::identity(),
     );
     let Some(shader) = shader else {
-        fill_rounded_rect(pixmap, x, y, w, h, r, top);
+        fill_rounded_rect(pixmap, x, y, w, h, r, top, scale);
         return;
     };
     let Some(path) = rounded_rect_path(x, y, w, h, r.max(0.0).min(w * 0.5).min(h * 0.5)) else {
@@ -116,7 +119,7 @@ pub fn fill_gradient_rounded_rect(
         &path,
         &paint,
         FillRule::Winding,
-        Transform::identity(),
+        Transform::from_scale(scale, scale),
         None,
     );
 }
@@ -132,6 +135,7 @@ pub fn stroke_rounded_rect(
     r: f32,
     color: Color,
     width: f32,
+    scale: f32,
 ) {
     if w <= 0.0 || h <= 0.0 {
         return;
@@ -146,12 +150,18 @@ pub fn stroke_rounded_rect(
         ..Stroke::default()
     };
     if let Some(path) = rounded_rect_path(x, y, w, h, r) {
-        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        pixmap.stroke_path(
+            &path,
+            &paint,
+            &stroke,
+            Transform::from_scale(scale, scale),
+            None,
+        );
     }
 }
 
 /// Draw a filled circle.
-pub fn fill_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, color: Color) {
+pub fn fill_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, color: Color, scale: f32) {
     if r <= 0.0 {
         return;
     }
@@ -165,14 +175,21 @@ pub fn fill_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, color: Color) 
             &path,
             &paint,
             FillRule::Winding,
-            Transform::identity(),
+            Transform::from_scale(scale, scale),
             None,
         );
     }
 }
 
 /// Draw a soft circular glow that fades to transparent at `radius`.
-pub fn fill_radial_glow(pixmap: &mut Pixmap, cx: f32, cy: f32, radius: f32, color: Color) {
+pub fn fill_radial_glow(
+    pixmap: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    color: Color,
+    scale: f32,
+) {
     if radius <= 0.0 || color.alpha() <= 0.0 {
         return;
     }
@@ -208,7 +225,7 @@ pub fn fill_radial_glow(pixmap: &mut Pixmap, cx: f32, cy: f32, radius: f32, colo
             ..Paint::default()
         },
         FillRule::Winding,
-        Transform::identity(),
+        Transform::from_scale(scale, scale),
         None,
     );
 }
@@ -349,6 +366,7 @@ mod tests {
             12.0,
             10.0,
             Color::from_rgba8(255, 0, 0, 128),
+            1.0,
         );
 
         let center = pixmap.pixel(12, 12).unwrap().alpha();
