@@ -1040,6 +1040,38 @@ fn publish_snapshot(
     }
 }
 
+/// The soonest of everything the loop is waiting for.
+///
+/// Six hand-written `min` calls used to do this, so a new deadline that
+/// forgot to add a seventh produced not a crash but a silent 250 ms
+/// latency bug. Register them all here instead.
+struct Deadlines {
+    wait: Duration,
+    now: Instant,
+}
+
+impl Deadlines {
+    fn new(idle: Duration, now: Instant) -> Self {
+        Self { wait: idle, now }
+    }
+
+    /// Wait no longer than until `deadline`.
+    fn at(&mut self, deadline: Instant) {
+        self.wait = self.wait.min(deadline.saturating_duration_since(self.now));
+    }
+
+    /// Wait no longer than `total` measured from `since`.
+    fn after(&mut self, since: Instant, total: Duration) {
+        self.wait = self
+            .wait
+            .min(total.saturating_sub(self.now.saturating_duration_since(since)));
+    }
+
+    fn wait(self) -> Duration {
+        self.wait
+    }
+}
+
 fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut config = Config::load(&config_path)?;
     let output_names = connected_outputs()?;
@@ -1654,29 +1686,28 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         // only provide deadlines for animation/focus/peek state and a safety
         // fallback; settled input does not burn CPU in a fixed sleep loop.
         let now = Instant::now();
-        wait_timeout = if animating || dirty {
+        let idle = if animating || dirty {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(250)
         };
+        let mut deadlines = Deadlines::new(idle, now);
         if let Some(since) = pending_focus_since {
-            wait_timeout =
-                wait_timeout.min(FOCUS_SETTLE.saturating_sub(now.saturating_duration_since(since)));
+            deadlines.after(since, FOCUS_SETTLE);
         }
         if let Some(deadline) = panel.peek().deadline() {
-            wait_timeout = wait_timeout.min(deadline.saturating_duration_since(now));
+            deadlines.at(deadline);
         }
         if let Some(at) = panel.peek().pointer_at() {
-            wait_timeout = wait_timeout.min(at.saturating_duration_since(now));
+            deadlines.at(at);
         }
         if let Some((_, since)) = panel.follow_candidate() {
-            let delay = Duration::from_millis(config.popup.follow_delay_ms);
-            wait_timeout =
-                wait_timeout.min(delay.saturating_sub(now.saturating_duration_since(*since)));
+            deadlines.after(*since, Duration::from_millis(config.popup.follow_delay_ms));
         }
         if let Some(deadline) = drop_transactions.next_deadline() {
-            wait_timeout = wait_timeout.min(deadline.saturating_duration_since(now));
+            deadlines.at(deadline);
         }
+        wait_timeout = deadlines.wait();
     }
 
     surfaces.hide_all_popups()
@@ -3225,10 +3256,43 @@ mod tests {
         resolve_bars(&mut config, &["eDP-1".to_string()]);
         assert!(config.bars.is_empty());
     }
+
+    /// The loop sleeps until the soonest thing it is waiting for, and an
+    /// already-passed deadline means do not sleep at all.
+    #[test]
+    fn deadlines_take_the_soonest_wait() {
+        let now = Instant::now();
+
+        // Nothing registered: the idle wait stands.
+        let deadlines = Deadlines::new(Duration::from_millis(250), now);
+        assert_eq!(deadlines.wait(), Duration::from_millis(250));
+
+        // The soonest of several wins, whichever order they arrive in.
+        let mut deadlines = Deadlines::new(Duration::from_millis(250), now);
+        deadlines.at(now + Duration::from_millis(90));
+        deadlines.at(now + Duration::from_millis(30));
+        deadlines.at(now + Duration::from_millis(60));
+        assert_eq!(deadlines.wait(), Duration::from_millis(30));
+
+        // A longer deadline never extends the wait.
+        let mut deadlines = Deadlines::new(Duration::from_millis(250), now);
+        deadlines.at(now + Duration::from_secs(5));
+        assert_eq!(deadlines.wait(), Duration::from_millis(250));
+
+        // `after` measures a total from a start instant.
+        let mut deadlines = Deadlines::new(Duration::from_millis(250), now);
+        deadlines.after(now - Duration::from_millis(80), Duration::from_millis(120));
+        assert_eq!(deadlines.wait(), Duration::from_millis(40));
+
+        // Anything already due means return immediately.
+        let mut deadlines = Deadlines::new(Duration::from_millis(250), now);
+        deadlines.at(now - Duration::from_millis(5));
+        assert_eq!(deadlines.wait(), Duration::ZERO);
+    }
 }
 
 #[cfg(test)]
-mod selection_tests {
+mod ui_tests {
     use super::*;
     use crate::model::{OutputModel, Snapshot, WindowModel, WorkspaceModel};
     use std::collections::BTreeMap;
