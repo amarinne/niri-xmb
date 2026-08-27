@@ -4,7 +4,7 @@ use crate::config::{
 };
 use crate::draw::{
     blit_icon_alpha, fill_circle, fill_gradient_rounded_rect, fill_radial_glow, fill_rect,
-    fill_rounded_rect, hex_color, stroke_rounded_rect,
+    fill_rounded_rect, stroke_rounded_rect,
 };
 use crate::icons::IconCache;
 use crate::model::{OutputModel, Snapshot, WindowModel, WindowSlot, WorkspaceModel};
@@ -99,7 +99,7 @@ fn draw_panel_chrome(
     let radius = config.style.panel_radius;
     let offset = config.style.shadow_offset;
     let spread = config.style.shadow_spread;
-    let shadow = hex_color(&config.style.shadow);
+    let shadow = config.style.shadow.get();
     // Two offset passes approximate a blur without a real blur pass. The outer
     // one is spread wider and drawn fainter.
     let mut outer = shadow;
@@ -131,8 +131,8 @@ fn draw_panel_chrome(
         panel.width,
         panel.height,
         radius,
-        hex_color(&config.style.background),
-        hex_color(&config.style.background_end),
+        config.style.background.get(),
+        config.style.background_end.get(),
         scale,
     );
     stroke_rounded_rect(
@@ -143,9 +143,9 @@ fn draw_panel_chrome(
         panel.height - 1.0,
         radius,
         if panel_input_active {
-            hex_color(&config.style.accent)
+            config.style.accent.get()
         } else {
-            hex_color(&config.style.border)
+            config.style.border.get()
         },
         config.style.border_width,
         scale,
@@ -848,9 +848,9 @@ impl Renderer {
 
             if bar.show_workspace_labels {
                 let color = if workspace.active || workspace.focused {
-                    hex_color(&config.style.text)
+                    config.style.text.get()
                 } else {
-                    hex_color(&config.style.muted)
+                    config.style.muted.get()
                 };
                 let (label_x, label_y) = if horizontal {
                     (rect.x + 6.0, rect.y + (rect.height - label_font) * 0.5)
@@ -1069,7 +1069,7 @@ impl Renderer {
                     origin_y + 6.0,
                     1.0,
                     (canvas_height - 12.0).max(0.0),
-                    hex_color(&config.style.border_soft),
+                    config.style.border_soft.get(),
                     self.render_scale,
                 );
             }
@@ -1080,7 +1080,7 @@ impl Renderer {
                     (origin_x + 4.0) * self.render_scale,
                     (panel_y + padding) * self.render_scale,
                     config.style.label_font_size * self.render_scale,
-                    hex_color(&config.style.muted),
+                    config.style.muted.get(),
                 );
             }
             self.draw_output_canvas(
@@ -1208,7 +1208,7 @@ impl Renderer {
 
         if workspace.windows().next().is_none() {
             // An empty workspace still occupies a rung on the vertical axis.
-            let mut dot = hex_color(&config.style.border_soft);
+            let mut dot = config.style.border_soft.get();
             dot.set_alpha(dot.alpha() * base_alpha);
             fill_circle(
                 pixmap,
@@ -1325,7 +1325,7 @@ impl Renderer {
                 (canvas.x + canvas.width - x).max(0.0),
                 size,
             );
-            let mut color = hex_color(&config.style.text);
+            let mut color = config.style.text.get();
             color.set_alpha(color.alpha() * alpha);
             self.text.draw(
                 pixmap,
@@ -1343,7 +1343,7 @@ impl Renderer {
             let title = truncate_label(&label, 18);
             let size = config.style.title_font_size;
             let width = self.text.measure(&title, size);
-            let mut color = hex_color(&config.style.text);
+            let mut color = config.style.text.get();
             color.set_alpha(color.alpha() * focus);
             self.text.draw(
                 pixmap,
@@ -1375,9 +1375,9 @@ impl Renderer {
                 rect.height,
                 config.style.radius,
                 if workspace.active || workspace.focused || hovered {
-                    hex_color(&config.style.surface_hover)
+                    config.style.surface_hover.get()
                 } else {
-                    hex_color(&config.style.surface)
+                    config.style.surface.get()
                 },
                 self.render_scale,
             );
@@ -1389,11 +1389,11 @@ impl Renderer {
                 rect.height - 1.0,
                 config.style.radius,
                 if workspace.urgent {
-                    hex_color(&config.style.urgent)
+                    config.style.urgent.get()
                 } else if workspace.active || workspace.focused {
-                    hex_color(&config.style.selection_border)
+                    config.style.selection_border.get()
                 } else {
-                    hex_color(&config.style.border_soft)
+                    config.style.border_soft.get()
                 },
                 if workspace.active || workspace.focused {
                     1.25
@@ -1412,9 +1412,9 @@ impl Renderer {
                 rect.y + rect.height - 2.5,
                 diameter * 0.5,
                 if workspace.urgent {
-                    hex_color(&config.style.urgent)
+                    config.style.urgent.get()
                 } else {
-                    hex_color(&config.style.accent)
+                    config.style.accent.get()
                 },
                 self.render_scale,
             );
@@ -1430,7 +1430,7 @@ impl Renderer {
         config: &Config,
         alpha: f32,
     ) {
-        let mut color = hex_color(&config.style.floating_backing);
+        let mut color = config.style.floating_backing.get();
         color.set_alpha(color.alpha() * alpha.clamp(0.0, 1.0));
         fill_circle(
             pixmap,
@@ -1476,7 +1476,7 @@ impl Renderer {
                 alpha,
             );
         } else {
-            let mut plate = hex_color(&config.style.border);
+            let mut plate = config.style.border.get();
             plate.set_alpha(plate.alpha() * alpha);
             fill_rounded_rect(
                 pixmap,
@@ -1495,7 +1495,7 @@ impl Renderer {
                 .unwrap_or('?')
                 .to_uppercase()
                 .to_string();
-            let mut text_color = hex_color(&config.style.text);
+            let mut text_color = config.style.text.get();
             text_color.set_alpha(text_color.alpha() * alpha);
             let font_size = rect.height * 0.55;
             let text_width = self.text.measure(&fallback, font_size);
@@ -1514,7 +1514,7 @@ impl Renderer {
     }
 
     fn draw_urgent_indicator(&self, pixmap: &mut Pixmap, rect: Rect, config: &Config) {
-        let urgent = hex_color(&config.style.urgent);
+        let urgent = config.style.urgent.get();
         match config.style.urgent_indicator {
             UrgentIndicator::None => {}
             UrgentIndicator::Ring => {
@@ -1558,7 +1558,7 @@ impl Renderer {
                 }
                 let x = rect.x + rect.width - radius * 0.15;
                 let y = rect.y + radius * 0.15;
-                let mut backing = hex_color(&config.style.background_end);
+                let mut backing = config.style.background_end.get();
                 backing.set_alpha(backing.alpha().max(0.82));
                 fill_circle(pixmap, x, y, radius + 1.25, backing, self.render_scale);
                 fill_circle(pixmap, x, y, radius, urgent, self.render_scale);
@@ -1596,7 +1596,7 @@ impl Renderer {
             rect.width + 10.0,
             rect.height + 10.0,
             config.style.radius,
-            hex_color(&config.style.floating_backing),
+            config.style.floating_backing.get(),
             self.render_scale,
         );
         let ghost_window = WindowModel {

@@ -5,24 +5,61 @@ use tiny_skia::{
     Point, RadialGradient, Rect, SpreadMode, Stroke, Transform,
 };
 
-/// Parse a hex color string (#RRGGBB or #AARRGGBB) into a tiny-skia Color.
-pub fn hex_color(s: &str) -> Color {
-    let s = s.trim_start_matches('#');
-    match s.len() {
-        6 => {
-            let r = u8::from_str_radix(&s[0..2], 16).unwrap_or(0);
-            let g = u8::from_str_radix(&s[2..4], 16).unwrap_or(0);
-            let b = u8::from_str_radix(&s[4..6], 16).unwrap_or(0);
-            Color::from_rgba8(r, g, b, 255)
+/// A colour parsed once, at config load.
+///
+/// Colours used to live as strings and be reparsed from hex on every
+/// frame, with a validator and a parser that disagreed about what was
+/// valid: one demanded a leading `#`, the other silently fell back to
+/// black. This type can only be built by parsing, so neither is possible.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StyleColor(tiny_skia::Color);
+
+impl StyleColor {
+    pub fn get(self) -> tiny_skia::Color {
+        self.0
+    }
+
+    /// Parse `#RRGGBB` or `#AARRGGBB`.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let digits = value
+            .strip_prefix('#')
+            .ok_or_else(|| format!("must use #RRGGBB or #AARRGGBB syntax; got {value:?}"))?;
+        if !matches!(digits.len(), 6 | 8) || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "must use #RRGGBB or #AARRGGBB syntax; got {value:?}"
+            ));
         }
-        8 => {
-            let a = u8::from_str_radix(&s[0..2], 16).unwrap_or(255);
-            let r = u8::from_str_radix(&s[2..4], 16).unwrap_or(0);
-            let g = u8::from_str_radix(&s[4..6], 16).unwrap_or(0);
-            let b = u8::from_str_radix(&s[6..8], 16).unwrap_or(0);
-            Color::from_rgba8(r, g, b, a)
-        }
-        _ => Color::BLACK,
+        let byte = |at: usize| u8::from_str_radix(&digits[at..at + 2], 16).unwrap_or(0);
+        let color = if digits.len() == 6 {
+            tiny_skia::Color::from_rgba8(byte(0), byte(2), byte(4), 255)
+        } else {
+            tiny_skia::Color::from_rgba8(byte(2), byte(4), byte(6), byte(0))
+        };
+        Ok(Self(color))
+    }
+}
+
+impl std::fmt::Display for StyleColor {
+    /// Round-trips through `parse`, so a serialised config reloads identically.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = (self.0.red() * 255.0).round() as u8;
+        let g = (self.0.green() * 255.0).round() as u8;
+        let b = (self.0.blue() * 255.0).round() as u8;
+        let a = (self.0.alpha() * 255.0).round() as u8;
+        write!(formatter, "#{a:02X}{r:02X}{g:02X}{b:02X}")
+    }
+}
+
+impl serde::Serialize for StyleColor {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for StyleColor {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -374,5 +411,27 @@ mod tests {
         let edge = pixmap.pixel(21, 12).unwrap().alpha();
         assert!(center > middle);
         assert!(middle > edge);
+    }
+
+    /// #RRGGBB is opaque; #AARRGGBB puts alpha first. Display round-trips.
+    #[test]
+    fn style_colours_parse_and_round_trip() {
+        let opaque = StyleColor::parse("#1E1E2E").unwrap();
+        assert_eq!(opaque.get().alpha(), 1.0);
+        assert_eq!((opaque.get().red() * 255.0).round() as u8, 0x1E);
+        assert_eq!((opaque.get().blue() * 255.0).round() as u8, 0x2E);
+
+        let with_alpha = StyleColor::parse("#801E1E2E").unwrap();
+        assert_eq!((with_alpha.get().alpha() * 255.0).round() as u8, 0x80);
+        assert_eq!((with_alpha.get().red() * 255.0).round() as u8, 0x1E);
+
+        assert_eq!(StyleColor::parse(&opaque.to_string()).unwrap(), opaque);
+        assert_eq!(
+            StyleColor::parse(&with_alpha.to_string()).unwrap(),
+            with_alpha
+        );
+
+        assert!(StyleColor::parse("1e1e2e").is_err());
+        assert!(StyleColor::parse("#xyzxyz").is_err());
     }
 }

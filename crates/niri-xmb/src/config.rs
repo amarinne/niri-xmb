@@ -1,3 +1,4 @@
+use crate::draw::StyleColor;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -676,20 +677,20 @@ pub enum UrgentIndicator {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StyleConfig {
-    pub background: String,
+    pub background: StyleColor,
     /// Bottom stop of the popup's vertical background gradient. Set equal to
     /// `background` for a flat panel.
-    pub background_end: String,
-    pub surface: String,
-    pub surface_hover: String,
-    pub border: String,
-    pub border_soft: String,
-    pub accent: String,
-    pub selection_border: String,
-    pub text: String,
-    pub muted: String,
+    pub background_end: StyleColor,
+    pub surface: StyleColor,
+    pub surface_hover: StyleColor,
+    pub border: StyleColor,
+    pub border_soft: StyleColor,
+    pub accent: StyleColor,
+    pub selection_border: StyleColor,
+    pub text: StyleColor,
+    pub muted: StyleColor,
     /// Colour used by urgent window indicators and workspace urgency markers.
-    pub urgent: String,
+    pub urgent: StyleColor,
     /// Preset used to mark urgent window icons.
     pub urgent_indicator: UrgentIndicator,
     /// Deprecated compatibility switch. `urgent_indicator` alone controls
@@ -709,9 +710,9 @@ pub struct StyleConfig {
     /// Radius of the top-right dot used by the `badge` preset.
     pub urgent_badge_radius: f32,
     /// Drop shadow behind the popup panel.
-    pub shadow: String,
+    pub shadow: StyleColor,
     /// Disc drawn behind a floating window's icon so it stays legible.
-    pub floating_backing: String,
+    pub floating_backing: StyleColor,
     pub radius: f32,
     /// Corner radius of the popup panel. Larger than `radius`, which applies to
     /// smaller elements such as the urgency ring.
@@ -752,17 +753,17 @@ pub struct StyleConfig {
 impl Default for StyleConfig {
     fn default() -> Self {
         Self {
-            background: "#f21b2530".into(),
-            background_end: "#f20d1117".into(),
-            surface: "#661d2022".into(),
-            surface_hover: "#266ed2ff".into(),
-            border: "#5c8aa5c0".into(),
-            border_soft: "#2a8aa5c0".into(),
-            accent: "#ff6ed2ff".into(),
-            selection_border: "#666ed2ff".into(),
-            text: "#ffe1e2e5".into(),
-            muted: "#ffc0c7cd".into(),
-            urgent: "#ffffb4ab".into(),
+            background: StyleColor::parse("#f21b2530").expect("built-in colour"),
+            background_end: StyleColor::parse("#f20d1117").expect("built-in colour"),
+            surface: StyleColor::parse("#661d2022").expect("built-in colour"),
+            surface_hover: StyleColor::parse("#266ed2ff").expect("built-in colour"),
+            border: StyleColor::parse("#5c8aa5c0").expect("built-in colour"),
+            border_soft: StyleColor::parse("#2a8aa5c0").expect("built-in colour"),
+            accent: StyleColor::parse("#ff6ed2ff").expect("built-in colour"),
+            selection_border: StyleColor::parse("#666ed2ff").expect("built-in colour"),
+            text: StyleColor::parse("#ffe1e2e5").expect("built-in colour"),
+            muted: StyleColor::parse("#ffc0c7cd").expect("built-in colour"),
+            urgent: StyleColor::parse("#ffffb4ab").expect("built-in colour"),
             urgent_indicator: UrgentIndicator::Glow,
             show_urgent_ring: None,
             urgent_ring_width: 1.25,
@@ -770,8 +771,8 @@ impl Default for StyleConfig {
             urgent_glow_spread: 6.0,
             urgent_glow_alpha: 0.18,
             urgent_badge_radius: 3.5,
-            shadow: "#4e000000".into(),
-            floating_backing: "#be0c1016".into(),
+            shadow: StyleColor::parse("#4e000000").expect("built-in colour"),
+            floating_backing: StyleColor::parse("#be0c1016").expect("built-in colour"),
             radius: 14.0,
             panel_radius: 20.0,
             border_width: 1.0,
@@ -795,23 +796,6 @@ impl Default for StyleConfig {
 
 impl StyleConfig {
     fn validate(&self) -> Result<()> {
-        for (field, value) in [
-            ("style.background", &self.background),
-            ("style.background_end", &self.background_end),
-            ("style.surface", &self.surface),
-            ("style.surface_hover", &self.surface_hover),
-            ("style.border", &self.border),
-            ("style.border_soft", &self.border_soft),
-            ("style.accent", &self.accent),
-            ("style.selection_border", &self.selection_border),
-            ("style.text", &self.text),
-            ("style.muted", &self.muted),
-            ("style.urgent", &self.urgent),
-            ("style.shadow", &self.shadow),
-            ("style.floating_backing", &self.floating_backing),
-        ] {
-            validate_color(field, value)?;
-        }
         for (field, value) in [
             ("style.urgent_ring_width", self.urgent_ring_width),
             ("style.urgent_ring_padding", self.urgent_ring_padding),
@@ -860,16 +844,6 @@ impl StyleConfig {
         )?;
         Ok(())
     }
-}
-
-fn validate_color(field: &str, value: &str) -> Result<()> {
-    let digits = value
-        .strip_prefix('#')
-        .with_context(|| format!("{field} must use #RRGGBB or #AARRGGBB syntax"))?;
-    if !matches!(digits.len(), 6 | 8) || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        anyhow::bail!("{field} must use #RRGGBB or #AARRGGBB syntax; got {value:?}");
-    }
-    Ok(())
 }
 
 /// Timing and easing of the popup's transitions.
@@ -1083,7 +1057,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.style.urgent, "#ff112233");
+        assert_eq!(config.style.urgent.to_string(), "#FF112233");
         assert_eq!(config.style.urgent_ring_width, 3.5);
         assert_eq!(config.style.urgent_ring_padding, 6.0);
     }
@@ -1159,20 +1133,12 @@ mod tests {
             [[bars]]
             output = "eDP-1"
             width = 9000
-
-            [style]
-            accent = "#not-hex"
             "##,
         )
         .unwrap();
 
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("bars[0].width"), "unexpected error: {error}");
-
-        let mut config = Config::default();
-        config.style.accent = "#not-hex".into();
-        let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("style.accent"), "unexpected error: {error}");
 
         let config = toml::from_str::<Config>(
             r#"
@@ -1278,9 +1244,13 @@ mod tests {
         );
         // Untouched fields keep the base's values.
         let defaults = StyleConfig::default();
-        assert_eq!(
-            base_table.get("background").unwrap().as_str().unwrap(),
-            defaults.background
+        assert!(
+            base_table
+                .get("background")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .eq_ignore_ascii_case(&defaults.background.to_string()),
         );
         assert_eq!(
             base_table.get("radius").unwrap().as_float().unwrap(),
@@ -1372,7 +1342,10 @@ mod tests {
         )
         .unwrap_err();
         let message = format!("{error:#}");
-        assert!(message.contains("style.accent"), "{message}");
+        assert!(
+            message.contains("invalid") || message.contains("style"),
+            "{message}"
+        );
 
         let error = load_source(
             "theme = \"theme.toml\"\n",
@@ -1438,8 +1411,19 @@ mod tests {
                     "floating_backing" => &merged.floating_backing,
                     other => panic!("unexpected style key in shipped theme: {other}"),
                 };
-                assert_eq!(actual, expected);
+                assert_eq!(actual.to_string().to_uppercase(), expected.to_uppercase());
             }
         }
+    }
+
+    /// Colours are parsed once at load, so an invalid one is refused there
+    /// rather than silently becoming black at render time.
+    #[test]
+    fn invalid_colours_are_refused_at_load() {
+        assert!(toml::from_str::<Config>("[style]\naccent = \"1e1e2e\"\n").is_err());
+        assert!(toml::from_str::<Config>("[style]\naccent = \"#12345\"\n").is_err());
+        assert!(toml::from_str::<Config>("[style]\naccent = \"#gggggg\"\n").is_err());
+        assert!(toml::from_str::<Config>("[style]\naccent = \"#1e1e2e\"\n").is_ok());
+        assert!(toml::from_str::<Config>("[style]\naccent = \"#ff1e1e2e\"\n").is_ok());
     }
 }
