@@ -10,6 +10,13 @@ local state = {
     lastError = nil,
     icons = {},
     iconRetryAt = {},
+    -- appIconPath can scan desktop entries and the icon theme. Keep those
+    -- lookups out of render callbacks and spread them across update ticks so
+    -- a window-heavy output cannot exhaust Noctalia's callback CPU budget.
+    iconQueue = {},
+    iconQueued = {},
+    iconQueueHead = 1,
+    iconRenderPending = false,
     hoveredWindowId = nil,
     pendingDrop = nil,
     dropErrorUntil = nil,
@@ -241,20 +248,44 @@ local function resolveIconCandidate(candidate, size)
         return nil
     end
 
-    -- Resolve a larger source than the logical display size. Noctalia then
-    -- downsamples the image instead of enlarging a low-resolution icon on a
-    -- fractional-scale output.
-    local decodeSize = math.max(64, size * 2)
-    local resolved = noctalia.appIconPath(candidate, decodeSize)
-    if resolved ~= nil then
-        state.icons[key] = resolved
-        state.iconRetryAt[key] = nil
-    else
-        -- Desktop entries can finish loading after the first plugin frame.
-        -- Retry misses slowly instead of keeping a startup placeholder forever.
-        state.iconRetryAt[key] = now + 5000
+    if not state.iconQueued[key] then
+        state.iconQueued[key] = true
+        table.insert(state.iconQueue, {
+            candidate = candidate,
+            size = size,
+            key = key,
+        })
     end
-    return resolved
+    return nil
+end
+
+local function resolveNextQueuedIcon()
+    while state.iconQueueHead <= #state.iconQueue do
+        local request = state.iconQueue[state.iconQueueHead]
+        state.iconQueueHead = state.iconQueueHead + 1
+        state.iconQueued[request.key] = nil
+
+        local now = noctalia.nowMs()
+        local retryAt = state.iconRetryAt[request.key]
+        if state.icons[request.key] == nil and (retryAt == nil or now >= retryAt) then
+            -- Resolve a larger source than the logical display size. Noctalia
+            -- then downsamples instead of enlarging a low-resolution icon.
+            local decodeSize = math.max(64, request.size * 2)
+            local resolved = noctalia.appIconPath(request.candidate, decodeSize)
+            if resolved ~= nil then
+                state.icons[request.key] = resolved
+                state.iconRetryAt[request.key] = nil
+                state.iconRenderPending = true
+            else
+                -- Desktop entries can finish loading after the first frame.
+                state.iconRetryAt[request.key] = now + 5000
+            end
+            return
+        end
+    end
+
+    state.iconQueue = {}
+    state.iconQueueHead = 1
 end
 
 local function iconPath(window, size)
@@ -872,6 +903,12 @@ end
 
 function update()
     flushScroll()
+    if state.iconRenderPending then
+        state.iconRenderPending = false
+        render()
+    else
+        resolveNextQueuedIcon()
+    end
     poll(false)
 end
 
@@ -902,6 +939,10 @@ end
 function onConfigChanged()
     state.icons = {}
     state.iconRetryAt = {}
+    state.iconQueue = {}
+    state.iconQueued = {}
+    state.iconQueueHead = 1
+    state.iconRenderPending = false
     state.lastGeneration = -1
     state.lastContentRevision = -1
     noctalia.setUpdateInterval(config("poll_interval_ms", 250))

@@ -21,6 +21,7 @@ pub type IconData = (u32, u32, Vec<u8>);
 struct DesktopApp {
     icon: String,
     name: String,
+    match_score: u8,
 }
 
 pub struct IconCache {
@@ -206,7 +207,7 @@ fn parse_desktop_file(path: &Path, map: &mut HashMap<String, DesktopApp>) {
     let mut in_entry = false;
     let mut icon_name: Option<String> = None;
     let mut display_name: Option<String> = None;
-    let mut keys: Vec<String> = Vec::new();
+    let mut keys: Vec<(String, u8)> = Vec::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -229,10 +230,10 @@ fn parse_desktop_file(path: &Path, map: &mut HashMap<String, DesktopApp>) {
             }
             "Name" => {
                 display_name = Some(v.to_string());
-                keys.push(v.to_lowercase());
+                keys.push((v.to_lowercase(), 10));
             }
             "StartupWMClass" => {
-                keys.push(v.to_lowercase());
+                keys.push((v.to_lowercase(), 90));
             }
             "Exec" => {
                 // Strip path and flags to get the bare executable name
@@ -240,7 +241,16 @@ fn parse_desktop_file(path: &Path, map: &mut HashMap<String, DesktopApp>) {
                     let base = exe.rsplit('/').next().unwrap_or(exe);
                     // Strip common wrappers (env, flatpak run, etc.)
                     let base = base.trim_end_matches(".sh");
-                    keys.push(base.to_lowercase());
+                    // Prefer the main launcher over helper entries that reuse
+                    // its executable with a fixed mode such as
+                    // `gnome-disks --restore-disk-image %U`.
+                    let fixed_args = v
+                        .split_whitespace()
+                        .skip(1)
+                        .filter(|arg| !arg.starts_with('%'))
+                        .count();
+                    let score = 60u8.saturating_sub(fixed_args.min(20) as u8);
+                    keys.push((base.to_lowercase(), score));
                 }
             }
             _ => {}
@@ -249,23 +259,35 @@ fn parse_desktop_file(path: &Path, map: &mut HashMap<String, DesktopApp>) {
 
     // Also register the .desktop filename stem (e.g. "org.gnome.Files" → "org.gnome.files")
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-        keys.push(stem.to_lowercase());
+        keys.push((stem.to_lowercase(), 100));
         // And short form
         if stem.contains('.')
             && let Some(last) = stem.rsplit('.').next()
         {
-            keys.push(last.to_lowercase());
+            keys.push((last.to_lowercase(), 80));
         }
     }
 
     if let Some(icon) = icon_name {
-        let app = DesktopApp {
-            name: display_name.unwrap_or_else(|| icon.clone()),
-            icon,
-        };
-        for key in keys {
+        let name = display_name.unwrap_or_else(|| icon.clone());
+        for (key, match_score) in keys {
             if !key.is_empty() {
-                map.entry(key).or_insert_with(|| app.clone());
+                let app = DesktopApp {
+                    icon: icon.clone(),
+                    name: name.clone(),
+                    match_score,
+                };
+                match map.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(app);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry)
+                        if match_score > entry.get().match_score =>
+                    {
+                        entry.insert(app);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
             }
         }
     }
@@ -284,8 +306,22 @@ fn find_icon_file(icon_name: &str) -> Option<PathBuf> {
     // Preferred sizes in order. Scalable icons are rendered through ImageMagick
     // when it is available, while PNG remains a dependency-free fast path.
     let sizes = [
-        "128x128", "256x256", "512x512", "96x96", "64x64", "scalable", "48x48", "32x32", "24x24",
-        "22x22", "16x16", "0x0",
+        "128x128",
+        "256x256",
+        "512x512",
+        "1024x1024",
+        "192x192",
+        "96x96",
+        "72x72",
+        "64x64",
+        "scalable",
+        "48x48",
+        "36x36",
+        "32x32",
+        "24x24",
+        "22x22",
+        "16x16",
+        "0x0",
     ];
     let mut themes = Vec::new();
     if let Some(theme) = gtk_icon_theme() {
@@ -308,43 +344,65 @@ fn find_icon_file(icon_name: &str) -> Option<PathBuf> {
         names.push(lowercase);
     }
 
-    for root in &roots {
+    find_icon_file_in_roots(icon_name, &roots, &themes, &sizes).or_else(|| {
+        for directory in xdg_data_dirs(&home)
+            .into_iter()
+            .map(|directory| format!("{directory}/pixmaps"))
+        {
+            for name in &names {
+                for extension in ["png", "svg"] {
+                    let path = PathBuf::from(&directory).join(format!("{name}.{extension}"));
+                    if path.is_file() {
+                        return Some(path);
+                    }
+                }
+                let path = PathBuf::from(&directory).join(name);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+
+        None
+    })
+}
+
+fn find_icon_file_in_roots(
+    icon_name: &str,
+    roots: &[String],
+    themes: &[String],
+    sizes: &[&str],
+) -> Option<PathBuf> {
+    let mut names = vec![icon_name.to_string()];
+    let lowercase = icon_name.to_lowercase();
+    if lowercase != icon_name {
+        names.push(lowercase);
+    }
+    // Freedesktop themes group icons by context. Application desktop files
+    // can legitimately name device or action icons, so do not restrict lookup
+    // to `apps/`.
+    let contexts = ["apps", "devices", "actions", "places", "mimetypes", "status"];
+
+    for root in roots {
         for theme in &themes {
             for size in &sizes {
-                for name in &names {
-                    for extension in ["png", "svg"] {
-                        let path = PathBuf::from(root)
-                            .join(theme)
-                            .join(size)
-                            .join("apps")
-                            .join(format!("{name}.{extension}"));
-                        if path.is_file() {
-                            return Some(path);
+                for context in contexts {
+                    for name in &names {
+                        for extension in ["png", "svg"] {
+                            let path = PathBuf::from(root)
+                                .join(theme)
+                                .join(size)
+                                .join(context)
+                                .join(format!("{name}.{extension}"));
+                            if path.is_file() {
+                                return Some(path);
+                            }
                         }
                     }
                 }
             }
         }
     }
-
-    for directory in xdg_data_dirs(&home)
-        .into_iter()
-        .map(|directory| format!("{directory}/pixmaps"))
-    {
-        for name in &names {
-            for extension in ["png", "svg"] {
-                let path = PathBuf::from(&directory).join(format!("{name}.{extension}"));
-                if path.is_file() {
-                    return Some(path);
-                }
-            }
-            let path = PathBuf::from(&directory).join(name);
-            if path.is_file() {
-                return Some(path);
-            }
-        }
-    }
-
     None
 }
 
@@ -475,6 +533,7 @@ mod tests {
             DesktopApp {
                 icon: "btop".into(),
                 name: "btop++".into(),
+                match_score: 100,
             },
         );
 
@@ -493,5 +552,54 @@ mod tests {
         assert!(dirs.contains(&"/var/lib/flatpak/exports/share".into()));
         assert!(dirs.contains(&"/usr/local/share".into()));
         assert!(dirs.contains(&"/usr/share".into()));
+    }
+
+    #[test]
+    fn launcher_with_no_fixed_arguments_wins_exec_alias_collision() {
+        let dir = std::env::temp_dir().join(format!("niri-xmb-icons-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("helper.desktop");
+        let launcher = dir.join("launcher.desktop");
+        std::fs::write(
+            &helper,
+            "[Desktop Entry]\nName=Disk Image Writer\nExec=gnome-disks --restore-disk-image %U\nIcon=drive-removable-media\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &launcher,
+            "[Desktop Entry]\nName=Disks\nExec=gnome-disks %U\nIcon=org.gnome.DiskUtility\n",
+        )
+        .unwrap();
+
+        let mut map = HashMap::new();
+        parse_desktop_file(&helper, &mut map);
+        parse_desktop_file(&launcher, &mut map);
+
+        assert_eq!(map["gnome-disks"].icon, "org.gnome.DiskUtility");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn icon_lookup_accepts_large_sizes_and_non_app_contexts() {
+        let root = std::env::temp_dir().join(format!("niri-xmb-theme-{}", std::process::id()));
+        let large = root.join("hicolor/1024x1024/apps/openlogi.png");
+        let device = root.join("Adwaita/scalable/devices/drive-removable-media.svg");
+        std::fs::create_dir_all(large.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(device.parent().unwrap()).unwrap();
+        std::fs::write(&large, b"icon").unwrap();
+        std::fs::write(&device, b"icon").unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let themes = vec!["hicolor".into(), "Adwaita".into()];
+        let sizes = ["128x128", "1024x1024", "scalable"];
+
+        assert_eq!(
+            find_icon_file_in_roots("openlogi", &roots, &themes, &sizes),
+            Some(large)
+        );
+        assert_eq!(
+            find_icon_file_in_roots("drive-removable-media", &roots, &themes, &sizes),
+            Some(device)
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -66,14 +66,6 @@ fn edge_fade(rect: Rect, canvas: Rect, margin: f32) -> f32 {
     left.min(right).min(top).min(bottom).clamp(0.0, 1.0)
 }
 
-/// Whether a rect is far enough inside the canvas to be worth hit-testing.
-fn rect_within(rect: Rect, canvas: Rect) -> bool {
-    rect.x >= canvas.x - 1.0
-        && rect.y >= canvas.y - 1.0
-        && rect.x + rect.width <= canvas.x + canvas.width + 1.0
-        && rect.y + rect.height <= canvas.y + canvas.height + 1.0
-}
-
 /// Trim a rect to the canvas bounds, returning a zero-size rect when outside.
 fn clamp_rect(rect: Rect, canvas: Rect) -> Rect {
     let x0 = rect.x.max(canvas.x);
@@ -86,6 +78,11 @@ fn clamp_rect(rect: Rect, canvas: Rect) -> Rect {
         width: (x1 - x0).max(0.0),
         height: (y1 - y0).max(0.0),
     }
+}
+
+fn visible_hit_rect(rect: Rect, canvas: Rect) -> Option<Rect> {
+    let visible = clamp_rect(rect, canvas);
+    (visible.width > 0.0 && visible.height > 0.0).then_some(visible)
 }
 
 /// Panel background: soft drop shadow, vertical gradient body, hairline edge.
@@ -1293,9 +1290,9 @@ impl Renderer {
             self.draw_floating_backing(pixmap, rect, config, alpha);
         }
         self.draw_window_icon(pixmap, rect, window, config, focus, alpha);
-        if rect_within(rect, canvas) {
+        if let Some(hit_rect) = visible_hit_rect(rect, canvas) {
             zones.push(HitZone {
-                rect,
+                rect: hit_rect,
                 target: HitTarget::Window {
                     workspace_id: workspace.id,
                     window_id: window.id,
@@ -1682,6 +1679,28 @@ fn truncate_label_to_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partially_visible_icon_keeps_visible_hit_area() {
+        let canvas = Rect {
+            x: 10.0,
+            y: 10.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        let icon = Rect {
+            x: 95.0,
+            y: 40.0,
+            width: 30.0,
+            height: 30.0,
+        };
+
+        let hit = visible_hit_rect(icon, canvas).unwrap();
+        assert_eq!(hit.x, 95.0);
+        assert_eq!(hit.width, 15.0);
+        assert!(hit.contains(109.0, 55.0));
+        assert!(!hit.contains(110.0, 55.0));
+    }
     use crate::model::OutputModel;
     use std::collections::BTreeMap;
 
