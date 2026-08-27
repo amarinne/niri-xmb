@@ -174,6 +174,92 @@ pub fn spawn(
         .expect("failed to spawn niri action thread");
 }
 
+/// Connect and start the event stream.
+///
+/// `None` means the attempt failed; the reason has already been logged and
+/// published as a health update, and the caller should back off and retry.
+fn connect_event_stream(health_tx: &Sender<NiriHealthUpdate>, wake: &WakeHandle) -> Option<Socket> {
+    let mut socket = match Socket::connect() {
+        Ok(socket) => socket,
+        Err(_) => {
+            tracing::warn!("cannot connect to Niri IPC; retrying");
+            publish_health(
+                health_tx,
+                wake,
+                NiriHealthUpdate::EventDisconnected("cannot connect to Niri IPC".into()),
+            );
+            return None;
+        }
+    };
+    match socket.send(Request::EventStream) {
+        Ok(Ok(Response::Handled)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "Niri rejected event stream");
+            publish_health(
+                health_tx,
+                wake,
+                NiriHealthUpdate::EventDisconnected(format!("Niri rejected event stream: {error}")),
+            );
+            return None;
+        }
+        Ok(Ok(response)) => {
+            tracing::warn!(?response, "unexpected Niri event-stream response");
+            publish_health(
+                health_tx,
+                wake,
+                NiriHealthUpdate::EventDisconnected(format!(
+                    "unexpected Niri event-stream response: {response:?}"
+                )),
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to start Niri event stream");
+            publish_health(
+                health_tx,
+                wake,
+                NiriHealthUpdate::EventDisconnected(format!(
+                    "failed to start Niri event stream: {error}"
+                )),
+            );
+            return None;
+        }
+    }
+    Some(socket)
+}
+
+/// Read events until the stream drops, pushing a snapshot after any event
+/// that changed something.
+fn pump_event_stream(
+    socket: Socket,
+    state: &mut NiriState,
+    snapshot_tx: &Sender<Snapshot>,
+    health_tx: &Sender<NiriHealthUpdate>,
+    wake: &WakeHandle,
+) {
+    let mut read_event = socket.read_events();
+    loop {
+        let event = match read_event() {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::warn!(%error, "Niri event stream disconnected");
+                publish_health(
+                    health_tx,
+                    wake,
+                    NiriHealthUpdate::EventDisconnected(format!(
+                        "Niri event stream disconnected: {error}"
+                    )),
+                );
+                break;
+            }
+        };
+        let refresh = apply_event(state, event);
+        if refresh && snapshot_tx.try_send(state.snapshot()).is_ok() {
+            wake.wake();
+        }
+    }
+}
+
 fn run_events(
     snapshot_tx: Sender<Snapshot>,
     health_tx: Sender<NiriHealthUpdate>,
@@ -183,79 +269,13 @@ fn run_events(
         let mut state = NiriState::default();
         refresh_outputs(&mut state);
 
-        let Ok(mut socket) = Socket::connect() else {
-            tracing::warn!("cannot connect to Niri IPC; retrying");
-            publish_health(
-                &health_tx,
-                &wake,
-                NiriHealthUpdate::EventDisconnected("cannot connect to Niri IPC".into()),
-            );
+        let Some(socket) = connect_event_stream(&health_tx, &wake) else {
             thread::sleep(Duration::from_secs(2));
             continue;
         };
-        match socket.send(Request::EventStream) {
-            Ok(Ok(Response::Handled)) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "Niri rejected event stream");
-                publish_health(
-                    &health_tx,
-                    &wake,
-                    NiriHealthUpdate::EventDisconnected(format!(
-                        "Niri rejected event stream: {error}"
-                    )),
-                );
-                thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-            Ok(Ok(response)) => {
-                tracing::warn!(?response, "unexpected Niri event-stream response");
-                publish_health(
-                    &health_tx,
-                    &wake,
-                    NiriHealthUpdate::EventDisconnected(format!(
-                        "unexpected Niri event-stream response: {response:?}"
-                    )),
-                );
-                thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "failed to start Niri event stream");
-                publish_health(
-                    &health_tx,
-                    &wake,
-                    NiriHealthUpdate::EventDisconnected(format!(
-                        "failed to start Niri event stream: {error}"
-                    )),
-                );
-                thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-        }
 
         publish_health(&health_tx, &wake, NiriHealthUpdate::EventConnected);
-
-        let mut read_event = socket.read_events();
-        loop {
-            let event = match read_event() {
-                Ok(event) => event,
-                Err(error) => {
-                    tracing::warn!(%error, "Niri event stream disconnected");
-                    publish_health(
-                        &health_tx,
-                        &wake,
-                        NiriHealthUpdate::EventDisconnected(format!(
-                            "Niri event stream disconnected: {error}"
-                        )),
-                    );
-                    break;
-                }
-            };
-            let refresh = apply_event(&mut state, event);
-            if refresh && snapshot_tx.try_send(state.snapshot()).is_ok() {
-                wake.wake();
-            }
-        }
+        pump_event_stream(socket, &mut state, &snapshot_tx, &health_tx, &wake);
         thread::sleep(Duration::from_millis(500));
     }
 }
