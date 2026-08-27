@@ -1,6 +1,6 @@
 [package]
 name = "niri-xmb"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Niri-native per-output workspace bar and XMB navigator"
