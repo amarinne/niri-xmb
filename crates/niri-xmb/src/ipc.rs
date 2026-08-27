@@ -21,23 +21,37 @@ const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const DROP_BUDGET_MS: u64 = 2400;
 
 /// The share of the budget reserved for confirmation, measured from when
-/// the last Niri action returns. What is left is what the actions get.
-pub const DROP_CONFIRM_TIMEOUT: Duration = Duration::from_millis(1200);
+/// the last Niri action returns.
+const DROP_CONFIRM_MS: u64 = 1200;
+
+/// What is left for the actions themselves, measured from submission.
+///
+/// This is enforced, not merely documented: a transaction whose actions
+/// never come back is finished by the daemon when this expires, instead of
+/// hanging until the client gives up.
+pub const DROP_ACTION_BUDGET: Duration = Duration::from_millis(DROP_BUDGET_MS - DROP_CONFIRM_MS);
+
+/// Maximum wait for the event stream after all Niri actions complete.
+pub const DROP_CONFIRM_TIMEOUT: Duration = Duration::from_millis(DROP_CONFIRM_MS);
+
+/// The whole budget, as a `Duration`.
+#[cfg(test)]
+pub const DROP_BUDGET: Duration = Duration::from_millis(DROP_BUDGET_MS);
 
 /// How long the control socket waits for the daemon's reply.
 ///
-/// This must strictly outlast the transaction it is waiting on. When it
-/// did not, the socket reported "daemon timeout" and dropped the reply
-/// channel for a drop that was still being confirmed -- and the drop then
-/// replied into a dead channel, so a move that succeeded was reported to
-/// the dock as a failure. The margin covers scheduling, not work.
+/// Must strictly outlast the transaction it is waiting on. When it did
+/// not, the socket reported "daemon timeout" and dropped the reply channel
+/// for a drop still being confirmed, and the drop then replied into a dead
+/// channel -- so a move that succeeded was reported as a failure.
 const DAEMON_REPLY_TIMEOUT: Duration = Duration::from_millis(DROP_BUDGET_MS + 600);
 
-/// The budget as a `Duration`, for the assertions that keep the two sides
-/// from drifting apart again.
-#[cfg(test)]
-const DROP_BUDGET: Duration = Duration::from_millis(DROP_BUDGET_MS);
-const COMMAND_IO_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the CLI waits on its socket read.
+///
+/// Strictly longer again than the daemon's own reply wait, so the two
+/// cannot expire in the same instant and race over who reports the
+/// timeout. These were both exactly three seconds.
+const COMMAND_IO_TIMEOUT: Duration = Duration::from_millis(DROP_BUDGET_MS + 1200);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlCommand {
@@ -772,18 +786,23 @@ mod tests {
         assert_eq!(frame["code"], "unsupported_protocol");
     }
 
-    /// The two sides of a drop are derived from one budget precisely so they
-    /// cannot invert again. If they do, a successful move gets reported as a
-    /// failure.
+    /// The three waits are derived from one budget so they cannot invert or
+    /// tie. A tie is as bad as an inversion: client and daemon expire in the
+    /// same instant and race over who reports the timeout.
     #[test]
     fn the_control_socket_outlasts_the_drop_it_waits_on() {
-        assert!(
-            DAEMON_REPLY_TIMEOUT > DROP_BUDGET,
-            "the reply wait must outlast the whole drop budget"
+        assert_eq!(
+            DROP_ACTION_BUDGET + DROP_CONFIRM_TIMEOUT,
+            DROP_BUDGET,
+            "the phases must add up to the budget they are taken from"
         );
         assert!(
-            DROP_BUDGET > DROP_CONFIRM_TIMEOUT,
-            "confirmation cannot be allowed the entire budget; the actions need some"
+            DAEMON_REPLY_TIMEOUT > DROP_BUDGET,
+            "the daemon's reply wait must outlast the whole drop"
+        );
+        assert!(
+            COMMAND_IO_TIMEOUT > DAEMON_REPLY_TIMEOUT,
+            "the client must outlast the daemon, or they race at the boundary"
         );
     }
 }

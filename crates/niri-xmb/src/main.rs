@@ -251,6 +251,10 @@ enum DropOutcome {
     Confirmed,
     ActionFailed(String),
     ConfirmationTimedOut,
+    /// The Niri actions did not come back inside their share of the
+    /// budget. Distinct from ConfirmationTimedOut, which means the actions
+    /// returned but the event stream never showed the result.
+    ActionTimedOut,
     EventStreamUnavailable,
 }
 
@@ -340,9 +344,18 @@ impl DropTransactionState {
         let Some(pending) = self.pending.as_ref() else {
             return;
         };
-        let Some(result) = pending.action_result.as_ref() else {
+        let submitted_at = pending.submitted_at;
+        let has_result = pending.action_result.is_some();
+        if !has_result {
+            // No result yet: the actions are still running. They get the part
+            // of the budget confirmation does not, and then they are over.
+            if now.duration_since(submitted_at) >= ipc::DROP_ACTION_BUDGET {
+                self.finish(snapshot.generation, DropOutcome::ActionTimedOut);
+            }
             return;
-        };
+        }
+        let pending = self.pending.as_ref().unwrap();
+        let result = pending.action_result.as_ref().unwrap();
         let result_at = pending.action_result_at.unwrap_or(pending.submitted_at);
         let outcome = if let Some(failure) = &result.failure {
             (now.duration_since(result_at) >= DROP_FAILURE_RECONCILE).then(|| {
@@ -381,6 +394,7 @@ impl DropTransactionState {
             DropOutcome::Confirmed => "ok\n".to_string(),
             DropOutcome::ActionFailed(error) => format!("error: drop action failed: {error}\n"),
             DropOutcome::ConfirmationTimedOut => "error: drop confirmation timeout\n".to_string(),
+            DropOutcome::ActionTimedOut => "error: drop action timeout\n".to_string(),
             DropOutcome::EventStreamUnavailable => {
                 "error: Niri event stream unavailable\n".to_string()
             }
@@ -399,7 +413,11 @@ impl DropTransactionState {
 
     fn next_deadline(&self) -> Option<Instant> {
         let pending = self.pending.as_ref()?;
-        pending.action_result_at.map(|result_at| {
+        let Some(result_at) = pending.action_result_at else {
+            // Actions still running: wake when their budget expires.
+            return Some(pending.submitted_at + ipc::DROP_ACTION_BUDGET);
+        };
+        Some(
             if pending
                 .action_result
                 .as_ref()
@@ -408,8 +426,8 @@ impl DropTransactionState {
                 result_at + DROP_FAILURE_RECONCILE
             } else {
                 result_at + DROP_CONFIRM_TIMEOUT
-            }
-        })
+            },
+        )
     }
 
     fn status_json(&self) -> serde_json::Value {
@@ -465,6 +483,7 @@ fn drop_outcome_name(outcome: &DropOutcome) -> &'static str {
         DropOutcome::Confirmed => "confirmed",
         DropOutcome::ActionFailed(_) => "action_failed",
         DropOutcome::ConfirmationTimedOut => "confirmation_timeout",
+        DropOutcome::ActionTimedOut => "action_timeout",
         DropOutcome::EventStreamUnavailable => "event_stream_unavailable",
     }
 }
@@ -3584,6 +3603,40 @@ mod tests {
         );
         // At exactly FOCUS_SETTLE it fires.
         assert!(w.settle(&s2, t0 + FOCUS_SETTLE * 2).is_some());
+    }
+
+    /// Actions that never come back used to leave the transaction pending
+    /// forever -- reconcile returned early with no result, and next_deadline
+    /// returned None, so the daemon never finished it at all.
+    #[test]
+    fn actions_that_never_return_time_out() {
+        let snapshot = protocol_snapshot();
+        let (niri_tx, _niri_rx) = crossbeam_channel::unbounded();
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let mut state = DropTransactionState::default();
+
+        state
+            .submit(
+                transaction_plan(snapshot.generation),
+                &snapshot,
+                Some(reply_tx),
+                &niri_tx,
+            )
+            .unwrap();
+
+        let submitted_at = Instant::now();
+        // Still inside the action budget: nothing is decided yet.
+        state.reconcile(&snapshot, true, submitted_at + Duration::from_millis(1));
+        assert!(reply_rx.try_recv().is_err());
+        // And the loop knows when to come back.
+        assert!(state.next_deadline().is_some());
+
+        state.reconcile(
+            &snapshot,
+            true,
+            submitted_at + ipc::DROP_ACTION_BUDGET + Duration::from_millis(1),
+        );
+        assert_eq!(reply_rx.try_recv().unwrap(), "error: drop action timeout\n");
     }
 }
 

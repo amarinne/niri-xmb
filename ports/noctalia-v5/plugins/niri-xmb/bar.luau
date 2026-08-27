@@ -2,6 +2,11 @@ local state = {
     snapshot = nil,
     polling = false,
     lastGeneration = -1,
+    -- Titles move without the layout moving, so the daemon bumps
+    -- content_revision and leaves generation alone. Gating on
+    -- generation alone left tooltips showing the title captured at
+    -- the last layout change.
+    lastContentRevision = -1,
     lastError = nil,
     icons = {},
     iconRetryAt = {},
@@ -308,6 +313,7 @@ local function applyOptimisticDrop(sourceWindowId, workspaceId, targetWindowId, 
         deadline = noctalia.nowMs() + 3000,
     }
     state.lastGeneration = -1
+    state.lastContentRevision = -1
     render()
     return true
 end
@@ -383,6 +389,7 @@ local function onDrop(payload, value, sceneX, sceneY)
             end
             state.pendingDrop = nil
             state.lastGeneration = -1
+            state.lastContentRevision = -1
             if result.exitCode ~= 0 or string.match(response, "^error:") ~= nil then
                 -- One line carries every field needed to reproduce the
                 -- rejection against daemon logs: ids and numbers only.
@@ -737,8 +744,14 @@ local function applySnapshot(decoded, force)
     if dropErrorExpired then
         state.dropErrorUntil = nil
     end
-    if force or dropErrorExpired or decoded.generation ~= state.lastGeneration then
+    local contentRevision = decoded.content_revision or 0
+    if force
+        or dropErrorExpired
+        or decoded.generation ~= state.lastGeneration
+        or contentRevision ~= state.lastContentRevision
+    then
         state.lastGeneration = decoded.generation
+        state.lastContentRevision = contentRevision
         render()
     end
 end
@@ -890,6 +903,7 @@ function onConfigChanged()
     state.icons = {}
     state.iconRetryAt = {}
     state.lastGeneration = -1
+    state.lastContentRevision = -1
     noctalia.setUpdateInterval(config("poll_interval_ms", 250))
     poll(true)
 end

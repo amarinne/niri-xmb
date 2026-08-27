@@ -396,11 +396,15 @@ trait ActionTransport {
 
 /// A Niri action socket held open across the steps of one command.
 ///
-/// A tiled move issues up to six actions. Reconnecting for each one spent
-/// most of the transaction's budget on socket setup, which is what made a
-/// successful move look like a timeout to the caller. Niri serves many
-/// requests per connection, so keep one and rebuild it only on error --
-/// that way a compositor restart still recovers on the next action.
+/// A tiled move issues up to six actions and reconnected for each one. Niri
+/// serves many requests per connection, so keep one and rebuild it only on
+/// error -- that way a compositor restart still recovers on the next action.
+///
+/// This is tidying, not a latency fix: measured against a live compositor a
+/// connect costs about 0.024 ms against 0.047 ms for the query itself, and a
+/// whole five-step move completes in about 4 ms. The drop that reported
+/// failure for a successful move was caused by the two timeouts inverting,
+/// not by socket setup.
 #[derive(Default)]
 struct SocketActionTransport {
     socket: Option<Socket>,
