@@ -1,7 +1,6 @@
 use crate::ipc;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
-use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -60,6 +59,8 @@ impl SubscriptionHub {
     /// Serialization happens once per generation regardless of how many
     /// subscribers exist.
     pub fn publish(&self, generation: u64, snapshot_body: &str) {
+        // Built by hand because snapshot_body is already serialised JSON;
+        // json! would encode it a second time as a string.
         let raw = format!(
             "{{\"type\":\"snapshot\",\"protocol\":{STREAM_PROTOCOL},\"schema\":{SNAPSHOT_SCHEMA},\
              \"instance\":\"{}\",\"generation\":{generation},\"snapshot\":{snapshot_body}}}",
@@ -126,11 +127,14 @@ impl SubscriptionHub {
         // One release per connection, whichever side notices the client left
         // first: the reader seeing EOF, or a failed write.
         let closed = Arc::new(AtomicBool::new(false));
-        let hello = format!(
-            "{{\"type\":\"hello\",\"protocol\":{STREAM_PROTOCOL},\"schema\":{SNAPSHOT_SCHEMA},\
-             \"instance\":\"{}\"}}\n",
-            self.instance
-        );
+        let hello = serde_json::json!({
+            "type": "hello",
+            "protocol": STREAM_PROTOCOL,
+            "schema": SNAPSHOT_SCHEMA,
+            "instance": self.instance,
+        })
+        .to_string()
+            + "\n";
         let _ = writer.write_all(hello.as_bytes());
         // Watch for the client hanging up. run_writer blocks on the condvar
         // until a newer generation exists, so without this a disconnected
@@ -234,39 +238,28 @@ fn is_newer(latest: &Published, last_sent: Option<u64>) -> bool {
 }
 
 fn write_error(stream: &UnixStream, code: &str, message: &str, retryable: bool, instance: &str) {
-    let escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
-    let line = format!(
-        "{{\"type\":\"error\",\"protocol\":{STREAM_PROTOCOL},\"instance\":\"{instance}\",\
-         \"code\":\"{code}\",\"message\":\"{escaped}\",\"retryable\":{retryable}}}\n"
-    );
+    let line = serde_json::json!({
+        "type": "error",
+        "protocol": STREAM_PROTOCOL,
+        "instance": instance,
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+    })
+    .to_string()
+        + "\n";
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let mut stream = stream;
     let _ = stream.write_all(line.as_bytes());
 }
 
+/// Only the user running the daemon may subscribe.
+///
+/// `UnixStream::peer_cred` is still unstable, so this goes through rustix
+/// rather than the hand-rolled `getsockopt` it replaced.
 fn peer_uid_matches(stream: &UnixStream) -> bool {
-    #[repr(C)]
-    struct Ucred {
-        pid: libc::pid_t,
-        uid: libc::uid_t,
-        gid: libc::gid_t,
-    }
-    let mut credential = Ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut length = std::mem::size_of::<Ucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut credential as *mut Ucred as *mut libc::c_void,
-            &mut length,
-        )
-    };
-    result == 0 && credential.uid == unsafe { libc::geteuid() }
+    rustix::net::sockopt::socket_peercred(stream)
+        .is_ok_and(|peer| peer.uid == rustix::process::geteuid())
 }
 
 fn generate_instance() -> String {
@@ -503,5 +496,35 @@ mod tests {
             .read_line(&mut line)
             .unwrap();
         line
+    }
+
+    /// Hand-escaping covered backslash and quote only, so a control character
+    /// in an error message produced a frame the client could not parse.
+    #[test]
+    fn error_frames_escape_control_characters() {
+        let (client, server) = UnixStream::pair().unwrap();
+        write_error(
+            &server,
+            "bad_request",
+            "line one\nline two\ttabbed \u{1} and a \"quote\" and a \\ backslash",
+            true,
+            "test-instance",
+        );
+        drop(server);
+
+        let mut raw = String::new();
+        {
+            let mut client = client;
+            client.read_to_string(&mut raw).unwrap();
+        }
+        let frame: serde_json::Value =
+            serde_json::from_str(raw.trim()).expect("error frame must be valid JSON");
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["code"], "bad_request");
+        assert_eq!(frame["retryable"], true);
+        assert_eq!(
+            frame["message"],
+            "line one\nline two\ttabbed \u{1} and a \"quote\" and a \\ backslash"
+        );
     }
 }
