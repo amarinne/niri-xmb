@@ -381,7 +381,14 @@ fn find_icon_file_in_roots(
     // Freedesktop themes group icons by context. Application desktop files
     // can legitimately name device or action icons, so do not restrict lookup
     // to `apps/`.
-    let contexts = ["apps", "devices", "actions", "places", "mimetypes", "status"];
+    let contexts = [
+        "apps",
+        "devices",
+        "actions",
+        "places",
+        "mimetypes",
+        "status",
+    ];
 
     for root in roots {
         for theme in &themes {
