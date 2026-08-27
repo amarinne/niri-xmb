@@ -1072,6 +1072,107 @@ impl Deadlines {
     }
 }
 
+/// Why focus moved, once an event burst has settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusVerdict {
+    /// The user navigated between workspaces on one monitor. This is the
+    /// only case that should raise a peek overlay.
+    Navigated,
+    /// Focus moved for some other reason: a window opened or closed, a
+    /// slow-starting app claimed it, or it crossed to another monitor.
+    Incidental,
+}
+
+/// Decides whether a focus change was the user navigating.
+///
+/// Niri reports one user action as a burst of events whose order cannot be
+/// relied on -- closing a window emits the focus change BEFORE the window
+/// removal -- so judging each event as it arrives mistakes the fallback
+/// focus for navigation. This waits for the burst to settle and compares
+/// against the last state it acted on, which removes that whole class of
+/// ordering bug.
+#[derive(Default)]
+struct FocusWatcher {
+    /// Focus as last seen, including which window.
+    observed: Option<FocusMark>,
+    /// Focus as last acted on, workspace granularity only.
+    acted_focus: Option<WorkspaceFocusMark>,
+    /// The window set as last acted on.
+    acted_windows: Option<HashSet<u64>>,
+    /// When the current burst started, if one is in flight.
+    pending_since: Option<Instant>,
+    /// First time each window was seen, for the new-window grace.
+    window_first_seen: HashMap<u64, Instant>,
+}
+
+impl FocusWatcher {
+    /// Take a new snapshot. Returns true when focus changed, which means
+    /// the panel should re-sync to live state immediately -- separately
+    /// from whether a peek is warranted, which only `settle` can say.
+    fn observe(&mut self, snapshot: &Snapshot, now: Instant) -> bool {
+        let windows = live_window_ids(snapshot);
+        for id in &windows {
+            self.window_first_seen.entry(*id).or_insert(now);
+        }
+        self.window_first_seen.retain(|id, _| windows.contains(id));
+
+        let signature = focus_signature(snapshot);
+        let changed = self
+            .observed
+            .replace(signature)
+            .is_some_and(|previous| previous != *self.observed.as_ref().unwrap());
+        if changed {
+            self.pending_since = Some(now);
+        }
+        changed
+    }
+
+    /// When the in-flight burst started, so the loop can wake to settle it.
+    fn pending_since(&self) -> Option<Instant> {
+        self.pending_since
+    }
+
+    /// Deliver a verdict once the burst has been quiet for `FOCUS_SETTLE`.
+    /// `None` means there is nothing to settle yet.
+    fn settle(&mut self, snapshot: &Snapshot, now: Instant) -> Option<FocusVerdict> {
+        let since = self.pending_since?;
+        if now.duration_since(since) < FOCUS_SETTLE {
+            return None;
+        }
+        self.pending_since = None;
+
+        let signature = workspace_focus_signature(snapshot);
+        let windows = live_window_ids(snapshot);
+        let movement = self
+            .acted_focus
+            .as_ref()
+            .map(|previous| classify_focus_move(previous, &signature))
+            .unwrap_or(FocusMove::None);
+        // A window appearing or disappearing moves focus without the user
+        // navigating anywhere.
+        let lifecycle = self
+            .acted_windows
+            .as_ref()
+            .is_some_and(|previous| *previous != windows);
+        // A slow-starting app can map its surface and only claim focus a
+        // second later, long after the burst settled, so window age is
+        // checked separately from the lifecycle comparison.
+        let focused_is_new = snapshot
+            .focused_window
+            .and_then(|id| self.window_first_seen.get(&id))
+            .is_some_and(|seen| now.duration_since(*seen) < NEW_WINDOW_GRACE);
+
+        self.acted_focus = Some(signature);
+        self.acted_windows = Some(windows);
+
+        if movement == FocusMove::WithinOutput && !lifecycle && !focused_is_new {
+            Some(FocusVerdict::Navigated)
+        } else {
+            Some(FocusVerdict::Incidental)
+        }
+    }
+}
+
 fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut config = Config::load(&config_path)?;
     let output_names = connected_outputs()?;
@@ -1122,13 +1223,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut popup_was_open = false;
     // Focus changes we caused ourselves must not bounce back as a peek.
     let mut peek_suppressed_until = Instant::now();
-    let mut window_first_seen: HashMap<u64, Instant> = HashMap::new();
-    // Focus state as last observed, versus as last acted on. The gap between
-    // them is the burst of events still settling.
-    let mut observed: Option<FocusMark> = None;
-    let mut acted_focus: Option<WorkspaceFocusMark> = None;
-    let mut acted_windows: Option<HashSet<u64>> = None;
-    let mut pending_focus_since: Option<Instant> = None;
+    let mut focus = FocusWatcher::default();
     let mut running = true;
     let mut dirty = true;
 
@@ -1158,20 +1253,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             publish_snapshot(&snapshot, &subscriptions, mirror.as_ref());
             normalize_selection(&mut selection, &snapshot);
             let now = Instant::now();
-            let windows = live_window_ids(&snapshot);
-            for id in &windows {
-                window_first_seen.entry(*id).or_insert(now);
-            }
-            window_first_seen.retain(|id, _| windows.contains(id));
-
-            // Re-syncing the panel to live state is safe to do immediately.
-            // The manual panel always mirrors complete live focus, including
-            // left/right and stacked-window changes. Peek granularity is a
-            // separate concern handled after the event burst settles.
-            let signature = focus_signature(&snapshot);
-            let changed = observed
-                .replace(signature)
-                .is_some_and(|previous| previous != *observed.as_ref().unwrap());
+            let changed = focus.observe(&snapshot, now);
             if changed {
                 if should_close_on_external_focus_change(
                     &config,
@@ -1190,15 +1272,6 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     selection.clear_session();
                     reset_selection(&mut selection, &snapshot);
                 }
-                // Whether to *raise* an overlay is decided only once focus has
-                // settled. Niri reports one user action as a burst of events in
-                // an order that cannot be relied on — closing a window emits
-                // the focus change before the window removal, so judging each
-                // event as it arrives mistakes the fallback focus for
-                // navigation. Waiting for the burst to finish and then
-                // comparing against the last state we acted on removes the
-                // whole class of ordering bug.
-                pending_focus_since = Some(now);
             }
             dirty = true;
         }
@@ -1213,60 +1286,30 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             Instant::now(),
         );
 
-        if let Some(since) = pending_focus_since {
-            let now = Instant::now();
-            if now.duration_since(since) >= FOCUS_SETTLE {
-                pending_focus_since = None;
-                let signature = workspace_focus_signature(&snapshot);
-                let windows = live_window_ids(&snapshot);
-                let movement = acted_focus
-                    .as_ref()
-                    .map(|previous| classify_focus_move(previous, &signature))
-                    .unwrap_or(FocusMove::None);
-                // A window appearing or disappearing moves focus without the
-                // user navigating anywhere.
-                let lifecycle = acted_windows
-                    .as_ref()
-                    .is_some_and(|previous| *previous != windows);
-                // A slow-starting app can map its surface and only claim focus
-                // a second later, long after the burst settled, so window age
-                // is checked separately from the lifecycle comparison.
-                let focused_is_new = snapshot
-                    .focused_window
-                    .and_then(|id| window_first_seen.get(&id))
-                    .is_some_and(|seen| now.duration_since(*seen) < NEW_WINDOW_GRACE);
-
-                if movement == FocusMove::WithinOutput
-                    && !lifecycle
-                    && !focused_is_new
-                    && now >= peek_suppressed_until
-                {
-                    let was_hidden = panel.mode() == PopupMode::Hidden;
-                    let pointer_live = panel.peek().pointer_live();
-                    let mut mode = panel.mode();
-                    let deadline = trigger_peek(
-                        &mut surfaces,
-                        &snapshot,
-                        &config,
-                        panel.outputs_mut(),
-                        &mut mode,
-                        &mut selection,
-                        peek_suppressed_until,
-                        pointer_live,
-                    )?;
-                    panel.set_mode(mode);
-                    panel.peek_mut().set_deadline(deadline);
-                    if was_hidden && panel.mode() == PopupMode::Peek && config.peek.pointer_promote
-                    {
-                        panel.peek_mut().arm_pointer(
-                            Instant::now() + Duration::from_millis(config.peek.arm_grace_ms),
-                        );
-                    }
-                    dirty = true;
-                }
-                acted_focus = Some(signature);
-                acted_windows = Some(windows);
+        if focus.settle(&snapshot, now) == Some(FocusVerdict::Navigated)
+            && now >= peek_suppressed_until
+        {
+            let was_hidden = panel.mode() == PopupMode::Hidden;
+            let pointer_live = panel.peek().pointer_live();
+            let mut mode = panel.mode();
+            let deadline = trigger_peek(
+                &mut surfaces,
+                &snapshot,
+                &config,
+                panel.outputs_mut(),
+                &mut mode,
+                &mut selection,
+                peek_suppressed_until,
+                pointer_live,
+            )?;
+            panel.set_mode(mode);
+            panel.peek_mut().set_deadline(deadline);
+            if was_hidden && panel.mode() == PopupMode::Peek && config.peek.pointer_promote {
+                panel
+                    .peek_mut()
+                    .arm_pointer(Instant::now() + Duration::from_millis(config.peek.arm_grace_ms));
             }
+            dirty = true;
         }
         // Guarded on Peek: a manual session must never inherit this expiry.
         // The overview opening counts as an expiry, so an overlay already up
@@ -1278,7 +1321,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 || (panel.mode() == PopupMode::Peek
                     && peek_deadline_reached(
                         panel.peek().deadline(),
-                        pending_focus_since,
+                        focus.pending_since(),
                         Instant::now(),
                     )))
         {
@@ -1692,7 +1735,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             Duration::from_millis(250)
         };
         let mut deadlines = Deadlines::new(idle, now);
-        if let Some(since) = pending_focus_since {
+        if let Some(since) = focus.pending_since() {
             deadlines.after(since, FOCUS_SETTLE);
         }
         if let Some(deadline) = panel.peek().deadline() {
@@ -3288,6 +3331,259 @@ mod tests {
         let mut deadlines = Deadlines::new(Duration::from_millis(250), now);
         deadlines.at(now - Duration::from_millis(5));
         assert_eq!(deadlines.wait(), Duration::ZERO);
+    }
+
+    fn focus_test_snapshot(
+        output: &str,
+        workspace_id: u64,
+        focused_window: Option<u64>,
+    ) -> Snapshot {
+        let window_id = focused_window.unwrap_or(1);
+        let window = WindowModel {
+            id: window_id,
+            workspace_id,
+            app_id: "app".into(),
+            title: String::new(),
+            focused: true,
+            urgent: false,
+            floating: false,
+            column: Some(0),
+            tile_width: 100.0,
+            tile_height: 100.0,
+            x: None,
+            y: None,
+        };
+        Snapshot {
+            outputs: BTreeMap::from([(
+                output.into(),
+                OutputModel {
+                    name: output.into(),
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    workspaces: vec![WorkspaceModel {
+                        id: workspace_id,
+                        index: 1,
+                        name: None,
+                        active: true,
+                        focused: true,
+                        urgent: false,
+                        active_window: Some(window_id),
+                        columns: BTreeMap::from([(0, BTreeMap::from([(0, window)]))]),
+                        floating: Vec::new(),
+                    }],
+                },
+            )]),
+            focused_window,
+            overview_open: false,
+            generation: 1,
+            content_revision: 0,
+        }
+    }
+
+    /// Snapshot with several windows on one workspace, so tests can hold the
+    /// window set fixed while focus moves -- which is what isolates the
+    /// new-window grace from the lifecycle check.
+    fn focus_snapshot_with(
+        output: &str,
+        workspace_id: u64,
+        focused_window: u64,
+        window_ids: &[u64],
+    ) -> Snapshot {
+        let mut column = BTreeMap::new();
+        for (row, id) in window_ids.iter().enumerate() {
+            column.insert(
+                row,
+                WindowModel {
+                    id: *id,
+                    workspace_id,
+                    app_id: "app".into(),
+                    title: String::new(),
+                    focused: *id == focused_window,
+                    urgent: false,
+                    floating: false,
+                    column: Some(0),
+                    tile_width: 100.0,
+                    tile_height: 100.0,
+                    x: None,
+                    y: None,
+                },
+            );
+        }
+        Snapshot {
+            outputs: BTreeMap::from([(
+                output.into(),
+                OutputModel {
+                    name: output.into(),
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    workspaces: vec![WorkspaceModel {
+                        id: workspace_id,
+                        index: 1,
+                        name: None,
+                        active: true,
+                        focused: true,
+                        urgent: false,
+                        active_window: Some(focused_window),
+                        columns: BTreeMap::from([(0, column)]),
+                        floating: Vec::new(),
+                    }],
+                },
+            )]),
+            focused_window: Some(focused_window),
+            overview_open: false,
+            generation: 1,
+            content_revision: 0,
+        }
+    }
+
+    /// Establish an acted-on baseline of (eDP-1, workspace 2) with `windows`
+    /// all first seen at `t0`.
+    fn focus_baseline_with(w: &mut FocusWatcher, t0: Instant, windows: &[u64]) {
+        let start = focus_snapshot_with("eDP-1", 1, windows[0], windows);
+        w.observe(&start, t0);
+        let moved = focus_snapshot_with("eDP-1", 2, windows[0], windows);
+        w.observe(&moved, t0 + FOCUS_SETTLE);
+        assert_eq!(
+            w.settle(&moved, t0 + FOCUS_SETTLE * 2),
+            Some(FocusVerdict::Incidental),
+            "the first settle only establishes the baseline"
+        );
+    }
+
+    /// Run one observe+settle cycle to bootstrap the acted-on baseline.
+    fn focus_baseline(w: &mut FocusWatcher, t0: Instant) {
+        let s = focus_test_snapshot("eDP-1", 1, Some(10));
+        w.observe(&s, t0);
+        let s2 = focus_test_snapshot("eDP-1", 2, Some(20));
+        w.observe(&s2, t0 + FOCUS_SETTLE);
+        // First settle fires and establishes acted_on. It is always Incidental
+        // because acted_focus is None (no prior baseline).
+        assert_eq!(
+            w.settle(&s2, t0 + FOCUS_SETTLE * 2),
+            Some(FocusVerdict::Incidental)
+        );
+        // acted_focus = (eDP-1, 2), acted_windows = {20}
+    }
+
+    /// Closing a window emits the focus change BEFORE the window removal, so a
+    /// verdict taken per event mistakes the fallback focus for navigation.
+    ///
+    /// Constructed so ONLY the lifecycle check can produce Incidental: the
+    /// workspace really did move within the output, and the window that ends
+    /// up focused is far older than the new-window grace.
+    #[test]
+    fn a_window_closing_is_not_navigation() {
+        let t0 = Instant::now();
+        let mut w = FocusWatcher::default();
+        focus_baseline_with(&mut w, t0, &[10, 30]);
+
+        // Window 10 closes; focus falls back to 30, and the workspace moves
+        // back to 1 -- WithinOutput movement.
+        let closed = focus_snapshot_with("eDP-1", 1, 30, &[30]);
+        let observed_at = t0 + Duration::from_millis(1500);
+        w.observe(&closed, observed_at);
+        // Settled well past NEW_WINDOW_GRACE, so window 30 is not "new".
+        let settled_at = t0 + Duration::from_millis(2000);
+        assert!(settled_at.duration_since(t0) > NEW_WINDOW_GRACE);
+        assert_eq!(
+            w.settle(&closed, settled_at),
+            Some(FocusVerdict::Incidental),
+            "a window closing must not raise a peek, even though focus moved \
+             within the output"
+        );
+    }
+
+    /// A slow-starting app can map its surface and only claim focus a second
+    /// later, long after the burst settled.
+    ///
+    /// Constructed so ONLY the new-window grace can produce Incidental: the
+    /// window set is identical to the one last acted on, so the lifecycle
+    /// check cannot fire.
+    #[test]
+    fn a_newly_mapped_window_taking_focus_is_not_navigation() {
+        let t0 = Instant::now();
+        let mut w = FocusWatcher::default();
+        focus_baseline_with(&mut w, t0, &[10, 99]);
+
+        // Window 99 was already mapped, so the set is unchanged, but it was
+        // first seen at t0 and claims focus while still inside the grace.
+        let claimed = focus_snapshot_with("eDP-1", 1, 99, &[10, 99]);
+        w.observe(&claimed, t0 + FOCUS_SETTLE * 3);
+        let settled_at = t0 + FOCUS_SETTLE * 4;
+        assert!(settled_at.duration_since(t0) < NEW_WINDOW_GRACE);
+        assert_eq!(
+            w.settle(&claimed, settled_at),
+            Some(FocusVerdict::Incidental),
+            "a young window claiming focus must not raise a peek"
+        );
+    }
+
+    /// Moving between workspaces on one monitor is the case peek exists for.
+    #[test]
+    fn moving_between_workspaces_on_one_output_is_navigation() {
+        let t0 = Instant::now();
+        let mut w = FocusWatcher::default();
+        focus_baseline(&mut w, t0);
+
+        // Move to ws3, same output, same window set (lifecycle = false).
+        // Window 20 was first seen at t0+FOCUS_SETTLE during the baseline;
+        // settling at t0+FOCUS_SETTLE*11 makes it 1200ms old, equal to
+        // NEW_WINDOW_GRACE, so focused_is_new is false.
+        let s = focus_test_snapshot("eDP-1", 3, Some(20));
+        w.observe(&s, t0 + FOCUS_SETTLE * 3);
+        assert_eq!(
+            w.settle(&s, t0 + FOCUS_SETTLE * 11),
+            Some(FocusVerdict::Navigated)
+        );
+    }
+
+    /// Focus landing on another monitor is not within-output navigation.
+    #[test]
+    fn focus_crossing_outputs_is_not_navigation() {
+        let t0 = Instant::now();
+        let mut w = FocusWatcher::default();
+        focus_baseline(&mut w, t0);
+
+        // Focus crosses to a different output.
+        let s = focus_test_snapshot("DP-2", 5, Some(50));
+        w.observe(&s, t0 + FOCUS_SETTLE * 3);
+        assert_eq!(
+            w.settle(&s, t0 + FOCUS_SETTLE * 4),
+            Some(FocusVerdict::Incidental)
+        );
+    }
+
+    /// Nothing settles until the burst has been quiet for FOCUS_SETTLE.
+    #[test]
+    fn nothing_settles_before_the_burst_is_quiet() {
+        let t0 = Instant::now();
+        let mut w = FocusWatcher::default();
+
+        let s1 = focus_test_snapshot("eDP-1", 1, Some(10));
+        w.observe(&s1, t0);
+        // First observe never sets pending (no prior state), so settle is None.
+        assert_eq!(
+            w.settle(&s1, t0 + FOCUS_SETTLE - Duration::from_millis(1)),
+            None
+        );
+
+        // Trigger a real change to set pending_since.
+        let s2 = focus_test_snapshot("eDP-1", 2, Some(20));
+        w.observe(&s2, t0 + FOCUS_SETTLE);
+        // Settle before FOCUS_SETTLE has elapsed — should return None.
+        assert_eq!(
+            w.settle(
+                &s2,
+                t0 + FOCUS_SETTLE + FOCUS_SETTLE - Duration::from_millis(1)
+            ),
+            None
+        );
+        // At exactly FOCUS_SETTLE it fires.
+        assert!(w.settle(&s2, t0 + FOCUS_SETTLE * 2).is_some());
     }
 }
 
