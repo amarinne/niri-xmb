@@ -23,12 +23,18 @@ const RECONNECT_MAX: Duration = Duration::from_secs(2);
 #[derive(Default)]
 struct HubState {
     latest: Option<Arc<Published>>,
+    /// Increments on every publish.
+    ///
+    /// Freshness is per-publish, not per generation: a title-only
+    /// change moves `content_revision` and deliberately leaves
+    /// `generation` alone, and subscribers must still receive it.
+    sequence: u64,
     active: usize,
 }
 
 enum Published {
     /// A complete NDJSON line, newline included.
-    Snapshot { generation: u64, line: Arc<String> },
+    Snapshot { line: Arc<String> },
     /// The serialized snapshot exceeded the frame bound.
     Oversize,
 }
@@ -70,11 +76,11 @@ impl SubscriptionHub {
             Published::Oversize
         } else {
             Published::Snapshot {
-                generation,
                 line: Arc::new(raw + "\n"),
             }
         };
         let mut state = self.state.lock().unwrap();
+        state.sequence += 1;
         state.latest = Some(Arc::new(published));
         drop(state);
         self.signal.notify_all();
@@ -158,6 +164,9 @@ impl SubscriptionHub {
                     if !closed.swap(true, Ordering::SeqCst) {
                         hub.release();
                     }
+                    // Wake the writer so it sees `closed` and exits; it is
+                    // parked waiting for a frame that may never be published.
+                    hub.signal.notify_all();
                     let _ = reader.shutdown(Shutdown::Both);
                 })
                 .expect("failed to spawn subscription reader");
@@ -174,18 +183,21 @@ impl SubscriptionHub {
 
     fn run_writer(&self, mut writer: UnixStream, closed: Arc<AtomicBool>) {
         let _ = writer.set_write_timeout(Some(WRITE_TIMEOUT));
-        let mut last_sent: Option<u64> = None;
+        let mut last_sent: u64 = 0;
         loop {
-            // Latest-value delivery: block until a frame newer than the last
-            // one sent exists, then send it. Generations published while this
-            // writer was busy collapse into the newest frame.
-            let next = {
+            let (sequence, next) = {
                 let mut guard = self.state.lock().unwrap();
                 loop {
-                    if let Some(latest) = guard.latest.as_ref()
-                        && is_newer(latest, last_sent)
+                    // The client hanging up wakes this too, so a writer
+                    // whose connection is gone exits instead of parking
+                    // here for a publish that may never come.
+                    if closed.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if guard.sequence > last_sent
+                        && let Some(latest) = guard.latest.as_ref()
                     {
-                        break Arc::clone(latest);
+                        break (guard.sequence, Arc::clone(latest));
                     }
                     guard = self
                         .signal
@@ -194,14 +206,14 @@ impl SubscriptionHub {
                 }
             };
             match next.as_ref() {
-                Published::Snapshot { generation, line } => {
+                Published::Snapshot { line } => {
                     if writer.write_all(line.as_bytes()).is_err() {
                         if !closed.swap(true, Ordering::SeqCst) {
                             self.release();
                         }
                         return;
                     }
-                    last_sent = Some(*generation);
+                    last_sent = sequence;
                 }
                 Published::Oversize => {
                     write_error(
@@ -227,13 +239,6 @@ impl SubscriptionHub {
 
     pub fn subscriber_count(&self) -> usize {
         self.state.lock().unwrap().active
-    }
-}
-
-fn is_newer(latest: &Published, last_sent: Option<u64>) -> bool {
-    match latest {
-        Published::Snapshot { generation, .. } => last_sent.is_none_or(|sent| *generation > sent),
-        Published::Oversize => last_sent.is_none(),
     }
 }
 
@@ -526,5 +531,89 @@ mod tests {
             frame["message"],
             "line one\nline two\ttabbed \u{1} and a \"quote\" and a \\ backslash"
         );
+    }
+
+    /// A writer parked waiting for a frame must exit when its client hangs
+    /// up. It used to stay parked forever, leaking one thread per connection.
+    #[test]
+    fn a_disconnected_subscriber_does_not_leave_its_writer_parked() {
+        let hub = Arc::new(SubscriptionHub::new());
+        let before = thread_count();
+
+        for _ in 0..8 {
+            let (client, server) = UnixStream::pair().unwrap();
+            hub.attach(server, STREAM_PROTOCOL);
+            // Let the writer reach the condvar and park BEFORE hanging up.
+            // Dropping immediately lets it see `closed` on its first check,
+            // which never exercises the wake and hides the leak.
+            thread::sleep(Duration::from_millis(60));
+            drop(client);
+        }
+
+        // Slots come back...
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while hub.subscriber_count() != 0 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(hub.subscriber_count(), 0);
+
+        // ...and so do the threads, without anything being published.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while thread_count() > before + 2 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let after = thread_count();
+        assert!(
+            after <= before + 2,
+            "writer threads leaked: {before} before, {after} after eight connect/disconnect cycles"
+        );
+    }
+
+    /// A title-only change moves content_revision and deliberately leaves
+    /// generation alone. Freshness used to key on generation, so the frame was
+    /// silently never sent. Read with a timeout so a regression fails rather
+    /// than hangs.
+    #[test]
+    fn a_title_only_publish_reaches_a_subscriber() {
+        use std::io::BufRead;
+
+        let hub = Arc::new(SubscriptionHub::new());
+        let (client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        hub.attach(server, STREAM_PROTOCOL);
+
+        let mut reader = std::io::BufReader::new(client);
+        let mut hello = String::new();
+        reader.read_line(&mut hello).expect("hello frame");
+        assert!(hello.contains("\"type\":\"hello\""), "{hello}");
+
+        hub.publish(7, r#"{"generation":7,"content_revision":1}"#);
+        let mut first = String::new();
+        assert!(
+            reader.read_line(&mut first).unwrap_or(0) > 0,
+            "the first snapshot frame must arrive"
+        );
+
+        // Same generation, higher content_revision: the title-only case.
+        hub.publish(7, r#"{"generation":7,"content_revision":2}"#);
+        let mut second = String::new();
+        let read = reader.read_line(&mut second).unwrap_or(0);
+        assert!(
+            read > 0,
+            "a title-only publish at an unchanged generation must still be delivered"
+        );
+        assert!(
+            second.contains("\"content_revision\":2"),
+            "expected the newer revision, got: {second}"
+        );
+    }
+
+    /// Threads in this process, read from /proc.
+    fn thread_count() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .map(|entries| entries.count())
+            .unwrap_or(0)
     }
 }
