@@ -1361,6 +1361,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     }
                 }
                 ControlCommand::CycleWorkspace { output, delta } => {
+                    let wrap = scroll_wrap_for(&config, &output);
                     let target = snapshot.outputs.get(&output).and_then(|model| {
                         if model.workspaces.is_empty() {
                             return None;
@@ -1370,8 +1371,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                             .iter()
                             .position(|workspace| workspace.active)
                             .unwrap_or(0);
-                        let len = model.workspaces.len() as i64;
-                        let next = (current as i64 + i64::from(delta)).rem_euclid(len) as usize;
+                        let next = step_index(current, delta, model.workspaces.len(), wrap);
                         Some(model.workspaces[next].id)
                     });
                     match target {
@@ -1390,6 +1390,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     }
                 }
                 ControlCommand::CycleWindow { output, delta } => {
+                    let wrap = scroll_wrap_for(&config, &output);
                     let target = snapshot.outputs.get(&output).and_then(|model| {
                         let workspace = model
                             .workspaces
@@ -1410,8 +1411,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                                     .position(|id| Some(*id) == workspace.active_window)
                             })
                             .unwrap_or(0);
-                        let len = windows.len() as i64;
-                        let next = (current as i64 + i64::from(delta)).rem_euclid(len) as usize;
+                        let next = step_index(current, delta, windows.len(), wrap);
                         Some(windows[next])
                     });
                     match target {
@@ -2211,6 +2211,35 @@ fn handle_ui_event(
     }
 }
 
+/// Step an index by `delta`, wrapping at the ends or stopping there.
+///
+/// The bar honoured `scroll_wrap` while the control socket hard-coded
+/// wrapping, so the dock and the CLI ignored the setting and the same
+/// gesture behaved differently depending on which surface received it.
+/// Every path goes through here.
+fn step_index(current: usize, delta: i32, count: usize, wrap: bool) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    if wrap {
+        wrap_index(current, delta, count)
+    } else {
+        (current as i32 + delta).clamp(0, count.saturating_sub(1) as i32) as usize
+    }
+}
+
+/// The wheel wrap policy for `output`, taken from its bar.
+///
+/// An output with no configured bar keeps the default, which is what the
+/// control socket did for every output before this.
+fn scroll_wrap_for(config: &Config, output: &str) -> bool {
+    config
+        .bars
+        .iter()
+        .find(|bar| bar.output == output)
+        .map_or_else(|| BarConfig::default().scroll_wrap, |bar| bar.scroll_wrap)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn focus_adjacent_workspace(
     snapshot: &Snapshot,
@@ -2313,11 +2342,7 @@ fn queue_workspace_scroll(
                 .position(|workspace| workspace.focused || workspace.active)
                 .unwrap_or(0)
         });
-    let next = if wrap {
-        wrap_index(current, delta, count)
-    } else {
-        (current as i32 + delta).clamp(0, count.saturating_sub(1) as i32) as usize
-    };
+    let next = step_index(current, delta, count, wrap);
     scroll.target_workspace = Some(output.workspaces[next].id);
     scroll.last_step_at = Some(now);
     (next != current).then_some(output.workspaces[next].id)
@@ -3589,5 +3614,55 @@ mod selection_tests {
             Some(crate::model::WindowSlot { column: 1, row: 0 })
         );
         assert_eq!(workspace.max_stack(), 2);
+    }
+
+    /// The bar and the control socket must agree about what happens at the
+    /// end of the list; the socket used to always wrap regardless of config.
+    #[test]
+    fn stepping_honours_the_wrap_setting_at_both_ends() {
+        // Wrapping.
+        assert_eq!(step_index(2, 1, 3, true), 0);
+        assert_eq!(step_index(0, -1, 3, true), 2);
+        // Stopping.
+        assert_eq!(step_index(2, 1, 3, false), 2);
+        assert_eq!(step_index(0, -1, 3, false), 0);
+        // Interior moves are the same either way.
+        assert_eq!(step_index(0, 1, 3, true), 1);
+        assert_eq!(step_index(0, 1, 3, false), 1);
+        // Multi-step deltas, which the dock now sends after coalescing.
+        assert_eq!(step_index(0, 2, 3, false), 2);
+        assert_eq!(step_index(0, 5, 3, false), 2);
+        assert_eq!(step_index(0, 4, 3, true), 1);
+        // An empty list must not panic.
+        assert_eq!(step_index(0, 1, 0, true), 0);
+        assert_eq!(step_index(0, 1, 0, false), 0);
+    }
+
+    /// An output with a bar follows that bar's setting; one without keeps the
+    /// default, which is what every output used to get.
+    #[test]
+    fn wrap_policy_comes_from_the_bar_for_that_output() {
+        let config = Config {
+            bars: vec![
+                BarConfig {
+                    output: "eDP-1".into(),
+                    scroll_wrap: false,
+                    ..BarConfig::default()
+                },
+                BarConfig {
+                    output: "DP-2".into(),
+                    scroll_wrap: true,
+                    ..BarConfig::default()
+                },
+            ],
+            ..Config::default()
+        };
+
+        assert!(!scroll_wrap_for(&config, "eDP-1"));
+        assert!(scroll_wrap_for(&config, "DP-2"));
+        assert_eq!(
+            scroll_wrap_for(&config, "HDMI-A-9"),
+            BarConfig::default().scroll_wrap
+        );
     }
 }
