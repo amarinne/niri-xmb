@@ -315,10 +315,14 @@ impl NiriState {
         let mut outputs = BTreeMap::new();
 
         for (name, output) in &self.outputs {
-            let logical = output.logical;
-            let (x, y, width, height) = logical
-                .map(|logical| (logical.x, logical.y, logical.width, logical.height))
-                .unwrap_or((0, 0, 1920, 1080));
+            // Niri keeps disabled connectors in its output list, but marks
+            // them without logical mapping. Do not expose those outputs in
+            // the popup, or a disabled virtual monitor appears as an empty
+            // workspace group.
+            let Some(logical) = output.logical else {
+                continue;
+            };
+            let (x, y, width, height) = (logical.x, logical.y, logical.width, logical.height);
             outputs.insert(
                 name.clone(),
                 OutputModel {
