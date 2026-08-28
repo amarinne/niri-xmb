@@ -446,11 +446,6 @@ fn update_binary(
         println!("daemon restart skipped");
         return Ok(());
     }
-    if std::env::var_os("NIRI_SOCKET").is_none() {
-        println!("NIRI_SOCKET is not set; reload Niri to run the new build");
-        return Ok(());
-    }
-
     let mut restart = ProcessCommand::new(&executable);
     restart.arg("--config").arg(config_path);
     for _ in 0..verbosity.min(2) {
