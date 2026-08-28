@@ -391,8 +391,8 @@ fn find_icon_file_in_roots(
     ];
 
     for root in roots {
-        for theme in &themes {
-            for size in &sizes {
+        for theme in themes {
+            for size in sizes {
                 for context in contexts {
                     for name in &names {
                         for extension in ["png", "svg"] {
