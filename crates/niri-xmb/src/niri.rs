@@ -241,6 +241,12 @@ fn pump_event_stream(
     loop {
         let event = match read_event() {
             Ok(event) => event,
+            // Newer Niri releases add event variants (e.g. TouchpadToggled) that the
+            // pinned niri-ipc cannot decode. Skip them instead of dropping the stream.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                tracing::debug!(%error, "skipping undecodable Niri event");
+                continue;
+            }
             Err(error) => {
                 tracing::warn!(%error, "Niri event stream disconnected");
                 publish_health(
