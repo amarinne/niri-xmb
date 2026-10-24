@@ -1,0 +1,39 @@
+# rpkg spec for niri-xmb. Copy to the repository root as niri-xmb.spec.rpkg.
+%global debug_package %{nil}
+%global version {{{ git describe --tags --long --abbrev=8 --match 'v[0-9]*' | sed 's/^v//;s/-\([0-9]*\)-g/.git.\1./' }}}
+
+Name:           niri-xmb
+Version:        %{version}
+Release:        1%{?dist}
+Summary:        Niri-native per-output workspace bar and XMB navigator
+License:        GPL-3.0-only
+URL:            https://github.com/amarinne/niri-xmb
+VCS:            {{{ git_dir_vcs }}}
+Source:         {{{ git_dir_pack }}}
+
+BuildRequires:  cargo
+BuildRequires:  rust
+BuildRequires:  pkgconfig(xkbcommon)
+
+%description
+Workspace navigator for the Niri compositor, with a Noctalia v5 widget.
+
+%prep
+{{{ git_dir_setup_macro }}}
+
+%build
+cargo build --locked --release -p niri-xmb
+
+%install
+install -Dm755 target/release/niri-xmb %{buildroot}%{_bindir}/niri-xmb
+# Noctalia v5 widget; point a [[plugins.source]] kind = "path" at this directory.
+mkdir -p %{buildroot}%{_datadir}/niri-xmb/noctalia-v5
+cp -r ports/noctalia-v5/plugins %{buildroot}%{_datadir}/niri-xmb/noctalia-v5/
+
+%files
+%license LICENSE
+%{_bindir}/niri-xmb
+%{_datadir}/niri-xmb/
+
+%changelog
+{{{ git_dir_changelog }}}
