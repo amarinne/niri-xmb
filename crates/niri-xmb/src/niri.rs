@@ -1,3 +1,4 @@
+use crate::config::NaviNiriAction;
 use crate::model::{NiriState, Snapshot};
 use crate::wayland::WakeHandle;
 use crossbeam_channel::{Receiver, Sender};
@@ -57,6 +58,7 @@ pub enum NiriCommand {
         restore_focus: Option<u64>,
         restore_cursor: Option<(f64, f64)>,
     },
+    Navi(NaviNiriAction),
 }
 
 /// One command for the action worker.
@@ -90,6 +92,7 @@ pub enum ActionStep {
     JoinLeft,
     MoveFloatingWindow,
     RestoreFocus,
+    Navi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,7 +394,7 @@ impl NiriCommand {
             Self::MoveTiled { restore_cursor, .. } | Self::MoveFloating { restore_cursor, .. } => {
                 *restore_cursor
             }
-            Self::FocusWindow(_) | Self::FocusWorkspace(_) => None,
+            Self::FocusWindow(_) | Self::FocusWorkspace(_) | Self::Navi(_) => None,
         }
     }
 
@@ -401,7 +404,7 @@ impl NiriCommand {
             Self::MoveTiled { window_id, .. } | Self::MoveFloating { window_id, .. } => {
                 Some(*window_id)
             }
-            Self::FocusWindow(_) | Self::FocusWorkspace(_) => None,
+            Self::FocusWindow(_) | Self::FocusWorkspace(_) | Self::Navi(_) => None,
         }
     }
 
@@ -411,7 +414,7 @@ impl NiriCommand {
             Self::MoveTiled { restore_focus, .. } | Self::MoveFloating { restore_focus, .. } => {
                 *restore_focus
             }
-            Self::FocusWindow(_) | Self::FocusWorkspace(_) => None,
+            Self::FocusWindow(_) | Self::FocusWorkspace(_) | Self::Navi(_) => None,
         }
     }
 }
@@ -563,6 +566,27 @@ fn restore_cursor_position(
 /// Deciding the whole sequence up front is what lets the failure path --
 /// run the compensating focus restore, then stop -- be written once in
 /// `execute_command` instead of at every step boundary.
+fn navi_niri_action(action: NaviNiriAction) -> Action {
+    match action {
+        NaviNiriAction::FocusWorkspacePrev => Action::FocusWorkspaceUp {},
+        NaviNiriAction::FocusWorkspaceNext => Action::FocusWorkspaceDown {},
+        NaviNiriAction::FocusWindowPrev => Action::FocusWindowUp {},
+        NaviNiriAction::FocusWindowNext => Action::FocusWindowDown {},
+        NaviNiriAction::MoveWindowWorkspacePrev => Action::MoveWindowToWorkspaceUp { focus: false },
+        NaviNiriAction::MoveWindowWorkspaceNext => {
+            Action::MoveWindowToWorkspaceDown { focus: false }
+        }
+        NaviNiriAction::MoveColumnLeft => Action::MoveColumnLeft {},
+        NaviNiriAction::MoveColumnRight => Action::MoveColumnRight {},
+        NaviNiriAction::FocusMonitorPrev => Action::FocusMonitorPrevious {},
+        NaviNiriAction::FocusMonitorNext => Action::FocusMonitorNext {},
+        NaviNiriAction::MoveWindowMonitorPrev => Action::MoveWindowToMonitorPrevious {},
+        NaviNiriAction::MoveWindowMonitorNext => Action::MoveWindowToMonitorNext {},
+        NaviNiriAction::ToggleOverview => Action::ToggleOverview {},
+        NaviNiriAction::CloseWindow => Action::CloseWindow { id: None },
+    }
+}
+
 fn command_steps(command: &NiriCommand) -> Vec<(ActionStep, Action)> {
     match command {
         NiriCommand::FocusWindow(id) => {
@@ -574,6 +598,7 @@ fn command_steps(command: &NiriCommand) -> Vec<(ActionStep, Action)> {
                 reference: WorkspaceReferenceArg::Id(*id),
             },
         )],
+        NiriCommand::Navi(action) => vec![(ActionStep::Navi, navi_niri_action(*action))],
         NiriCommand::MoveTiled {
             window_id,
             source_workspace_id,

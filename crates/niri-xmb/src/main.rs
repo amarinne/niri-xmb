@@ -20,12 +20,14 @@ mod wayland;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::{
-    BarConfig, Config, GamepadAction, NavigationMode, PopupOutputs, PopupPosition, PopupSurfaceMode,
+    BarConfig, Config, GamepadAction, GamepadMode, NaviAction, NavigationMode, PopupOutputs,
+    PopupPosition, PopupSurfaceMode,
 };
 use crossbeam_channel::unbounded;
 use drop_plan::{DropPoint, DropPolicy, DropRequest, DropTarget, plan_drop};
 use drop_transaction::DropTransactionState;
 use focus::{FOCUS_SETTLE, FocusVerdict, FocusWatcher};
+use gamepad::GamepadEvent;
 use ipc::{ControlCommand, ControlRequest};
 use model::Snapshot;
 use niri::{NiriCommand, NiriHealth, NiriRequest, spawn as spawn_niri};
@@ -680,6 +682,13 @@ fn popup_mode_name(mode: PopupMode) -> &'static str {
     }
 }
 
+fn gamepad_mode_name(mode: GamepadMode) -> &'static str {
+    match mode {
+        GamepadMode::Game => "game",
+        GamepadMode::Navi => "navi",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn status_response(
     popup_outputs: &HashSet<String>,
@@ -689,11 +698,16 @@ fn status_response(
     cursor_restore: bool,
     niri_health: &NiriHealth,
     drop_transactions: &DropTransactionState,
+    gamepad_mode: Option<GamepadMode>,
     subscribers: usize,
 ) -> String {
     serde_json::json!({
         "visible": !popup_outputs.is_empty(),
         "mode": popup_mode_name(popup_mode),
+        "gamepad": {
+            "enabled": gamepad_mode.is_some(),
+            "mode": gamepad_mode.map(gamepad_mode_name),
+        },
         "selection": selection.map(|visual| {
             serde_json::json!({
                 "output": visual.output,
@@ -855,6 +869,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut panel = PanelState::default();
     let mut bar_scrolls: HashMap<String, BarScrollState> = HashMap::new();
     let mut selection = Selection::default();
+    let mut gamepad_pointer_buttons: HashSet<u16> = HashSet::new();
     let mut popup_was_open = false;
     // Focus changes we caused ourselves must not bounce back as a peek.
     let mut peek_suppressed_until = Instant::now();
@@ -1031,6 +1046,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     surfaces.cursor_restore_available(),
                     &niri_health,
                     &drop_transactions,
+                    gamepad.as_ref().map(|gamepad| gamepad.mode()),
                     subscriptions.subscriber_count(),
                 ),
                 ControlCommand::Snapshot { output } => {
@@ -1283,9 +1299,22 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         }
 
         if let Some(gamepad) = &gamepad {
-            while let Some(action) = gamepad.try_recv() {
-                dirty |= handle_gamepad_action(
-                    action,
+            let mut mode = gamepad.mode();
+            while let Some(event) = gamepad.try_recv() {
+                if let GamepadEvent::ModeChanged(next) = event {
+                    if next == GamepadMode::Game {
+                        release_gamepad_pointer_buttons(
+                            &mut surfaces,
+                            &mut gamepad_pointer_buttons,
+                        );
+                    }
+                    mode = next;
+                    dirty = true;
+                    continue;
+                }
+                dirty |= handle_gamepad_event(
+                    event,
+                    mode,
                     &mut renderer,
                     &mut surfaces,
                     &config,
@@ -1294,8 +1323,12 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     &mut panel,
                     &mut selection,
                     &mut peek_suppressed_until,
+                    &mut gamepad_pointer_buttons,
                 )?;
             }
+        }
+        if panel.mode() == PopupMode::Manual {
+            release_gamepad_pointer_buttons(&mut surfaces, &mut gamepad_pointer_buttons);
         }
 
         // Only the manual popup uses the delayed follow. A peek overlay is
@@ -1897,6 +1930,116 @@ fn handle_gamepad_action(
         selection,
         suppress_peek,
     )
+}
+
+fn release_gamepad_pointer_buttons(surfaces: &mut SurfaceManager, buttons: &mut HashSet<u16>) {
+    for button in buttons.drain() {
+        surfaces.pointer_button(u32::from(button), false);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_gamepad_event(
+    event: GamepadEvent,
+    mode: GamepadMode,
+    renderer: &mut Renderer,
+    surfaces: &mut SurfaceManager,
+    config: &Config,
+    snapshot: &Snapshot,
+    niri_tx: &crossbeam_channel::Sender<NiriRequest>,
+    panel: &mut PanelState,
+    selection: &mut Selection,
+    suppress_peek: &mut Instant,
+    pointer_buttons: &mut HashSet<u16>,
+) -> Result<bool> {
+    match event {
+        GamepadEvent::ModeChanged(_) => Ok(false),
+        GamepadEvent::Xmb(action) => {
+            if mode != GamepadMode::Navi {
+                return Ok(false);
+            }
+            handle_gamepad_action(
+                action,
+                renderer,
+                surfaces,
+                config,
+                snapshot,
+                niri_tx,
+                panel,
+                selection,
+                suppress_peek,
+            )
+        }
+        GamepadEvent::Navi(action) => {
+            if mode != GamepadMode::Navi {
+                return Ok(false);
+            }
+            match action {
+                NaviAction::XmbOpen => {
+                    if panel.mode() == PopupMode::Manual {
+                        return Ok(false);
+                    }
+                    handle_gamepad_action(
+                        GamepadAction::Open,
+                        renderer,
+                        surfaces,
+                        config,
+                        snapshot,
+                        niri_tx,
+                        panel,
+                        selection,
+                        suppress_peek,
+                    )
+                }
+                NaviAction::Niri(action) => {
+                    if panel.mode() == PopupMode::Manual {
+                        return Ok(false);
+                    }
+                    if submit_niri_command(niri_tx, NiriCommand::Navi(action)) {
+                        *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
+                    }
+                    Ok(false)
+                }
+                NaviAction::Scroll(direction) => {
+                    if panel.mode() != PopupMode::Manual {
+                        surfaces.pointer_scroll(f64::from(direction));
+                    }
+                    Ok(false)
+                }
+                NaviAction::Pointer(_) => Ok(false),
+            }
+        }
+        GamepadEvent::PointerMotion { dx, dy } => {
+            if mode == GamepadMode::Navi {
+                surfaces.pointer_motion(f64::from(dx), f64::from(dy));
+            }
+            Ok(false)
+        }
+        GamepadEvent::PointerButton { button, pressed } => {
+            if mode != GamepadMode::Navi {
+                return Ok(false);
+            }
+            if panel.mode() == PopupMode::Manual {
+                if !pressed && pointer_buttons.remove(&button) {
+                    surfaces.pointer_button(u32::from(button), false);
+                }
+                return Ok(false);
+            }
+            surfaces.pointer_button(u32::from(button), pressed);
+            if pressed {
+                pointer_buttons.insert(button);
+            } else {
+                pointer_buttons.remove(&button);
+            }
+            Ok(false)
+        }
+        GamepadEvent::PointerScroll { steps } => {
+            if mode == GamepadMode::Navi && panel.mode() != PopupMode::Manual {
+                surfaces.pointer_scroll(f64::from(steps));
+            }
+            Ok(false)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2628,6 +2771,7 @@ mod tests {
             true,
             &health,
             &DropTransactionState::default(),
+            None,
             0,
         ))
         .unwrap();
@@ -2645,6 +2789,25 @@ mod tests {
             value.get("snapshot_mirror").is_some(),
             "status must publish where the snapshot mirror lives"
         );
+    }
+
+    #[test]
+    fn status_response_reports_gamepad_mode() {
+        let value: serde_json::Value = serde_json::from_str(&status_response(
+            &HashSet::new(),
+            PopupMode::Hidden,
+            None,
+            &protocol_snapshot(),
+            true,
+            &NiriHealth::default(),
+            &DropTransactionState::default(),
+            Some(GamepadMode::Navi),
+            0,
+        ))
+        .unwrap();
+
+        assert_eq!(value["gamepad"]["enabled"], true);
+        assert_eq!(value["gamepad"]["mode"], "navi");
     }
 
     #[test]

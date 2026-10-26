@@ -110,13 +110,42 @@ External Niri keybinds must not change manual mode into hidden or peek mode.
 
 ## Gamepad input
 
-Optional evdev gamepads may map button presses to the manual popup's actions.
-The daemon reads only configured absolute device paths; an empty list discovers
-`/dev/input/by-id/*-event-joystick` and `*-event-gamepad`. It never grabs the
-device. Actions apply only while a manual popup is open: up/down/left/right
-navigate, tab/back select the next/previous output, confirm activates the
-selection, and close follows `close_on_escape`. Presses trigger one action;
-releases and repeats are ignored. Gamepad input is disabled by default.
+Optional evdev gamepads start in **game** mode. The daemon reads only configured
+absolute device paths; an empty list discovers
+`/dev/input/by-id/*-event-joystick` and `*-event-gamepad`. It does not grab the
+device in game mode, so games receive normal input. The mode toggle
+(`gamepad.mode.toggle`, default `BTN_MODE`+`BTN_START`) switches to **navi**
+mode, which grabs the device and activates desktop navigation. The completing
+toggle press is consumed; a device that disconnects resets the mode to game.
+
+Navi mode maps stick motion, clicks, and scroll through the Wayland virtual
+pointer. The default base bindings are left stick pointer, right stick scroll,
+South/Cross left click, East/Circle right click, West/Square middle click,
+North/Triangle open XMB, and Start toggle the Niri overview. Hold layers are
+configured under `gamepad.navi.layers`: by default TL focuses workspaces and
+windows, TR moves windows/columns, and holding both analog triggers focuses or
+moves between monitors. D-pad hats and `BTN_DPAD_*` events both resolve these
+layers. Navi actions call Niri directly, so workspace/output changes are
+immediate rather than deferred.
+
+Analog triggers modulate pointer and scroll speed around the configured baseline
+speed. LT is a precision/deceleration control and RT is a boost. Trigger depth is
+deadzoned and curved, then combined multiplicatively with separate deceleration
+floors, boost caps, and smoothing for pointer and scroll. The speed multiplier
+is smoothed, not the stick position, so trigger ADC noise does not step the
+pointer. Both triggers also participate in the monitor layer's hold_axes; layer
+actions take precedence when the D-pad is used.
+
+While the manual XMB is open, the existing `gamepad.buttons` mapping owns the
+face/D-pad context; navi pointer motion remains available but pointer clicks and
+Niri actions are suppressed. When the XMB closes, navi base/layers resume.
+`gamepad.open_combo` is active only in navi mode. Presses trigger one action;
+releases and repeats are ignored except for pointer holds and mode/layer
+releases. Gamepad input is disabled by default.
+
+The current xpad interface exposes standard Xbox controls only. Full Vader 4
+paddles and gyro are a follow-up DInput/vendor-HID source; they are not inferred
+from the standard axes.
 
 `gamepad.preset` selects `none`, `auto`, `xbox`, or `ds4`. Explicit
 `gamepad.buttons` entries override preset entries by evdev code. `auto` maps

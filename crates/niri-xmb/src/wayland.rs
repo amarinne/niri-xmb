@@ -979,6 +979,53 @@ impl SurfaceManager {
         pointer.frame();
         self.queue.flush().is_ok()
     }
+
+    fn virtual_pointer_time(&self) -> u32 {
+        self.state
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u32::MAX as u128) as u32
+    }
+
+    /// Move the desktop pointer by a relative amount.
+    pub fn pointer_motion(&mut self, dx: f64, dy: f64) -> bool {
+        let Some(pointer) = &self.state.virtual_pointer else {
+            return false;
+        };
+        let time = self.virtual_pointer_time();
+        pointer.motion(time, dx, dy);
+        pointer.frame();
+        self.queue.flush().is_ok()
+    }
+
+    /// Press or release a desktop pointer button.
+    pub fn pointer_button(&mut self, button: u32, pressed: bool) -> bool {
+        let Some(pointer) = &self.state.virtual_pointer else {
+            return false;
+        };
+        let time = self.virtual_pointer_time();
+        let state = if pressed {
+            wl_pointer::ButtonState::Pressed
+        } else {
+            wl_pointer::ButtonState::Released
+        };
+        pointer.button(time, button, state);
+        pointer.frame();
+        self.queue.flush().is_ok()
+    }
+
+    /// Scroll the desktop pointer continuously.
+    pub fn pointer_scroll(&mut self, steps: f64) -> bool {
+        let Some(pointer) = &self.state.virtual_pointer else {
+            return false;
+        };
+        let time = self.virtual_pointer_time();
+        pointer.axis_source(wl_pointer::AxisSource::Continuous);
+        pointer.axis(time, wl_pointer::Axis::VerticalScroll, steps);
+        pointer.frame();
+        self.queue.flush().is_ok()
+    }
 }
 
 fn allocate_surface_buffer(surface: &mut SurfaceEntry) -> Result<()> {

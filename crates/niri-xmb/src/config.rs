@@ -1,6 +1,6 @@
 use crate::draw::StyleColor;
 use anyhow::{Context, Result};
-use evdev::KeyCode;
+use evdev::{AbsoluteAxisCode, KeyCode};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1008,6 +1008,130 @@ pub enum GamepadPreset {
     Ds4,
 }
 
+/// Game or desktop-navigation mode for the controller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GamepadMode {
+    #[default]
+    Game,
+    Navi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GamepadPointerStick {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerButton {
+    Left,
+    Right,
+    Middle,
+}
+
+impl PointerButton {
+    pub(crate) fn code(self) -> u16 {
+        match self {
+            Self::Left => KeyCode::BTN_LEFT.0,
+            Self::Right => KeyCode::BTN_RIGHT.0,
+            Self::Middle => KeyCode::BTN_MIDDLE.0,
+        }
+    }
+}
+
+/// Immediate compositor action emitted by a navi binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NaviNiriAction {
+    FocusWorkspacePrev,
+    FocusWorkspaceNext,
+    FocusWindowPrev,
+    FocusWindowNext,
+    MoveWindowWorkspacePrev,
+    MoveWindowWorkspaceNext,
+    MoveColumnLeft,
+    MoveColumnRight,
+    FocusMonitorPrev,
+    FocusMonitorNext,
+    MoveWindowMonitorPrev,
+    MoveWindowMonitorNext,
+    ToggleOverview,
+    CloseWindow,
+}
+
+/// An action resolved from a navi button or layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NaviAction {
+    Pointer(PointerButton),
+    Scroll(i8),
+    Niri(NaviNiriAction),
+    XmbOpen,
+}
+
+/// Parse a navi action string from the config.
+pub(crate) fn parse_navi_action(value: &str) -> Result<NaviAction> {
+    let value = value.trim().to_ascii_lowercase();
+    let action = match value.as_str() {
+        "pointer.left" => NaviAction::Pointer(PointerButton::Left),
+        "pointer.right" => NaviAction::Pointer(PointerButton::Right),
+        "pointer.middle" => NaviAction::Pointer(PointerButton::Middle),
+        "pointer.scroll-up" => NaviAction::Scroll(-1),
+        "pointer.scroll-down" => NaviAction::Scroll(1),
+        "xmb.open" => NaviAction::XmbOpen,
+        "niri.focus-workspace-prev" => NaviAction::Niri(NaviNiriAction::FocusWorkspacePrev),
+        "niri.focus-workspace-next" => NaviAction::Niri(NaviNiriAction::FocusWorkspaceNext),
+        "niri.focus-window-prev" => NaviAction::Niri(NaviNiriAction::FocusWindowPrev),
+        "niri.focus-window-next" => NaviAction::Niri(NaviNiriAction::FocusWindowNext),
+        "niri.move-window-workspace-prev" => {
+            NaviAction::Niri(NaviNiriAction::MoveWindowWorkspacePrev)
+        }
+        "niri.move-window-workspace-next" => {
+            NaviAction::Niri(NaviNiriAction::MoveWindowWorkspaceNext)
+        }
+        "niri.move-column-left" => NaviAction::Niri(NaviNiriAction::MoveColumnLeft),
+        "niri.move-column-right" => NaviAction::Niri(NaviNiriAction::MoveColumnRight),
+        "niri.focus-monitor-prev" => NaviAction::Niri(NaviNiriAction::FocusMonitorPrev),
+        "niri.focus-monitor-next" => NaviAction::Niri(NaviNiriAction::FocusMonitorNext),
+        "niri.move-window-monitor-prev" => NaviAction::Niri(NaviNiriAction::MoveWindowMonitorPrev),
+        "niri.move-window-monitor-next" => NaviAction::Niri(NaviNiriAction::MoveWindowMonitorNext),
+        "niri.toggle-overview" => NaviAction::Niri(NaviNiriAction::ToggleOverview),
+        "niri.close-window" => NaviAction::Niri(NaviNiriAction::CloseWindow),
+        _ => anyhow::bail!(
+            "unknown gamepad navi action {value:?}; expected a pointer, xmb, or niri action"
+        ),
+    };
+    Ok(action)
+}
+
+/// Parse an absolute axis name or 16-bit decimal/hex code.
+pub(crate) fn gamepad_axis_code(name: &str) -> Result<u16> {
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("gamepad axis name must not be empty");
+    }
+    let code = match name {
+        "ABS_X" => AbsoluteAxisCode::ABS_X.0,
+        "ABS_Y" => AbsoluteAxisCode::ABS_Y.0,
+        "ABS_Z" => AbsoluteAxisCode::ABS_Z.0,
+        "ABS_RX" => AbsoluteAxisCode::ABS_RX.0,
+        "ABS_RY" => AbsoluteAxisCode::ABS_RY.0,
+        "ABS_RZ" => AbsoluteAxisCode::ABS_RZ.0,
+        _ => {
+            let number =
+                if let Some(hex) = name.strip_prefix("0x").or_else(|| name.strip_prefix("0X")) {
+                    u16::from_str_radix(hex, 16).ok()
+                } else {
+                    name.parse::<u16>().ok()
+                };
+            number.with_context(|| {
+                format!("unknown gamepad axis {name:?}; use an ABS name or a 16-bit code")
+            })?
+        }
+    };
+    Ok(code)
+}
+
 /// One action a gamepad input can trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1031,9 +1155,9 @@ pub enum GamepadAction {
 
 /// Optional evdev gamepad button map.
 ///
-/// Gamepads are read outside the Wayland seat. The daemon never grabs the
-/// device, so other clients keep receiving its input.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Gamepads are read outside the Wayland seat. The daemon only grabs the
+/// device while navi mode is active.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct GamepadConfig {
     pub enabled: bool,
@@ -1049,17 +1173,238 @@ pub struct GamepadConfig {
     /// At least two unique evdev button names or 16-bit codes held together to
     /// open the manual popup. Empty disables the combo.
     pub open_combo: Vec<String>,
+    /// Game/navi mode and capture behavior.
+    pub mode: GamepadModeConfig,
+    /// Desktop-navigation pointer, bindings, and modifier layers.
+    pub navi: GamepadNaviConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GamepadModeConfig {
+    pub default: GamepadMode,
+    /// At least two unique codes; empty disables the mode toggle.
+    pub toggle: Vec<String>,
+    /// Grab the device while navi is active so games do not receive nav input.
+    pub grab_in_navi: bool,
+    /// Return to game mode when the last controller disconnects.
+    pub reset_on_disconnect: bool,
+}
+
+impl Default for GamepadModeConfig {
+    fn default() -> Self {
+        Self {
+            default: GamepadMode::Game,
+            toggle: vec!["BTN_MODE".into(), "BTN_START".into()],
+            grab_in_navi: true,
+            reset_on_disconnect: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GamepadPointerAccelConfig {
+    pub enabled: bool,
+    /// Multiplier at full left trigger.
+    pub decel_floor: f32,
+    /// Multiplier at full right trigger.
+    pub boost_cap: f32,
+    /// Time constant for multiplier changes, in milliseconds.
+    pub smoothing_ms: f32,
+}
+
+impl Default for GamepadPointerAccelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            decel_floor: 0.30,
+            boost_cap: 2.50,
+            smoothing_ms: 90.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GamepadPointerConfig {
+    pub enabled: bool,
+    pub stick: GamepadPointerStick,
+    pub deadzone: f32,
+    /// Response exponent; 1.0 is linear.
+    pub curve: f32,
+    /// Logical pixels per second at full deflection.
+    pub speed: f32,
+    /// Maximum pointer movement emitted in one frame.
+    pub max_step: f32,
+    pub invert_y: bool,
+    pub scroll_stick: GamepadPointerStick,
+    pub scroll_deadzone: f32,
+    /// Wheel steps per second at full deflection.
+    pub scroll_speed: f32,
+    /// Analog trigger threshold used by hold_axes layers.
+    pub trigger_threshold: f32,
+    /// Deadzone for analog trigger speed modulation.
+    pub trigger_deadzone: f32,
+    /// Response exponent for trigger speed modulation.
+    pub trigger_curve: f32,
+    pub accel: GamepadPointerAccelConfig,
+    pub scroll_accel: GamepadPointerAccelConfig,
+}
+
+impl Default for GamepadPointerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            stick: GamepadPointerStick::Left,
+            deadzone: 0.15,
+            curve: 1.6,
+            speed: 1200.0,
+            max_step: 48.0,
+            invert_y: false,
+            scroll_stick: GamepadPointerStick::Right,
+            scroll_deadzone: 0.20,
+            scroll_speed: 6.0,
+            trigger_threshold: 0.35,
+            trigger_deadzone: 0.08,
+            trigger_curve: 1.35,
+            accel: GamepadPointerAccelConfig::default(),
+            scroll_accel: GamepadPointerAccelConfig {
+                decel_floor: 0.35,
+                boost_cap: 3.0,
+                smoothing_ms: 120.0,
+                ..GamepadPointerAccelConfig::default()
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GamepadAxisHold {
+    pub axis: String,
+    #[serde(default = "default_trigger_threshold")]
+    pub threshold: f32,
+}
+
+fn default_trigger_threshold() -> f32 {
+    0.35
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GamepadLayerConfig {
+    pub hold: Vec<String>,
+    pub hold_axes: Vec<GamepadAxisHold>,
+    pub bindings: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GamepadNaviConfig {
+    pub pointer: GamepadPointerConfig,
+    pub bindings: BTreeMap<String, String>,
+    pub layers: BTreeMap<String, GamepadLayerConfig>,
+}
+
+impl Default for GamepadNaviConfig {
+    fn default() -> Self {
+        Self {
+            pointer: GamepadPointerConfig::default(),
+            bindings: default_navi_bindings(),
+            layers: default_navi_layers(),
+        }
+    }
+}
+
+fn default_navi_bindings() -> BTreeMap<String, String> {
+    [
+        ("BTN_SOUTH", "pointer.left"),
+        ("BTN_EAST", "pointer.right"),
+        ("BTN_WEST", "pointer.middle"),
+        ("BTN_NORTH", "xmb.open"),
+        ("BTN_START", "niri.toggle-overview"),
+    ]
+    .into_iter()
+    .map(|(button, action)| (button.to_string(), action.to_string()))
+    .collect()
+}
+
+fn default_navi_layers() -> BTreeMap<String, GamepadLayerConfig> {
+    let layer = |hold: &[&str], bindings: &[(&str, &str)]| GamepadLayerConfig {
+        hold: hold.iter().map(|button| (*button).to_string()).collect(),
+        hold_axes: Vec::new(),
+        bindings: bindings
+            .iter()
+            .map(|(button, action)| (button.to_string(), action.to_string()))
+            .collect(),
+    };
+    BTreeMap::from([
+        (
+            "monitor".into(),
+            GamepadLayerConfig {
+                hold: Vec::new(),
+                hold_axes: vec![
+                    GamepadAxisHold {
+                        axis: "ABS_Z".into(),
+                        threshold: default_trigger_threshold(),
+                    },
+                    GamepadAxisHold {
+                        axis: "ABS_RZ".into(),
+                        threshold: default_trigger_threshold(),
+                    },
+                ],
+                bindings: [
+                    ("BTN_DPAD_LEFT", "niri.focus-monitor-prev"),
+                    ("BTN_DPAD_RIGHT", "niri.focus-monitor-next"),
+                    ("BTN_DPAD_UP", "niri.move-window-monitor-prev"),
+                    ("BTN_DPAD_DOWN", "niri.move-window-monitor-next"),
+                    ("BTN_SOUTH", "niri.focus-monitor-next"),
+                ]
+                .into_iter()
+                .map(|(button, action)| (button.to_string(), action.to_string()))
+                .collect(),
+            },
+        ),
+        (
+            "window".into(),
+            layer(
+                &["BTN_TR"],
+                &[
+                    ("BTN_DPAD_LEFT", "niri.move-window-workspace-prev"),
+                    ("BTN_DPAD_RIGHT", "niri.move-window-workspace-next"),
+                    ("BTN_DPAD_UP", "niri.move-column-left"),
+                    ("BTN_DPAD_DOWN", "niri.move-column-right"),
+                ],
+            ),
+        ),
+        (
+            "workspace".into(),
+            layer(
+                &["BTN_TL"],
+                &[
+                    ("BTN_DPAD_LEFT", "niri.focus-workspace-prev"),
+                    ("BTN_DPAD_RIGHT", "niri.focus-workspace-next"),
+                    ("BTN_DPAD_UP", "niri.focus-window-prev"),
+                    ("BTN_DPAD_DOWN", "niri.focus-window-next"),
+                ],
+            ),
+        ),
+    ])
 }
 
 impl GamepadConfig {
     pub fn validate(&self) -> Result<()> {
+        let navi_has_input = self.navi.pointer.enabled
+            || !self.navi.bindings.is_empty()
+            || !self.navi.layers.is_empty();
         if self.enabled
             && self.preset == GamepadPreset::None
             && self.buttons.is_empty()
             && self.open_combo.is_empty()
+            && !navi_has_input
         {
             anyhow::bail!(
-                "gamepad.buttons must define at least one binding, or gamepad.open_combo must define at least two unique button codes, when gamepad.enabled is true and gamepad.preset is \"none\""
+                "gamepad must define XMB buttons, an open combo, or navi input when gamepad.enabled is true and gamepad.preset is \"none\""
             );
         }
         for (index, device) in self.devices.iter().enumerate() {
@@ -1079,27 +1424,132 @@ impl GamepadConfig {
                 anyhow::bail!("gamepad.buttons contains duplicate code {code:#06x} via {name:?}");
             }
         }
-        self.open_combo_codes()?;
+        let open_combo = self.open_combo_codes()?;
+        let mode_toggle = self.mode_toggle_codes()?;
+        if !open_combo.is_empty() && open_combo == mode_toggle {
+            anyhow::bail!("gamepad.mode.toggle must differ from gamepad.open_combo");
+        }
+        self.navi.validate()?;
         Ok(())
     }
 
     /// Parse and validate the simultaneous open-combo codes.
     pub(crate) fn open_combo_codes(&self) -> Result<HashSet<u16>> {
-        let mut codes = HashSet::new();
-        for (index, name) in self.open_combo.iter().enumerate() {
-            let code = gamepad_button_code(name)
-                .with_context(|| format!("gamepad.open_combo[{index}]"))?;
-            if !codes.insert(code) {
-                anyhow::bail!(
-                    "gamepad.open_combo contains duplicate code {code:#06x} via {name:?}"
-                );
+        combo_codes(&self.open_combo, "gamepad.open_combo")
+    }
+
+    /// Parse and validate the game/navi toggle combo.
+    pub(crate) fn mode_toggle_codes(&self) -> Result<HashSet<u16>> {
+        combo_codes(&self.mode.toggle, "gamepad.mode.toggle")
+    }
+}
+
+fn combo_codes(names: &[String], label: &str) -> Result<HashSet<u16>> {
+    let mut codes = HashSet::new();
+    for (index, name) in names.iter().enumerate() {
+        let code = gamepad_button_code(name).with_context(|| format!("{label}[{index}]"))?;
+        if !codes.insert(code) {
+            anyhow::bail!("{label} contains duplicate code {code:#06x} via {name:?}");
+        }
+    }
+    if codes.len() == 1 {
+        anyhow::bail!("{label} must contain at least two unique button codes");
+    }
+    Ok(codes)
+}
+
+impl GamepadNaviConfig {
+    fn validate(&self) -> Result<()> {
+        let pointer = &self.pointer;
+        for (name, value) in [
+            ("deadzone", pointer.deadzone),
+            ("scroll_deadzone", pointer.scroll_deadzone),
+            ("trigger_threshold", pointer.trigger_threshold),
+        ] {
+            if !(0.0..=1.0).contains(&value) {
+                anyhow::bail!("gamepad.navi.pointer.{name} must be between 0.0 and 1.0");
             }
         }
-        if codes.len() == 1 {
-            anyhow::bail!("gamepad.open_combo must contain at least two unique button codes");
+        if !(0.0..=0.9).contains(&pointer.trigger_deadzone) {
+            anyhow::bail!("gamepad.navi.pointer.trigger_deadzone must be between 0.0 and 0.9");
         }
-        Ok(codes)
+        for (name, value) in [
+            ("curve", pointer.curve),
+            ("speed", pointer.speed),
+            ("max_step", pointer.max_step),
+            ("scroll_speed", pointer.scroll_speed),
+            ("trigger_curve", pointer.trigger_curve),
+        ] {
+            if !value.is_finite() || value < 0.0 || (name == "curve" && value == 0.0) {
+                anyhow::bail!("gamepad.navi.pointer.{name} is invalid");
+            }
+        }
+        if !(0.05..=5.0).contains(&pointer.trigger_curve) {
+            anyhow::bail!("gamepad.navi.pointer.trigger_curve must be between 0.05 and 5.0");
+        }
+        for (name, accel) in [
+            ("accel", &pointer.accel),
+            ("scroll_accel", &pointer.scroll_accel),
+        ] {
+            let label = format!("gamepad.navi.pointer.{name}");
+            if !accel.decel_floor.is_finite()
+                || !(0.0..=1.0).contains(&accel.decel_floor)
+                || accel.decel_floor == 0.0
+            {
+                anyhow::bail!("{label}.decel_floor must be greater than 0.0 and at most 1.0");
+            }
+            if !accel.boost_cap.is_finite() || !(1.0..=10.0).contains(&accel.boost_cap) {
+                anyhow::bail!("{label}.boost_cap must be between 1.0 and 10.0");
+            }
+            if !accel.smoothing_ms.is_finite() || !(0.0..=500.0).contains(&accel.smoothing_ms) {
+                anyhow::bail!("{label}.smoothing_ms must be between 0 and 500");
+            }
+        }
+
+        validate_navi_bindings(&self.bindings, "gamepad.navi.bindings")?;
+        for (name, layer) in &self.layers {
+            let label = format!("gamepad.navi.layers.{name}");
+            if layer.hold.is_empty() && layer.hold_axes.is_empty() {
+                anyhow::bail!("{label} must define hold or hold_axes");
+            }
+            let mut hold_codes = HashSet::new();
+            for button in &layer.hold {
+                let code = gamepad_button_code(button)
+                    .with_context(|| format!("{label}.hold.{button}"))?;
+                if !hold_codes.insert(code) {
+                    anyhow::bail!("{label}.hold contains duplicate code {code:#06x}");
+                }
+            }
+            let mut axis_codes = HashSet::new();
+            for axis in &layer.hold_axes {
+                let code = gamepad_axis_code(&axis.axis)
+                    .with_context(|| format!("{label}.hold_axes.{}", axis.axis))?;
+                if !axis_codes.insert(code) {
+                    anyhow::bail!("{label}.hold_axes contains duplicate axis {code:#06x}");
+                }
+                if !(0.0..=1.0).contains(&axis.threshold) {
+                    anyhow::bail!(
+                        "{label}.hold_axes.{}.threshold must be 0.0..=1.0",
+                        axis.axis
+                    );
+                }
+            }
+            validate_navi_bindings(&layer.bindings, &format!("{label}.bindings"))?;
+        }
+        Ok(())
     }
+}
+
+fn validate_navi_bindings(bindings: &BTreeMap<String, String>, label: &str) -> Result<()> {
+    let mut codes = HashSet::new();
+    for (button, action) in bindings {
+        let code = gamepad_button_code(button).with_context(|| format!("{label}.{button}"))?;
+        if !codes.insert(code) {
+            anyhow::bail!("{label} contains duplicate code {code:#06x} via {button:?}");
+        }
+        parse_navi_action(action).with_context(|| format!("{label}.{button}"))?;
+    }
+    Ok(())
 }
 
 /// Parse an evdev button name or a 16-bit numeric code.
@@ -1126,8 +1576,11 @@ mod tests {
     use super::*;
 
     fn load_source(config_source: &str, theme_source: Option<&str>) -> Result<Config> {
+        static TEMP_DIR_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let sequence = TEMP_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "niri-xmb-config-test-{}-{}",
+            "niri-xmb-config-test-{}-{sequence}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1586,6 +2039,13 @@ mod tests {
         assert!(config.gamepad.devices.is_empty());
         assert!(config.gamepad.buttons.is_empty());
         assert!(config.gamepad.open_combo.is_empty());
+        assert_eq!(config.gamepad.mode.default, GamepadMode::Game);
+        assert!(config.gamepad.navi.pointer.enabled);
+        assert_eq!(config.gamepad.navi.pointer.accel.decel_floor, 0.30);
+        assert_eq!(config.gamepad.navi.pointer.accel.boost_cap, 2.50);
+        assert_eq!(config.gamepad.navi.pointer.scroll_accel.boost_cap, 3.0);
+        assert!(config.gamepad.navi.bindings.contains_key("BTN_SOUTH"));
+        assert!(config.gamepad.navi.layers.contains_key("workspace"));
         config.validate().unwrap();
     }
 
@@ -1625,20 +2085,34 @@ mod tests {
     }
 
     #[test]
-    fn gamepad_rejects_empty_bindings_when_enabled_without_a_preset() {
+    fn gamepad_rejects_empty_bindings_when_enabled_without_any_input() {
         let error = load_source(
             r#"
             [gamepad]
             enabled = true
             devices = ["/dev/input/event0"]
+            navi = { pointer = { enabled = false }, bindings = {}, layers = {} }
             "#,
             None,
         )
         .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("gamepad.buttons"),
-            "{error:#}"
-        );
+        assert!(format!("{error:#}").contains("navi input"), "{error:#}");
+    }
+
+    #[test]
+    fn gamepad_navi_defaults_allow_enabled_without_xmb_bindings() {
+        let config = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            preset = "none"
+            devices = ["/dev/input/event0"]
+            "#,
+            None,
+        )
+        .unwrap();
+        assert!(config.gamepad.navi.pointer.enabled);
+        assert!(config.gamepad.navi.layers.contains_key("workspace"));
     }
 
     #[test]
@@ -1711,6 +2185,159 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("duplicate code"), "{error:#}");
+    }
+
+    #[test]
+    fn gamepad_navi_config_parses_and_validates() {
+        let config = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            preset = "auto"
+            [gamepad.mode]
+            default = "navi"
+            toggle = ["BTN_MODE", "BTN_START"]
+            [gamepad.navi.pointer]
+            stick = "right"
+            deadzone = 0.2
+            [gamepad.navi.bindings]
+            BTN_SOUTH = "pointer.left"
+            [gamepad.navi.layers.workspace]
+            hold = ["BTN_TL"]
+            [gamepad.navi.layers.workspace.bindings]
+            BTN_DPAD_LEFT = "niri.focus-workspace-prev"
+            "#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(config.gamepad.mode.default, GamepadMode::Navi);
+        assert_eq!(
+            config.gamepad.navi.pointer.stick,
+            GamepadPointerStick::Right
+        );
+        assert_eq!(
+            parse_navi_action("niri.focus-workspace-prev").unwrap(),
+            NaviAction::Niri(NaviNiriAction::FocusWorkspacePrev)
+        );
+        assert_eq!(
+            config.gamepad.navi.bindings.get("BTN_SOUTH"),
+            Some(&"pointer.left".to_string())
+        );
+    }
+
+    #[test]
+    fn gamepad_navi_rejects_unknown_actions_and_layers() {
+        let error = load_source(
+            r#"
+            [gamepad.navi.bindings]
+            BTN_SOUTH = "jump"
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("jump"), "{error:#}");
+
+        let error = load_source(
+            r#"
+            [gamepad.navi.layers.workspace.bindings]
+            BTN_DPAD_LEFT = "niri.focus-workspace-prev"
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("hold"), "{error:#}");
+    }
+
+    #[test]
+    fn gamepad_mode_toggle_is_validated() {
+        let error = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            preset = "auto"
+            [gamepad.mode]
+            toggle = ["BTN_MODE"]
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("at least two"), "{error:#}");
+
+        let error = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            preset = "auto"
+            open_combo = ["BTN_SELECT", "BTN_START"]
+            [gamepad.mode]
+            toggle = ["BTN_SELECT", "BTN_START"]
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("must differ from gamepad.open_combo"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn gamepad_navi_rejects_invalid_pointer_ranges() {
+        let error = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            preset = "auto"
+            [gamepad.navi.pointer]
+            deadzone = 1.5
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("deadzone"), "{error:#}");
+    }
+
+    #[test]
+    fn gamepad_navi_rejects_invalid_accel_settings() {
+        let error = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            preset = "auto"
+            [gamepad.navi.pointer.accel]
+            decel_floor = 0.0
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("decel_floor"), "{error:#}");
+
+        let error = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            preset = "auto"
+            [gamepad.navi.pointer.scroll_accel]
+            boost_cap = 0.5
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("boost_cap"), "{error:#}");
+
+        let error = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            preset = "auto"
+            [gamepad.navi.pointer]
+            trigger_curve = 10.0
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("trigger_curve"), "{error:#}");
     }
 
     #[test]

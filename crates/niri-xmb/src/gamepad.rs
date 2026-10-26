@@ -3,10 +3,15 @@
 //! Gamepads are not part of the Wayland seat. Each enabled device gets a
 //! reader thread that maps configured key codes to manual-popup actions and
 //! forwards them to the daemon loop through a bounded channel. The threads
-//! never block the Wayland or Niri event paths, and the device is never
-//! grabbed, so other clients keep receiving its input.
+//! never block the Wayland or Niri event paths. The device is not grabbed in
+//! game mode, so other clients keep receiving its input; navi mode grabs it so
+//! desktop navigation does not also reach the game.
 
-use crate::config::{GamepadAction, GamepadConfig, GamepadPreset, gamepad_button_code};
+use crate::config::{
+    GamepadAction, GamepadConfig, GamepadMode, GamepadNaviConfig, GamepadPointerAccelConfig,
+    GamepadPointerStick, GamepadPreset, NaviAction, PointerButton, gamepad_axis_code,
+    gamepad_button_code, parse_navi_action,
+};
 use crate::wayland::WakeHandle;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
@@ -15,28 +20,168 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const ACTION_QUEUE: usize = 32;
+const ACTION_QUEUE: usize = 512;
 const POLL_TIMEOUT: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: 200_000_000,
 };
+const NAVI_POLL_TIMEOUT: Timespec = Timespec {
+    tv_sec: 0,
+    tv_nsec: 8_000_000,
+};
+const NAVI_TICK: Duration = Duration::from_millis(8);
 const HOTPLUG_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const HOTPLUG_SLEEP_SLICE: Duration = Duration::from_millis(100);
 const READER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const GAMEPAD_EVENT_SUFFIXES: [&str; 2] = ["-event-joystick", "-event-gamepad"];
 const BY_ID_DIR: &str = "/dev/input/by-id";
 
+/// High-level input or output change emitted by a controller.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GamepadEvent {
+    /// An existing manual-XMB action (including Open).
+    Xmb(GamepadAction),
+    /// An immediate desktop-navigation action.
+    Navi(NaviAction),
+    PointerMotion {
+        dx: f32,
+        dy: f32,
+    },
+    PointerButton {
+        button: u16,
+        pressed: bool,
+    },
+    PointerScroll {
+        steps: f32,
+    },
+    ModeChanged(GamepadMode),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AccelRuntime {
+    enabled: bool,
+    decel_floor: f32,
+    boost_cap: f32,
+    smoothing_secs: f32,
+}
+
+impl AccelRuntime {
+    fn from_config(config: &GamepadPointerAccelConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            decel_floor: config.decel_floor,
+            boost_cap: config.boost_cap,
+            smoothing_secs: config.smoothing_ms / 1000.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PointerRuntime {
+    enabled: bool,
+    stick_left: bool,
+    deadzone: f32,
+    curve: f32,
+    speed: f32,
+    max_step: f32,
+    invert_y: bool,
+    scroll_left: bool,
+    scroll_deadzone: f32,
+    scroll_speed: f32,
+    trigger_deadzone: f32,
+    trigger_curve: f32,
+    accel: AccelRuntime,
+    scroll_accel: AccelRuntime,
+}
+
+#[derive(Debug, Clone)]
+struct LayerRuntime {
+    hold_buttons: HashSet<u16>,
+    hold_axes: HashMap<u16, f32>,
+    bindings: HashMap<u16, NaviAction>,
+}
+
+#[derive(Debug, Clone)]
+struct NaviRuntime {
+    mode_toggle: HashSet<u16>,
+    default_mode: GamepadMode,
+    grab_in_navi: bool,
+    reset_on_disconnect: bool,
+    pointer: PointerRuntime,
+    bindings: HashMap<u16, NaviAction>,
+    layers: Vec<LayerRuntime>,
+}
+
+impl NaviRuntime {
+    fn from_config(config: &GamepadConfig) -> Result<Self> {
+        let navi: &GamepadNaviConfig = &config.navi;
+        let pointer = &navi.pointer;
+        Ok(Self {
+            mode_toggle: config.mode_toggle_codes()?,
+            default_mode: config.mode.default,
+            grab_in_navi: config.mode.grab_in_navi,
+            reset_on_disconnect: config.mode.reset_on_disconnect,
+            pointer: PointerRuntime {
+                enabled: pointer.enabled,
+                stick_left: pointer.stick == GamepadPointerStick::Left,
+                deadzone: pointer.deadzone,
+                curve: pointer.curve,
+                speed: pointer.speed,
+                max_step: pointer.max_step,
+                invert_y: pointer.invert_y,
+                scroll_left: pointer.scroll_stick == GamepadPointerStick::Left,
+                scroll_deadzone: pointer.scroll_deadzone,
+                scroll_speed: pointer.scroll_speed,
+                trigger_deadzone: pointer.trigger_deadzone,
+                trigger_curve: pointer.trigger_curve,
+                accel: AccelRuntime::from_config(&pointer.accel),
+                scroll_accel: AccelRuntime::from_config(&pointer.scroll_accel),
+            },
+            bindings: navi_action_map(&navi.bindings)?,
+            layers: navi
+                .layers
+                .values()
+                .map(|layer| {
+                    let mut hold_buttons = HashSet::new();
+                    for button in &layer.hold {
+                        hold_buttons.insert(gamepad_button_code(button)?);
+                    }
+                    let mut hold_axes = HashMap::new();
+                    for axis in &layer.hold_axes {
+                        hold_axes.insert(gamepad_axis_code(&axis.axis)?, axis.threshold);
+                    }
+                    Ok(LayerRuntime {
+                        hold_buttons,
+                        hold_axes,
+                        bindings: navi_action_map(&layer.bindings)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+}
+
+fn navi_action_map(
+    bindings: &std::collections::BTreeMap<String, String>,
+) -> Result<HashMap<u16, NaviAction>> {
+    bindings
+        .iter()
+        .map(|(button, action)| Ok((gamepad_button_code(button)?, parse_navi_action(action)?)))
+        .collect()
+}
+
 /// A running gamepad hotplug watcher.
 ///
 /// Dropping the service stops the watcher and joins every reader. The receiver
 /// is drained by the daemon loop after it is woken.
 pub struct GamepadService {
-    rx: Receiver<GamepadAction>,
+    rx: Receiver<GamepadEvent>,
     stop: Arc<AtomicBool>,
+    mode: Arc<AtomicU8>,
     supervisor: Option<JoinHandle<()>>,
 }
 
@@ -62,8 +207,16 @@ impl GamepadService {
                 return None;
             }
         };
+        let navi = match NaviRuntime::from_config(config) {
+            Ok(navi) => Arc::new(navi),
+            Err(error) => {
+                tracing::error!(%error, "gamepad navi config is invalid; gamepad input disabled");
+                return None;
+            }
+        };
         let (tx, rx) = bounded(ACTION_QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
+        let mode = Arc::new(AtomicU8::new(mode_to_u8(navi.default_mode)));
         let config = Arc::new(config.clone());
         let combo_codes = Arc::new(combo_codes);
         let supervisor = {
@@ -72,14 +225,17 @@ impl GamepadService {
             let stop = Arc::clone(&stop);
             let config = Arc::clone(&config);
             let combo_codes = Arc::clone(&combo_codes);
+            let navi = Arc::clone(&navi);
+            let mode = Arc::clone(&mode);
             thread::Builder::new()
                 .name("niri-xmb-gamepad-hotplug".into())
-                .spawn(move || supervisor_loop(config, combo_codes, tx, wake, stop))
+                .spawn(move || supervisor_loop(config, combo_codes, navi, mode, tx, wake, stop))
         };
         match supervisor {
             Ok(handle) => Some(Self {
                 rx,
                 stop,
+                mode,
                 supervisor: Some(handle),
             }),
             Err(error) => {
@@ -92,9 +248,51 @@ impl GamepadService {
         }
     }
 
-    /// Next queued action, if any. Called by the daemon loop after a wake.
-    pub fn try_recv(&self) -> Option<GamepadAction> {
+    /// Current game/navi mode.
+    pub fn mode(&self) -> GamepadMode {
+        mode_from_u8(self.mode.load(Ordering::Relaxed))
+    }
+
+    /// Next queued event, if any. Called by the daemon loop after a wake.
+    pub fn try_recv(&self) -> Option<GamepadEvent> {
         self.rx.try_recv().ok()
+    }
+}
+
+fn mode_to_u8(mode: GamepadMode) -> u8 {
+    match mode {
+        GamepadMode::Game => 0,
+        GamepadMode::Navi => 1,
+    }
+}
+
+fn mode_from_u8(mode: u8) -> GamepadMode {
+    if mode == 1 {
+        GamepadMode::Navi
+    } else {
+        GamepadMode::Game
+    }
+}
+
+fn toggle_mode(mode: &AtomicU8) -> GamepadMode {
+    loop {
+        let current = mode.load(Ordering::Relaxed);
+        let next = if current == mode_to_u8(GamepadMode::Game) {
+            GamepadMode::Navi
+        } else {
+            GamepadMode::Game
+        };
+        if mode
+            .compare_exchange(
+                current,
+                mode_to_u8(next),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return next;
+        }
     }
 }
 
@@ -403,6 +601,474 @@ impl HatTracker {
     }
 }
 
+#[derive(Debug, Default)]
+struct ComboTracker {
+    codes: HashSet<u16>,
+    down: HashSet<u16>,
+    fired: bool,
+}
+
+impl ComboTracker {
+    fn new(codes: HashSet<u16>) -> Self {
+        Self {
+            codes,
+            ..Self::default()
+        }
+    }
+
+    /// Returns true on the press that completes the combo.
+    fn feed(&mut self, code: u16, value: i32) -> bool {
+        if !self.codes.contains(&code) {
+            return false;
+        }
+        match value {
+            1 => {
+                self.down.insert(code);
+                if !self.fired && self.down.len() == self.codes.len() {
+                    self.fired = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            0 => {
+                self.down.remove(&code);
+                self.fired = false;
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TriggerAccel {
+    config: AccelRuntime,
+    multiplier: f32,
+}
+
+impl TriggerAccel {
+    fn new(config: AccelRuntime) -> Self {
+        Self {
+            config,
+            multiplier: 1.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.multiplier = 1.0;
+    }
+
+    fn step(&mut self, lt: f32, rt: f32, deadzone: f32, curve: f32, dt: f32) -> f32 {
+        let target = if self.config.enabled {
+            let lt = shape_trigger(lt, deadzone, curve);
+            let rt = shape_trigger(rt, deadzone, curve);
+            self.config.decel_floor.powf(lt) * self.config.boost_cap.powf(rt)
+        } else {
+            1.0
+        };
+        if self.config.smoothing_secs <= 0.0 {
+            self.multiplier = target;
+        } else {
+            let alpha = 1.0 - (-dt / self.config.smoothing_secs).exp();
+            self.multiplier += (target - self.multiplier) * alpha;
+        }
+        self.multiplier
+    }
+}
+
+fn shape_trigger(value: f32, deadzone: f32, curve: f32) -> f32 {
+    let value = ((value.clamp(0.0, 1.0) - deadzone) / (1.0 - deadzone).max(0.001)).clamp(0.0, 1.0);
+    value.powf(curve.max(0.05))
+}
+
+struct NaviTracker {
+    navi: Arc<NaviRuntime>,
+    ranges: HashMap<u16, (i32, i32)>,
+    pressed: HashSet<u16>,
+    pointer_hold: HashMap<u16, PointerButton>,
+    axes: HashMap<u16, f32>,
+    hat_x: i32,
+    hat_y: i32,
+    hat_active: [bool; 4],
+    key_down: [bool; 4],
+    last_tick: Instant,
+    scroll_remainder: f32,
+    pointer_accel: TriggerAccel,
+    scroll_accel: TriggerAccel,
+}
+
+impl NaviTracker {
+    fn new(navi: Arc<NaviRuntime>, ranges: HashMap<u16, (i32, i32)>) -> Self {
+        let pointer_accel = TriggerAccel::new(navi.pointer.accel);
+        let scroll_accel = TriggerAccel::new(navi.pointer.scroll_accel);
+        Self {
+            navi,
+            ranges,
+            pressed: HashSet::new(),
+            pointer_hold: HashMap::new(),
+            axes: HashMap::new(),
+            hat_x: 0,
+            hat_y: 0,
+            hat_active: [false; 4],
+            key_down: [false; 4],
+            last_tick: Instant::now(),
+            scroll_remainder: 0.0,
+            pointer_accel,
+            scroll_accel,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.pressed.clear();
+        self.pointer_hold.clear();
+        self.hat_x = 0;
+        self.hat_y = 0;
+        self.hat_active = [false; 4];
+        self.key_down = [false; 4];
+        self.axes.clear();
+        self.last_tick = Instant::now();
+        self.scroll_remainder = 0.0;
+        self.pointer_accel.reset();
+        self.scroll_accel.reset();
+    }
+
+    fn update(&mut self, event: &InputEvent) -> Vec<GamepadEvent> {
+        let mut events = Vec::new();
+        match event.event_type() {
+            EventType::KEY => self.key_event(event.code(), event.value(), &mut events),
+            EventType::ABSOLUTE => self.absolute_event(event.code(), event.value(), &mut events),
+            _ => {}
+        }
+        events
+    }
+
+    fn key_event(&mut self, code: u16, value: i32, events: &mut Vec<GamepadEvent>) {
+        if let Some(index) = dpad_index(code) {
+            match value {
+                1 if !self.key_down[index] => {
+                    self.key_down[index] = true;
+                    if !self.hat_active[index]
+                        && let Some(event) = self.button_event(code, true)
+                    {
+                        events.push(event);
+                    }
+                }
+                0 if self.key_down[index] => {
+                    self.key_down[index] = false;
+                    if !self.hat_active[index]
+                        && let Some(event) = self.button_event(code, false)
+                    {
+                        events.push(event);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match value {
+            1 if self.pressed.insert(code) => {
+                if let Some(event) = self.action_event(code) {
+                    events.push(event);
+                }
+            }
+            0 if self.pressed.remove(&code) => {
+                if let Some(button) = self.pointer_hold.remove(&code) {
+                    events.push(GamepadEvent::PointerButton {
+                        button: button.code(),
+                        pressed: false,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn absolute_event(&mut self, code: u16, value: i32, events: &mut Vec<GamepadEvent>) {
+        if code == AbsoluteAxisCode::ABS_HAT0X.0 {
+            self.hat_event(HatAxis::X, value, events);
+        } else if code == AbsoluteAxisCode::ABS_HAT0Y.0 {
+            self.hat_event(HatAxis::Y, value, events);
+        } else if code == AbsoluteAxisCode::ABS_Z.0 || code == AbsoluteAxisCode::ABS_RZ.0 {
+            let (min, max) = self.ranges.get(&code).copied().unwrap_or((0, 255));
+            self.axes.insert(code, normalize_unsigned(value, min, max));
+        } else if code == AbsoluteAxisCode::ABS_X.0
+            || code == AbsoluteAxisCode::ABS_Y.0
+            || code == AbsoluteAxisCode::ABS_RX.0
+            || code == AbsoluteAxisCode::ABS_RY.0
+        {
+            let (min, max) = self.ranges.get(&code).copied().unwrap_or((-32768, 32767));
+            self.axes.insert(code, normalize_signed(value, min, max));
+        }
+    }
+
+    fn hat_event(&mut self, axis: HatAxis, value: i32, events: &mut Vec<GamepadEvent>) {
+        let old = match axis {
+            HatAxis::X => self.hat_x,
+            HatAxis::Y => self.hat_y,
+        };
+        let new = value.signum();
+        if new == old {
+            return;
+        }
+        if let Some(index) = hat_direction(axis, old)
+            && self.hat_active[index]
+        {
+            self.hat_active[index] = false;
+            // If the corresponding key is still held, it takes ownership and
+            // its release will emit the button-up.
+            if !self.key_down[index]
+                && let Some(event) = self.button_event(dpad_code(index), false)
+            {
+                events.push(event);
+            }
+        }
+        match axis {
+            HatAxis::X => self.hat_x = new,
+            HatAxis::Y => self.hat_y = new,
+        }
+        let Some(index) = hat_direction(axis, new) else {
+            return;
+        };
+        self.hat_active[index] = true;
+        if !self.key_down[index]
+            && let Some(event) = self.button_event(dpad_code(index), true)
+        {
+            events.push(event);
+        }
+    }
+
+    fn button_event(&mut self, code: u16, pressed: bool) -> Option<GamepadEvent> {
+        if pressed {
+            if !self.pressed.insert(code) {
+                return None;
+            }
+            let action = self.action_for(code)?;
+            match action {
+                NaviAction::Pointer(button) => {
+                    self.pointer_hold.insert(code, button);
+                    Some(GamepadEvent::PointerButton {
+                        button: button.code(),
+                        pressed: true,
+                    })
+                }
+                NaviAction::Scroll(direction) => Some(GamepadEvent::PointerScroll {
+                    steps: direction as f32,
+                }),
+                NaviAction::Niri(action) => Some(GamepadEvent::Navi(NaviAction::Niri(action))),
+                NaviAction::XmbOpen => Some(GamepadEvent::Navi(NaviAction::XmbOpen)),
+            }
+        } else {
+            self.pressed.remove(&code);
+            self.pointer_hold
+                .remove(&code)
+                .map(|button| GamepadEvent::PointerButton {
+                    button: button.code(),
+                    pressed: false,
+                })
+        }
+    }
+
+    fn action_event(&mut self, code: u16) -> Option<GamepadEvent> {
+        let action = self.action_for(code)?;
+        match action {
+            NaviAction::Pointer(button) => {
+                self.pointer_hold.insert(code, button);
+                Some(GamepadEvent::PointerButton {
+                    button: button.code(),
+                    pressed: true,
+                })
+            }
+            NaviAction::Scroll(direction) => Some(GamepadEvent::PointerScroll {
+                steps: direction as f32,
+            }),
+            NaviAction::Niri(action) => Some(GamepadEvent::Navi(NaviAction::Niri(action))),
+            NaviAction::XmbOpen => Some(GamepadEvent::Navi(NaviAction::XmbOpen)),
+        }
+    }
+
+    fn action_for(&self, code: u16) -> Option<NaviAction> {
+        self.active_layer()
+            .and_then(|layer| layer.bindings.get(&code).copied())
+            .or_else(|| self.navi.bindings.get(&code).copied())
+    }
+
+    fn active_layer(&self) -> Option<&LayerRuntime> {
+        self.navi.layers.iter().find(|layer| {
+            layer
+                .hold_buttons
+                .iter()
+                .all(|code| self.pressed.contains(code))
+                && layer.hold_axes.iter().all(|(code, threshold)| {
+                    self.axes.get(code).is_some_and(|value| value >= threshold)
+                })
+        })
+    }
+
+    fn tick(&mut self) -> Vec<GamepadEvent> {
+        let now = Instant::now();
+        let dt = now
+            .saturating_duration_since(self.last_tick)
+            .as_secs_f32()
+            .min(0.05);
+        if dt < NAVI_TICK.as_secs_f32() * 0.5 {
+            return Vec::new();
+        }
+        self.last_tick = now;
+        if !self.navi.pointer.enabled {
+            return Vec::new();
+        }
+
+        let mut events = Vec::with_capacity(2);
+        let lt = self
+            .axes
+            .get(&AbsoluteAxisCode::ABS_Z.0)
+            .copied()
+            .unwrap_or(0.0);
+        let rt = self
+            .axes
+            .get(&AbsoluteAxisCode::ABS_RZ.0)
+            .copied()
+            .unwrap_or(0.0);
+        let trigger_deadzone = self.navi.pointer.trigger_deadzone;
+        let trigger_curve = self.navi.pointer.trigger_curve;
+        let pointer_multiplier =
+            self.pointer_accel
+                .step(lt, rt, trigger_deadzone, trigger_curve, dt);
+
+        let (stick_x, stick_y) = if self.navi.pointer.stick_left {
+            self.stick(AbsoluteAxisCode::ABS_X, AbsoluteAxisCode::ABS_Y)
+        } else {
+            self.stick(AbsoluteAxisCode::ABS_RX, AbsoluteAxisCode::ABS_RY)
+        };
+        let (x, y) = apply_radial_deadzone(stick_x, stick_y, self.navi.pointer.deadzone);
+        let x = shape(x, self.navi.pointer.curve);
+        let mut y = shape(y, self.navi.pointer.curve);
+        if self.navi.pointer.invert_y {
+            y = -y;
+        }
+        let dx = clamp_step(
+            x * self.navi.pointer.speed * pointer_multiplier * dt,
+            self.navi.pointer.max_step,
+        );
+        let dy = clamp_step(
+            y * self.navi.pointer.speed * pointer_multiplier * dt,
+            self.navi.pointer.max_step,
+        );
+        if dx.abs() > 0.01 || dy.abs() > 0.01 {
+            events.push(GamepadEvent::PointerMotion { dx, dy });
+        }
+
+        let (_scroll_x, scroll_y) = if self.navi.pointer.scroll_left {
+            self.stick(AbsoluteAxisCode::ABS_X, AbsoluteAxisCode::ABS_Y)
+        } else {
+            self.stick(AbsoluteAxisCode::ABS_RX, AbsoluteAxisCode::ABS_RY)
+        };
+        let scroll = apply_deadzone(scroll_y, self.navi.pointer.scroll_deadzone);
+        let scroll_multiplier = self
+            .scroll_accel
+            .step(lt, rt, trigger_deadzone, trigger_curve, dt);
+        self.scroll_remainder += scroll * self.navi.pointer.scroll_speed * scroll_multiplier * dt;
+        if self.scroll_remainder.abs() >= 0.01 {
+            events.push(GamepadEvent::PointerScroll {
+                steps: self.scroll_remainder,
+            });
+            self.scroll_remainder = 0.0;
+        }
+        events
+    }
+
+    fn stick(&self, axis_x: AbsoluteAxisCode, axis_y: AbsoluteAxisCode) -> (f32, f32) {
+        (
+            self.axes.get(&axis_x.0).copied().unwrap_or(0.0),
+            self.axes.get(&axis_y.0).copied().unwrap_or(0.0),
+        )
+    }
+}
+
+fn device_axis_ranges(device: &Device) -> HashMap<u16, (i32, i32)> {
+    device
+        .get_absinfo()
+        .ok()
+        .into_iter()
+        .flatten()
+        .map(|(code, info)| (code.0, (info.minimum(), info.maximum())))
+        .collect()
+}
+
+fn normalize_signed(value: i32, min: i32, max: i32) -> f32 {
+    let center = (min as f32 + max as f32) * 0.5;
+    let half = (max as f32 - min as f32) * 0.5;
+    if half <= 0.0 {
+        0.0
+    } else {
+        ((value as f32 - center) / half).clamp(-1.0, 1.0)
+    }
+}
+
+fn normalize_unsigned(value: i32, min: i32, max: i32) -> f32 {
+    if max <= min {
+        0.0
+    } else {
+        ((value as f32 - min as f32) / (max as f32 - min as f32)).clamp(0.0, 1.0)
+    }
+}
+
+fn apply_radial_deadzone(x: f32, y: f32, deadzone: f32) -> (f32, f32) {
+    let magnitude = (x * x + y * y).sqrt();
+    if magnitude <= deadzone || magnitude == 0.0 {
+        return (0.0, 0.0);
+    }
+    let scale = ((magnitude - deadzone) / (1.0 - deadzone).max(0.001)).min(1.0);
+    (x / magnitude * scale, y / magnitude * scale)
+}
+
+fn apply_deadzone(value: f32, deadzone: f32) -> f32 {
+    let magnitude = value.abs();
+    if magnitude <= deadzone {
+        0.0
+    } else {
+        value.signum() * ((magnitude - deadzone) / (1.0 - deadzone).max(0.001))
+    }
+}
+
+fn shape(value: f32, curve: f32) -> f32 {
+    value.signum() * value.abs().powf(curve.max(0.05))
+}
+
+fn clamp_step(value: f32, max_step: f32) -> f32 {
+    if max_step <= 0.0 {
+        0.0
+    } else {
+        value.clamp(-max_step, max_step)
+    }
+}
+
+fn apply_mode_grab(device: &mut Device, mode: GamepadMode, grab_in_navi: bool, path: &Path) {
+    match (mode, grab_in_navi) {
+        (GamepadMode::Navi, true) => {
+            if let Err(error) = device.grab() {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "cannot grab gamepad for navi mode"
+                );
+            }
+        }
+        (GamepadMode::Game, _) => {
+            if let Err(error) = device.ungrab() {
+                tracing::debug!(
+                    path = %path.display(),
+                    %error,
+                    "cannot ungrab gamepad after navi mode"
+                );
+            }
+        }
+        (GamepadMode::Navi, false) => {}
+    }
+}
+
 pub(crate) fn is_gamepad_event_name(name: &str) -> bool {
     GAMEPAD_EVENT_SUFFIXES
         .iter()
@@ -461,7 +1127,9 @@ fn hotplug_diff(desired: &[PathBuf], active: &HashSet<PathBuf>) -> (Vec<PathBuf>
 fn supervisor_loop(
     config: Arc<GamepadConfig>,
     combo_codes: Arc<HashSet<u16>>,
-    tx: Sender<GamepadAction>,
+    navi: Arc<NaviRuntime>,
+    mode: Arc<AtomicU8>,
+    tx: Sender<GamepadEvent>,
     wake: WakeHandle,
     stop: Arc<AtomicBool>,
 ) {
@@ -469,7 +1137,12 @@ fn supervisor_loop(
     let mut retry_at: HashMap<PathBuf, Instant> = HashMap::new();
     let mut failures: HashSet<PathBuf> = HashSet::new();
     let mut skipped: HashSet<PathBuf> = HashSet::new();
-    tracing::info!(combo = combo_codes.len(), "gamepad hotplug watcher started");
+    let mut had_active = false;
+    tracing::info!(
+        combo = combo_codes.len(),
+        mode = ?navi.default_mode,
+        "gamepad hotplug watcher started"
+    );
 
     while !stop.load(Ordering::Relaxed) {
         let desired = discover_devices(&config.devices);
@@ -514,9 +1187,10 @@ fn supervisor_loop(
             if retry_at.get(&path).is_some_and(|until| now < *until) {
                 continue;
             }
-            match start_reader(&path, &config, &combo_codes, &tx, &wake) {
+            match start_reader(&path, &config, &combo_codes, &navi, &mode, &tx, &wake) {
                 Ok(Some(reader)) => {
                     active.insert(path.clone(), reader);
+                    had_active = true;
                     retry_at.remove(&path);
                     failures.remove(&path);
                     skipped.remove(&path);
@@ -539,6 +1213,17 @@ fn supervisor_loop(
             }
         }
 
+        if had_active
+            && active.is_empty()
+            && desired.is_empty()
+            && navi.reset_on_disconnect
+            && mode_from_u8(mode.load(Ordering::Relaxed)) != GamepadMode::Game
+        {
+            mode.store(mode_to_u8(GamepadMode::Game), Ordering::Relaxed);
+            let _ = tx.try_send(GamepadEvent::ModeChanged(GamepadMode::Game));
+            had_active = false;
+        }
+
         let deadline = Instant::now() + HOTPLUG_POLL_INTERVAL;
         while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
             thread::sleep(HOTPLUG_SLEEP_SLICE);
@@ -557,7 +1242,9 @@ fn start_reader(
     path: &Path,
     config: &GamepadConfig,
     combo_codes: &HashSet<u16>,
-    tx: &Sender<GamepadAction>,
+    navi: &NaviRuntime,
+    mode: &Arc<AtomicU8>,
+    tx: &Sender<GamepadEvent>,
     wake: &WakeHandle,
 ) -> Result<Option<ActiveReader>> {
     let device =
@@ -571,11 +1258,13 @@ fn start_reader(
     };
     let bindings = binding_map_for(config, preset)
         .with_context(|| format!("gamepad bindings for {}", path.display()))?;
-    if !has_gamepad_input(&bindings, combo_codes) {
+    let navi_has_input =
+        navi.pointer.enabled || !navi.bindings.is_empty() || !navi.layers.is_empty();
+    if !has_gamepad_input(&bindings, combo_codes) && !navi_has_input {
         tracing::warn!(
             path = %path.display(),
             preset = ?preset,
-            "gamepad has no button bindings or open combo; skipping"
+            "gamepad has no button bindings, open combo, or navi input; skipping"
         );
         return Ok(None);
     }
@@ -584,6 +1273,8 @@ fn start_reader(
     let binding_count = bindings.len();
     let bindings = Arc::new(bindings);
     let combo_codes = combo_codes.clone();
+    let navi = Arc::new(navi.clone());
+    let mode = Arc::clone(mode);
     let reader_stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&reader_stop);
     let thread_path = path.to_path_buf();
@@ -597,6 +1288,8 @@ fn start_reader(
                 device,
                 bindings,
                 combo_codes,
+                navi,
+                mode,
                 tx,
                 wake,
                 thread_stop,
@@ -616,24 +1309,78 @@ fn start_reader(
     }))
 }
 
+fn queue_gamepad_event(
+    tx: &Sender<GamepadEvent>,
+    event: GamepadEvent,
+    full_logged: &mut bool,
+) -> Result<bool, ()> {
+    match tx.try_send(event) {
+        Ok(()) => Ok(true),
+        Err(TrySendError::Full(_)) => {
+            if !*full_logged {
+                *full_logged = true;
+                tracing::warn!("gamepad event queue full; dropping input");
+            }
+            Ok(false)
+        }
+        Err(TrySendError::Disconnected(_)) => Err(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn reader_loop(
     path: PathBuf,
     mut device: Device,
     bindings: Arc<HashMap<u16, GamepadAction>>,
     combo_codes: HashSet<u16>,
-    tx: Sender<GamepadAction>,
+    navi: Arc<NaviRuntime>,
+    mode: Arc<AtomicU8>,
+    tx: Sender<GamepadEvent>,
     wake: WakeHandle,
     stop: Arc<AtomicBool>,
 ) {
-    let mut tracker = HatTracker::new(combo_codes);
+    let ranges = device_axis_ranges(&device);
+    let mut xmb_tracker = HatTracker::new(combo_codes);
+    let mut navi_tracker = NaviTracker::new(Arc::clone(&navi), ranges);
+    let mut mode_combo = ComboTracker::new(navi.mode_toggle.clone());
+    let mut last_mode = mode_from_u8(mode.load(Ordering::Relaxed));
+    apply_mode_grab(&mut device, last_mode, navi.grab_in_navi, &path);
     let mut full_logged = false;
+
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
+
+        let observed_mode = mode_from_u8(mode.load(Ordering::Relaxed));
+        if observed_mode != last_mode {
+            apply_mode_grab(&mut device, observed_mode, navi.grab_in_navi, &path);
+            navi_tracker.reset();
+            last_mode = observed_mode;
+        }
+
+        let timeout = if last_mode == GamepadMode::Navi {
+            &NAVI_POLL_TIMEOUT
+        } else {
+            &POLL_TIMEOUT
+        };
         let mut fds = [PollFd::new(&device, PollFlags::IN)];
-        match poll(&mut fds, Some(&POLL_TIMEOUT)) {
-            Ok(0) => continue,
+        match poll(&mut fds, Some(timeout)) {
+            Ok(0) => {
+                if last_mode == GamepadMode::Navi {
+                    let mut sent = false;
+                    for event in navi_tracker.tick() {
+                        let Ok(queued) = queue_gamepad_event(&tx, event, &mut full_logged) else {
+                            return;
+                        };
+                        sent |= queued;
+                    }
+                    if sent {
+                        wake.wake();
+                    }
+                }
+                continue;
+            }
             Ok(_) => {
                 let ready = fds[0].revents();
                 if ready.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
@@ -650,30 +1397,60 @@ fn reader_loop(
             }
         }
 
-        let mut sent = false;
-        match device.fetch_events() {
-            Ok(events) => {
-                for event in events {
-                    let Some(action) = tracker.update(&event, &bindings) else {
-                        continue;
-                    };
-                    match tx.try_send(action) {
-                        Ok(()) => sent = true,
-                        Err(TrySendError::Full(_)) => {
-                            if !full_logged {
-                                full_logged = true;
-                                tracing::warn!("gamepad action queue full; dropping button input");
-                            }
-                        }
-                        Err(TrySendError::Disconnected(_)) => return,
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+        let events = match device.fetch_events() {
+            Ok(events) => events.collect::<Vec<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Vec::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Vec::new(),
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "gamepad read failed");
                 break;
+            }
+        };
+
+        let mut sent = false;
+        for event in events {
+            if event.event_type() == EventType::KEY && mode_combo.feed(event.code(), event.value())
+            {
+                let next = toggle_mode(&mode);
+                apply_mode_grab(&mut device, next, navi.grab_in_navi, &path);
+                navi_tracker.reset();
+                last_mode = next;
+                let Ok(queued) =
+                    queue_gamepad_event(&tx, GamepadEvent::ModeChanged(next), &mut full_logged)
+                else {
+                    return;
+                };
+                sent |= queued;
+                continue;
+            }
+
+            if let Some(action) = xmb_tracker.update(&event, &bindings)
+                && last_mode == GamepadMode::Navi
+            {
+                let Ok(queued) =
+                    queue_gamepad_event(&tx, GamepadEvent::Xmb(action), &mut full_logged)
+                else {
+                    return;
+                };
+                sent |= queued;
+            }
+
+            if last_mode == GamepadMode::Navi {
+                for navi_event in navi_tracker.update(&event) {
+                    let Ok(queued) = queue_gamepad_event(&tx, navi_event, &mut full_logged) else {
+                        return;
+                    };
+                    sent |= queued;
+                }
+            }
+        }
+
+        if last_mode == GamepadMode::Navi {
+            for event in navi_tracker.tick() {
+                let Ok(queued) = queue_gamepad_event(&tx, event, &mut full_logged) else {
+                    return;
+                };
+                sent |= queued;
             }
         }
         if sent {
@@ -701,6 +1478,7 @@ mod tests {
                 .map(|(name, action)| ((*name).to_string(), *action))
                 .collect(),
             open_combo: Vec::new(),
+            ..GamepadConfig::default()
         }
     }
 
@@ -729,6 +1507,18 @@ mod tests {
 
     fn combo_tracker(codes: &[KeyCode]) -> HatTracker {
         HatTracker::new(codes.iter().map(|code| code.0).collect())
+    }
+
+    fn navi_tracker() -> NaviTracker {
+        let config = GamepadConfig::default();
+        NaviTracker::new(
+            Arc::new(NaviRuntime::from_config(&config).unwrap()),
+            HashMap::new(),
+        )
+    }
+
+    fn abs(axis: AbsoluteAxisCode, value: i32) -> InputEvent {
+        InputEvent::new(EventType::ABSOLUTE.0, axis.0, value)
     }
 
     #[test]
@@ -808,6 +1598,14 @@ mod tests {
     }
 
     #[test]
+    fn xbox_and_ds4_presets_are_intentionally_positionally_identical() {
+        // Linux exposes both families through the same positional key codes.
+        // Keep separate constants for future divergence; this catches an
+        // accidental one-sided edit without treating the duplication as drift.
+        assert_eq!(XBOX_PRESET, DS4_PRESET);
+    }
+
+    #[test]
     fn explicit_overrides_win_over_a_preset_by_code() {
         let config = GamepadConfig {
             enabled: true,
@@ -818,6 +1616,7 @@ mod tests {
                 ("BTN_EAST".into(), GamepadAction::Tab),
             ]),
             open_combo: Vec::new(),
+            ..GamepadConfig::default()
         };
         let map = binding_map_for(&config, GamepadPreset::Xbox).unwrap();
         assert_eq!(map.get(&KeyCode::BTN_SOUTH.0), Some(&GamepadAction::Close));
@@ -1062,6 +1861,180 @@ mod tests {
             tracker.update(&hat(AbsoluteAxisCode::ABS_X, 100), &map),
             None
         );
+    }
+
+    #[test]
+    fn mode_combo_toggles_once_until_release() {
+        let mut combo =
+            ComboTracker::new(HashSet::from([KeyCode::BTN_MODE.0, KeyCode::BTN_START.0]));
+        assert!(!combo.feed(KeyCode::BTN_MODE.0, 1));
+        assert!(combo.feed(KeyCode::BTN_START.0, 1));
+        assert!(!combo.feed(KeyCode::BTN_START.0, 2));
+        assert!(!combo.feed(KeyCode::BTN_START.0, 0));
+        assert!(combo.feed(KeyCode::BTN_START.0, 1));
+    }
+
+    #[test]
+    fn navi_mode_atomic_round_trips() {
+        let mode = AtomicU8::new(mode_to_u8(GamepadMode::Game));
+        assert_eq!(toggle_mode(&mode), GamepadMode::Navi);
+        assert_eq!(
+            mode_from_u8(mode.load(Ordering::Relaxed)),
+            GamepadMode::Navi
+        );
+        assert_eq!(toggle_mode(&mode), GamepadMode::Game);
+        assert_eq!(
+            mode_from_u8(mode.load(Ordering::Relaxed)),
+            GamepadMode::Game
+        );
+    }
+
+    #[test]
+    fn navi_base_maps_clicks_and_xmb_open() {
+        let mut tracker = navi_tracker();
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_SOUTH, 1)),
+            vec![GamepadEvent::PointerButton {
+                button: PointerButton::Left.code(),
+                pressed: true,
+            }]
+        );
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_SOUTH, 0)),
+            vec![GamepadEvent::PointerButton {
+                button: PointerButton::Left.code(),
+                pressed: false,
+            }]
+        );
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_NORTH, 1)),
+            vec![GamepadEvent::Navi(NaviAction::XmbOpen)]
+        );
+    }
+
+    #[test]
+    fn navi_layers_resolve_dpad_and_trigger_holds() {
+        let mut tracker = navi_tracker();
+        assert!(tracker.update(&key(KeyCode::BTN_TL, 1)).is_empty());
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_DPAD_LEFT, 1)),
+            vec![GamepadEvent::Navi(NaviAction::Niri(
+                crate::config::NaviNiriAction::FocusWorkspacePrev
+            ))]
+        );
+        tracker.update(&key(KeyCode::BTN_DPAD_LEFT, 0));
+        tracker.update(&key(KeyCode::BTN_TL, 0));
+
+        tracker.update(&abs(AbsoluteAxisCode::ABS_Z, 255));
+        tracker.update(&abs(AbsoluteAxisCode::ABS_RZ, 255));
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_DPAD_RIGHT, 1)),
+            vec![GamepadEvent::Navi(NaviAction::Niri(
+                crate::config::NaviNiriAction::FocusMonitorNext
+            ))]
+        );
+    }
+
+    #[test]
+    fn navi_hat_dpad_uses_the_same_layers() {
+        let mut tracker = navi_tracker();
+        tracker.update(&key(KeyCode::BTN_TL, 1));
+        assert_eq!(
+            tracker.update(&abs(AbsoluteAxisCode::ABS_HAT0X, -1)),
+            vec![GamepadEvent::Navi(NaviAction::Niri(
+                crate::config::NaviNiriAction::FocusWorkspacePrev
+            ))]
+        );
+        assert!(
+            tracker
+                .update(&abs(AbsoluteAxisCode::ABS_HAT0X, 0))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn navi_pointer_deadzone_and_motion() {
+        let mut tracker = navi_tracker();
+        tracker.update(&abs(AbsoluteAxisCode::ABS_X, 0));
+        tracker.last_tick = Instant::now() - Duration::from_millis(20);
+        assert!(tracker.tick().is_empty());
+
+        tracker.update(&abs(AbsoluteAxisCode::ABS_X, 32767));
+        tracker.last_tick = Instant::now() - Duration::from_millis(20);
+        let events = tracker.tick();
+        assert!(matches!(
+            events.as_slice(),
+            [GamepadEvent::PointerMotion { dx, .. }] if *dx > 0.0
+        ));
+    }
+
+    #[test]
+    fn trigger_accel_multiplier_targets_and_deadzone() {
+        let mut accel = TriggerAccel::new(AccelRuntime {
+            enabled: true,
+            decel_floor: 0.30,
+            boost_cap: 2.50,
+            smoothing_secs: 0.0,
+        });
+        assert!((accel.step(0.0, 0.0, 0.08, 1.0, 0.008) - 1.0).abs() < 1e-5);
+        assert!((accel.step(1.0, 0.0, 0.08, 1.0, 0.008) - 0.30).abs() < 1e-5);
+        assert!((accel.step(0.0, 1.0, 0.08, 1.0, 0.008) - 2.50).abs() < 1e-5);
+        assert!((accel.step(1.0, 1.0, 0.08, 1.0, 0.008) - 0.75).abs() < 1e-5);
+        assert!((accel.step(0.08, 0.0, 0.08, 1.0, 0.008) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn trigger_accel_smoothing_converges() {
+        let mut accel = TriggerAccel::new(AccelRuntime {
+            enabled: true,
+            decel_floor: 0.30,
+            boost_cap: 2.50,
+            smoothing_secs: 0.09,
+        });
+        let first = accel.step(0.0, 1.0, 0.08, 1.0, 0.09);
+        assert!(first > 1.0 && first < 2.5);
+        for _ in 0..20 {
+            accel.step(0.0, 1.0, 0.08, 1.0, 0.09);
+        }
+        assert!((accel.step(0.0, 1.0, 0.08, 1.0, 0.09) - 2.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn navi_pointer_tick_uses_trigger_accel() {
+        let mut tracker = navi_tracker();
+        tracker.pointer_accel = TriggerAccel::new(AccelRuntime {
+            enabled: true,
+            decel_floor: 0.30,
+            boost_cap: 2.50,
+            smoothing_secs: 0.0,
+        });
+        tracker.update(&abs(AbsoluteAxisCode::ABS_X, 32767));
+
+        tracker.last_tick = Instant::now() - Duration::from_millis(8);
+        let base = tracker.tick();
+        let base_dx = match base.as_slice() {
+            [GamepadEvent::PointerMotion { dx, .. }] => *dx,
+            _ => panic!("expected pointer motion: {base:?}"),
+        };
+
+        tracker.update(&abs(AbsoluteAxisCode::ABS_RZ, 255));
+        tracker.last_tick = Instant::now() - Duration::from_millis(8);
+        let boosted = tracker.tick();
+        let boosted_dx = match boosted.as_slice() {
+            [GamepadEvent::PointerMotion { dx, .. }] => *dx,
+            _ => panic!("expected boosted pointer motion: {boosted:?}"),
+        };
+        assert!(boosted_dx > base_dx);
+
+        tracker.update(&abs(AbsoluteAxisCode::ABS_RZ, 0));
+        tracker.update(&abs(AbsoluteAxisCode::ABS_Z, 255));
+        tracker.last_tick = Instant::now() - Duration::from_millis(8);
+        let slowed = tracker.tick();
+        let slowed_dx = match slowed.as_slice() {
+            [GamepadEvent::PointerMotion { dx, .. }] => *dx,
+            _ => panic!("expected slowed pointer motion: {slowed:?}"),
+        };
+        assert!(slowed_dx < base_dx);
     }
 
     #[test]

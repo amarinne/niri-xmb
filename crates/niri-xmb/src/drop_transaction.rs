@@ -272,6 +272,7 @@ fn action_step_name(step: ActionStep) -> &'static str {
         ActionStep::JoinLeft => "join-left",
         ActionStep::MoveFloatingWindow => "move-floating-window",
         ActionStep::RestoreFocus => "restore-focus",
+        ActionStep::Navi => "navi",
     }
 }
 

@@ -26,10 +26,29 @@ Gamepad input is off by default. The `[gamepad]` table selects a built-in
 16-bit codes to manual-popup actions. Explicit bindings override the preset.
 Flydigi VADER4 and other xpad-compatible pads auto-detect as `xbox`, and
 D-pad hat axes work even when the kernel sends no `BTN_DPAD_*` events.
+
+The controller starts in **game** mode: niri-xmb does not grab it, so games get
+normal input. `gamepad.mode.toggle` (default `BTN_MODE` + `BTN_START`) switches
+to **navi** mode, where niri-xmb grabs the controller and drives the desktop:
+left stick pointer, right stick scroll, face-button clicks, and hold layers for
+workspaces, window moves, and monitors. Toggle back to release the grab. The
+mode is exposed in `niri-xmb status`; the manual XMB keeps the existing
+`[gamepad.buttons]` context while it is open.
+
+In navi mode, analog triggers also shape pointer and scroll speed around the
+configured baseline: LT is a precision/deceleration control and RT is a boost.
+`trigger_deadzone`, `trigger_curve`, and the separate
+`[gamepad.navi.pointer.accel]` / `scroll_accel` floors, caps, and smoothing
+values control the response.
+
 `gamepad.open_combo` holds at least two unique buttons together on one
-controller to open the manual popup from hidden or peek; it is disabled by
-default, does nothing when the manual popup is already open, and suppresses
-repeats until a combo button is released.
+controller to open the manual popup from hidden or peek in navi mode; it is
+disabled by default, does nothing when the manual popup is already open, and
+suppresses repeats until a combo button is released.
+
+The current Flydigi xpad interface exposes the standard Xbox controls only.
+Full Vader 4 paddles and gyro require the DInput/vendor-HID mode and a virtual
+gamepad target; that is a separate follow-up phase.
 
 The daemon watches `/dev/input/by-id` and attaches/detaches controllers live;
 no restart is needed after plugging one in. Reading the event device still

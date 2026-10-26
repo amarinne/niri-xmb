@@ -159,6 +159,84 @@ open_combo = ["BTN_SELECT", "BTN_START"]
 # BTN_TL = "back"
 # BTN_TR = "tab"
 
+# Game/navi mode. The controller is not grabbed in game mode; navi mode grabs
+# it so games do not also receive navigation input. Toggle requires two unique
+# codes; the press that completes it is consumed.
+[gamepad.mode]
+default = "game"
+toggle = ["BTN_MODE", "BTN_START"]
+grab_in_navi = true
+reset_on_disconnect = true
+
+# Desktop pointer and scroll. Navi bindings are active only outside the manual
+# XMB; while the XMB is open, [gamepad.buttons] takes precedence.
+[gamepad.navi.pointer]
+enabled = true
+stick = "left"
+deadzone = 0.15
+curve = 1.6
+speed = 1200.0
+max_step = 48.0
+invert_y = false
+scroll_stick = "right"
+scroll_deadzone = 0.20
+scroll_speed = 6.0
+trigger_threshold = 0.35  # layer hold_axes only
+trigger_deadzone = 0.08   # analog trigger speed curve
+trigger_curve = 1.35
+
+# LT slows/precises the pointer; RT accelerates. The multiplier is
+# decel_floor^LT * boost_cap^RT, smoothed over smoothing_ms.
+[gamepad.navi.pointer.accel]
+enabled = true
+decel_floor = 0.30
+boost_cap = 2.50
+smoothing_ms = 90
+
+[gamepad.navi.pointer.scroll_accel]
+enabled = true
+decel_floor = 0.35
+boost_cap = 3.00
+smoothing_ms = 120
+
+[gamepad.navi.bindings]
+BTN_SOUTH = "pointer.left"          # A / Cross
+BTN_EAST = "pointer.right"          # B / Circle
+BTN_WEST = "pointer.middle"         # X / Square
+BTN_NORTH = "xmb.open"              # Y / Triangle
+BTN_START = "niri.toggle-overview"
+
+# Hold layers. D-pad actions call Niri directly, so they are immediate.
+[gamepad.navi.layers.workspace]
+hold = ["BTN_TL"]
+[gamepad.navi.layers.workspace.bindings]
+BTN_DPAD_LEFT = "niri.focus-workspace-prev"
+BTN_DPAD_RIGHT = "niri.focus-workspace-next"
+BTN_DPAD_UP = "niri.focus-window-prev"
+BTN_DPAD_DOWN = "niri.focus-window-next"
+
+[gamepad.navi.layers.window]
+hold = ["BTN_TR"]
+[gamepad.navi.layers.window.bindings]
+BTN_DPAD_LEFT = "niri.move-window-workspace-prev"
+BTN_DPAD_RIGHT = "niri.move-window-workspace-next"
+BTN_DPAD_UP = "niri.move-column-left"
+BTN_DPAD_DOWN = "niri.move-column-right"
+
+# Analog triggers normalize to 0.0..1.0; holding LT+RT activates the monitor
+# layer. D-pad left/right focuses outputs, up/down moves the focused window.
+[gamepad.navi.layers.monitor]
+hold_axes = [
+  { axis = "ABS_Z", threshold = 0.35 },
+  { axis = "ABS_RZ", threshold = 0.35 },
+]
+[gamepad.navi.layers.monitor.bindings]
+BTN_DPAD_LEFT = "niri.focus-monitor-prev"
+BTN_DPAD_RIGHT = "niri.focus-monitor-next"
+BTN_DPAD_UP = "niri.move-window-monitor-prev"
+BTN_DPAD_DOWN = "niri.move-window-monitor-next"
+BTN_SOUTH = "niri.focus-monitor-next"
+
 [animation]
 enabled = true        # false applies every visual change immediately
 panel_ms = 140.0    # panel transition, 0-60000 milliseconds
