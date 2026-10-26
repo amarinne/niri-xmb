@@ -136,11 +136,16 @@ close_on_escape = true       # Escape closes the popup
 # layout. Explicit buttons below override preset entries by evdev code.
 # D-pad hat axes (ABS_HAT0X/Y) are translated to the configured BTN_DPAD_*
 # actions, so controllers without BTN_DPAD_* key events work.
-# Actions: up, down, left, right, tab, back (previous output), confirm, close.
+# Actions: up, down, left, right, tab, back (previous output), confirm, close,
+# and open (show the manual popup from hidden/peek). open_combo holds at least
+# two unique button names/codes together; empty disables it. The completing
+# press emits open instead of that button's action, and repeats are suppressed
+# until a combo button is released.
 [gamepad]
 enabled = false
 preset = "auto"
 devices = []
+open_combo = ["BTN_SELECT", "BTN_START"]
 
 [gamepad.buttons]
 # BTN_SOUTH = "confirm"

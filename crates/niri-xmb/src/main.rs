@@ -983,22 +983,14 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         while let Ok(request) = control_rx.try_recv() {
             let response = match request.command {
                 ControlCommand::Show => {
-                    if panel.mode() != PopupMode::Manual {
-                        renderer.clear_popup_offsets();
-                        panel.set_origin_focus(snapshot.focused_window);
-                    }
-                    let origin_focus = panel.origin_focus();
-                    show_popup(
+                    show_manual_popup(
                         &mut surfaces,
+                        &mut renderer,
                         &snapshot,
                         &config,
-                        panel.outputs_mut(),
-                        PopupInput::FULL,
-                        PopupMode::Manual,
+                        &mut panel,
+                        &mut selection,
                     )?;
-                    // Taking control cancels the peek countdown.
-                    panel.promote(origin_focus);
-                    reset_selection(&mut selection, &snapshot);
                     dirty = true;
                     "ok\n".into()
                 }
@@ -1294,6 +1286,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             while let Some(action) = gamepad.try_recv() {
                 dirty |= handle_gamepad_action(
                     action,
+                    &mut renderer,
                     &mut surfaces,
                     &config,
                     &snapshot,
@@ -1615,6 +1608,33 @@ fn show_popup(
     Ok(())
 }
 
+fn show_manual_popup(
+    surfaces: &mut SurfaceManager,
+    renderer: &mut Renderer,
+    snapshot: &Snapshot,
+    config: &Config,
+    panel: &mut PanelState,
+    selection: &mut Selection,
+) -> Result<()> {
+    if panel.mode() != PopupMode::Manual {
+        renderer.clear_popup_offsets();
+        panel.set_origin_focus(snapshot.focused_window);
+    }
+    let origin_focus = panel.origin_focus();
+    show_popup(
+        surfaces,
+        snapshot,
+        config,
+        panel.outputs_mut(),
+        PopupInput::FULL,
+        PopupMode::Manual,
+    )?;
+    // Taking control cancels the peek countdown.
+    panel.promote(origin_focus);
+    reset_selection(selection, snapshot);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_following_popup(
     surfaces: &mut SurfaceManager,
@@ -1749,18 +1769,24 @@ fn scroll_deltas(axis: ScrollAxis, steps: i32) -> (i32, i32) {
 ///
 /// `Back` is previous output (Shift+Tab); `Close` is Escape and therefore
 /// follows `close_on_escape`. The mapping is applied only while a manual
-/// popup is open, matching keyboard focus.
-fn gamepad_keysym(action: GamepadAction) -> u32 {
+/// popup is open, matching keyboard focus. `Open` has no keysym; it is
+/// handled before this mapping.
+fn gamepad_keysym(action: GamepadAction) -> Option<u32> {
     match action {
-        GamepadAction::Up => KEY_UP,
-        GamepadAction::Down => KEY_DOWN,
-        GamepadAction::Left => KEY_LEFT,
-        GamepadAction::Right => KEY_RIGHT,
-        GamepadAction::Tab => KEY_TAB,
-        GamepadAction::Back => KEY_SHIFT_TAB,
-        GamepadAction::Confirm => KEY_RETURN,
-        GamepadAction::Close => KEY_ESCAPE,
+        GamepadAction::Up => Some(KEY_UP),
+        GamepadAction::Down => Some(KEY_DOWN),
+        GamepadAction::Left => Some(KEY_LEFT),
+        GamepadAction::Right => Some(KEY_RIGHT),
+        GamepadAction::Tab => Some(KEY_TAB),
+        GamepadAction::Back => Some(KEY_SHIFT_TAB),
+        GamepadAction::Confirm => Some(KEY_RETURN),
+        GamepadAction::Close => Some(KEY_ESCAPE),
+        GamepadAction::Open => None,
     }
+}
+
+fn gamepad_open_allowed(mode: PopupMode) -> bool {
+    mode != PopupMode::Manual
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1839,6 +1865,7 @@ fn handle_popup_keysym(
 #[allow(clippy::too_many_arguments)]
 fn handle_gamepad_action(
     action: GamepadAction,
+    renderer: &mut Renderer,
     surfaces: &mut SurfaceManager,
     config: &Config,
     snapshot: &Snapshot,
@@ -1847,11 +1874,21 @@ fn handle_gamepad_action(
     selection: &mut Selection,
     suppress_peek: &mut Instant,
 ) -> Result<bool> {
+    if action == GamepadAction::Open {
+        if !gamepad_open_allowed(panel.mode()) {
+            return Ok(false);
+        }
+        show_manual_popup(surfaces, renderer, snapshot, config, panel, selection)?;
+        return Ok(true);
+    }
     if panel.mode() != PopupMode::Manual {
         return Ok(false);
     }
+    let Some(keysym) = gamepad_keysym(action) else {
+        return Ok(false);
+    };
     handle_popup_keysym(
-        gamepad_keysym(action),
+        keysym,
         surfaces,
         config,
         snapshot,
@@ -3214,14 +3251,23 @@ mod ui_tests {
 
     #[test]
     fn gamepad_actions_map_to_popup_keyboard_controls() {
-        assert_eq!(gamepad_keysym(GamepadAction::Up), KEY_UP);
-        assert_eq!(gamepad_keysym(GamepadAction::Down), KEY_DOWN);
-        assert_eq!(gamepad_keysym(GamepadAction::Left), KEY_LEFT);
-        assert_eq!(gamepad_keysym(GamepadAction::Right), KEY_RIGHT);
-        assert_eq!(gamepad_keysym(GamepadAction::Tab), KEY_TAB);
-        assert_eq!(gamepad_keysym(GamepadAction::Back), KEY_SHIFT_TAB);
-        assert_eq!(gamepad_keysym(GamepadAction::Confirm), KEY_RETURN);
-        assert_eq!(gamepad_keysym(GamepadAction::Close), KEY_ESCAPE);
+        assert_eq!(gamepad_keysym(GamepadAction::Up), Some(KEY_UP));
+        assert_eq!(gamepad_keysym(GamepadAction::Down), Some(KEY_DOWN));
+        assert_eq!(gamepad_keysym(GamepadAction::Left), Some(KEY_LEFT));
+        assert_eq!(gamepad_keysym(GamepadAction::Right), Some(KEY_RIGHT));
+        assert_eq!(gamepad_keysym(GamepadAction::Tab), Some(KEY_TAB));
+        assert_eq!(gamepad_keysym(GamepadAction::Back), Some(KEY_SHIFT_TAB));
+        assert_eq!(gamepad_keysym(GamepadAction::Confirm), Some(KEY_RETURN));
+        assert_eq!(gamepad_keysym(GamepadAction::Close), Some(KEY_ESCAPE));
+        assert_eq!(gamepad_keysym(GamepadAction::Open), None);
+    }
+
+    #[test]
+    fn gamepad_open_is_ignored_when_already_manual() {
+        assert!(gamepad_open_allowed(PopupMode::Hidden));
+        assert!(gamepad_open_allowed(PopupMode::Peek));
+        assert!(gamepad_open_allowed(PopupMode::PeekArmed));
+        assert!(!gamepad_open_allowed(PopupMode::Manual));
     }
 
     /// A peek overlay would only duplicate Niri's own overview, so navigation

@@ -130,6 +130,14 @@ close. D-pad `ABS_HAT0X`/`ABS_HAT0Y` axes are translated to the configured
 while a direction is held. A device that reports both hat axes and D-pad key
 events produces one action per direction.
 
+`gamepad.open_combo` lists at least two unique evdev button names or 16-bit
+codes. Holding them simultaneously on one device emits one `open` action,
+which shows and promotes the manual popup from hidden or peek, using the same
+path as the `show` control command, and does nothing when the manual popup is
+already open. The press that completes the combo emits `open` instead of that
+button's configured action; further repeats are suppressed until one combo
+button is released. An empty list disables the combo.
+
 ## Drag and drop
 
 Pointer travel must exceed `drag_threshold` before a press becomes a drag.

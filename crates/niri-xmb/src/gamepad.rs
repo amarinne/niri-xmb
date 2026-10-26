@@ -46,6 +46,13 @@ impl GamepadService {
         if !config.enabled {
             return None;
         }
+        let combo_codes = match config.open_combo_codes() {
+            Ok(codes) => codes,
+            Err(error) => {
+                tracing::error!(%error, "gamepad open combo is invalid; gamepad input disabled");
+                return None;
+            }
+        };
         let (tx, rx) = bounded(ACTION_QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
         let devices = discover_devices(&config.devices);
@@ -96,11 +103,11 @@ impl GamepadService {
                     continue;
                 }
             };
-            if bindings.is_empty() {
+            if !has_gamepad_input(&bindings, &combo_codes) {
                 tracing::warn!(
                     path = %path.display(),
                     preset = ?preset,
-                    "gamepad preset has no bindings and no explicit overrides; skipping device"
+                    "gamepad has no button bindings or open combo; skipping device"
                 );
                 continue;
             }
@@ -114,13 +121,14 @@ impl GamepadService {
                 "gamepad reader enabled"
             );
             let bindings = Arc::new(bindings);
+            let combo_codes = combo_codes.clone();
             let path_for_log = path.clone();
             let tx = tx.clone();
             let wake = wake.clone();
             let stop = Arc::clone(&stop);
             match thread::Builder::new()
                 .name("niri-xmb-gamepad".into())
-                .spawn(move || reader_loop(path, device, bindings, tx, wake, stop))
+                .spawn(move || reader_loop(path, device, bindings, combo_codes, tx, wake, stop))
             {
                 Ok(handle) => threads.push(handle),
                 Err(error) => {
@@ -132,7 +140,11 @@ impl GamepadService {
                 }
             }
         }
-        tracing::info!(devices = threads.len(), "gamepad input enabled");
+        tracing::info!(
+            devices = threads.len(),
+            combo = combo_codes.len(),
+            "gamepad input enabled"
+        );
         Some(Self { rx, stop, threads })
     }
 
@@ -190,6 +202,10 @@ const DS4_PRESET: &[(&str, GamepadAction)] = &[
     ("BTN_START", GamepadAction::Confirm),
     ("BTN_MODE", GamepadAction::Close),
 ];
+
+fn has_gamepad_input(bindings: &HashMap<u16, GamepadAction>, combo_codes: &HashSet<u16>) -> bool {
+    !bindings.is_empty() || !combo_codes.is_empty()
+}
 
 fn preset_bindings(preset: GamepadPreset) -> &'static [(&'static str, GamepadAction)] {
     match preset {
@@ -301,8 +317,9 @@ fn hat_direction(axis: HatAxis, value: i32) -> Option<usize> {
     }
 }
 
-/// Translate key and hat events into one action while suppressing duplicate
-/// reports when a device exposes both `BTN_DPAD_*` and `ABS_HAT0*`.
+/// Translate key, hat, and open-combo events into one action while
+/// suppressing duplicate reports when a device exposes both `BTN_DPAD_*` and
+/// `ABS_HAT0*`.
 #[derive(Debug, Default)]
 struct HatTracker {
     hat_x: i32,
@@ -311,19 +328,63 @@ struct HatTracker {
     hat_active: [bool; 4],
     /// A bound `BTN_DPAD_*` key currently owns this direction.
     dpad_down: [bool; 4],
+    /// Configured simultaneous codes; empty disables the open combo.
+    combo_codes: HashSet<u16>,
+    /// Combo codes currently held down.
+    combo_down: HashSet<u16>,
+    /// The current completion already emitted Open.
+    combo_fired: bool,
 }
 
 impl HatTracker {
+    fn new(combo_codes: HashSet<u16>) -> Self {
+        Self {
+            combo_codes,
+            ..Self::default()
+        }
+    }
+
     fn update(
         &mut self,
         event: &InputEvent,
         bindings: &HashMap<u16, GamepadAction>,
     ) -> Option<GamepadAction> {
         match event.event_type() {
-            EventType::KEY => self.key_event(event.code(), event.value(), bindings),
+            EventType::KEY => {
+                let completed = self.combo_event(event.code(), event.value());
+                let action = self.key_event(event.code(), event.value(), bindings);
+                if completed {
+                    Some(GamepadAction::Open)
+                } else {
+                    action
+                }
+            }
             EventType::ABSOLUTE => self.absolute_event(event.code(), event.value(), bindings),
             _ => None,
         }
+    }
+
+    /// Track simultaneous combo presses. Returns true only on the press that
+    /// completes the combo; a release re-arms it for the next completion.
+    fn combo_event(&mut self, code: u16, value: i32) -> bool {
+        if !self.combo_codes.contains(&code) {
+            return false;
+        }
+        match value {
+            1 => {
+                self.combo_down.insert(code);
+                if !self.combo_fired && self.combo_down.len() == self.combo_codes.len() {
+                    self.combo_fired = true;
+                    return true;
+                }
+            }
+            0 => {
+                self.combo_down.remove(&code);
+                self.combo_fired = false;
+            }
+            _ => {}
+        }
+        false
     }
 
     fn key_event(
@@ -442,11 +503,12 @@ fn reader_loop(
     path: PathBuf,
     mut device: Device,
     bindings: Arc<HashMap<u16, GamepadAction>>,
+    combo_codes: HashSet<u16>,
     tx: Sender<GamepadAction>,
     wake: WakeHandle,
     stop: Arc<AtomicBool>,
 ) {
-    let mut tracker = HatTracker::default();
+    let mut tracker = HatTracker::new(combo_codes);
     let mut full_logged = false;
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -521,6 +583,7 @@ mod tests {
                 .iter()
                 .map(|(name, action)| ((*name).to_string(), *action))
                 .collect(),
+            open_combo: Vec::new(),
         }
     }
 
@@ -547,6 +610,10 @@ mod tests {
         InputEvent::new(EventType::ABSOLUTE.0, axis.0, value)
     }
 
+    fn combo_tracker(codes: &[KeyCode]) -> HatTracker {
+        HatTracker::new(codes.iter().map(|code| code.0).collect())
+    }
+
     #[test]
     fn gamepad_event_names_use_stable_joystick_or_gamepad_suffixes() {
         assert!(is_gamepad_event_name("usb-test-event-joystick"));
@@ -560,6 +627,16 @@ mod tests {
         let map = explicit_bindings();
         assert_eq!(map.get(&0x130), Some(&GamepadAction::Confirm));
         assert_eq!(map.get(&0x221), Some(&GamepadAction::Down));
+    }
+
+    #[test]
+    fn combo_only_input_still_starts_a_reader() {
+        assert!(has_gamepad_input(
+            &HashMap::new(),
+            &HashSet::from([KeyCode::BTN_SELECT.0, KeyCode::BTN_START.0])
+        ));
+        assert!(has_gamepad_input(&explicit_bindings(), &HashSet::new()));
+        assert!(!has_gamepad_input(&HashMap::new(), &HashSet::new()));
     }
 
     #[test]
@@ -623,6 +700,7 @@ mod tests {
                 ("0x130".into(), GamepadAction::Close),
                 ("BTN_EAST".into(), GamepadAction::Tab),
             ]),
+            open_combo: Vec::new(),
         };
         let map = binding_map_for(&config, GamepadPreset::Xbox).unwrap();
         assert_eq!(map.get(&KeyCode::BTN_SOUTH.0), Some(&GamepadAction::Close));
@@ -690,6 +768,87 @@ mod tests {
             None
         );
         assert_eq!(tracker.update(&key(KeyCode::BTN_EAST, 1), &map), None);
+    }
+
+    #[test]
+    fn combo_requires_simultaneous_presses_and_fires_once() {
+        let map = preset_map(GamepadPreset::Xbox);
+        let mut tracker = combo_tracker(&[KeyCode::BTN_SELECT, KeyCode::BTN_START]);
+
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_SELECT, 1), &map),
+            Some(GamepadAction::Back)
+        );
+        assert_eq!(tracker.update(&key(KeyCode::BTN_SELECT, 0), &map), None);
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_START, 1), &map),
+            Some(GamepadAction::Confirm)
+        );
+        assert_eq!(tracker.update(&key(KeyCode::BTN_START, 0), &map), None);
+
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_SELECT, 1), &map),
+            Some(GamepadAction::Back)
+        );
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_START, 1), &map),
+            Some(GamepadAction::Open)
+        );
+        assert_eq!(tracker.update(&key(KeyCode::BTN_START, 2), &map), None);
+    }
+
+    #[test]
+    fn combo_rearms_after_one_combo_button_releases() {
+        let map = HashMap::new();
+        let mut tracker = combo_tracker(&[KeyCode::BTN_SELECT, KeyCode::BTN_START]);
+
+        assert_eq!(tracker.update(&key(KeyCode::BTN_SELECT, 1), &map), None);
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_START, 1), &map),
+            Some(GamepadAction::Open)
+        );
+        assert_eq!(tracker.update(&key(KeyCode::BTN_START, 0), &map), None);
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_START, 1), &map),
+            Some(GamepadAction::Open)
+        );
+        assert_eq!(tracker.update(&key(KeyCode::BTN_SELECT, 0), &map), None);
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_SELECT, 1), &map),
+            Some(GamepadAction::Open)
+        );
+        assert_eq!(tracker.update(&key(KeyCode::BTN_SELECT, 1), &map), None);
+    }
+
+    #[test]
+    fn combo_completion_replaces_that_buttons_action() {
+        let map = preset_map(GamepadPreset::Xbox);
+        let mut tracker = combo_tracker(&[KeyCode::BTN_SELECT, KeyCode::BTN_START]);
+
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_SELECT, 1), &map),
+            Some(GamepadAction::Back)
+        );
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_START, 1), &map),
+            Some(GamepadAction::Open),
+            "the completing press must not also confirm"
+        );
+    }
+
+    #[test]
+    fn empty_combo_preserves_normal_button_actions() {
+        let map = preset_map(GamepadPreset::Xbox);
+        let mut tracker = HatTracker::default();
+
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_SELECT, 1), &map),
+            Some(GamepadAction::Back)
+        );
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_START, 1), &map),
+            Some(GamepadAction::Confirm)
+        );
     }
 
     #[test]

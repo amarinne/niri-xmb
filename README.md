@@ -26,6 +26,10 @@ Gamepad input is off by default. The `[gamepad]` table selects a built-in
 16-bit codes to manual-popup actions. Explicit bindings override the preset.
 Flydigi VADER4 and other xpad-compatible pads auto-detect as `xbox`, and
 D-pad hat axes work even when the kernel sends no `BTN_DPAD_*` events.
+`gamepad.open_combo` holds at least two unique buttons together on one
+controller to open the manual popup from hidden or peek; it is disabled by
+default, does nothing when the manual popup is already open, and suppresses
+repeats until a combo button is released.
 
 ## Installation
 

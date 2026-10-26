@@ -1008,7 +1008,7 @@ pub enum GamepadPreset {
     Ds4,
 }
 
-/// One action a gamepad button can trigger while the manual popup is open.
+/// One action a gamepad input can trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GamepadAction {
@@ -1024,6 +1024,9 @@ pub enum GamepadAction {
     Confirm,
     /// Close the manual popup; matches Escape and follows `close_on_escape`.
     Close,
+    /// Show the manual popup from hidden or peek. Also emitted by the
+    /// configured simultaneous open combo.
+    Open,
 }
 
 /// Optional evdev gamepad button map.
@@ -1043,13 +1046,20 @@ pub struct GamepadConfig {
     /// evdev button name such as `BTN_SOUTH`, or a 16-bit decimal/hex code,
     /// mapped to one manual-popup action. These override preset entries.
     pub buttons: BTreeMap<String, GamepadAction>,
+    /// At least two unique evdev button names or 16-bit codes held together to
+    /// open the manual popup. Empty disables the combo.
+    pub open_combo: Vec<String>,
 }
 
 impl GamepadConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.enabled && self.preset == GamepadPreset::None && self.buttons.is_empty() {
+        if self.enabled
+            && self.preset == GamepadPreset::None
+            && self.buttons.is_empty()
+            && self.open_combo.is_empty()
+        {
             anyhow::bail!(
-                "gamepad.buttons must define at least one binding when gamepad.enabled is true and gamepad.preset is \"none\""
+                "gamepad.buttons must define at least one binding, or gamepad.open_combo must define at least two unique button codes, when gamepad.enabled is true and gamepad.preset is \"none\""
             );
         }
         for (index, device) in self.devices.iter().enumerate() {
@@ -1069,7 +1079,26 @@ impl GamepadConfig {
                 anyhow::bail!("gamepad.buttons contains duplicate code {code:#06x} via {name:?}");
             }
         }
+        self.open_combo_codes()?;
         Ok(())
+    }
+
+    /// Parse and validate the simultaneous open-combo codes.
+    pub(crate) fn open_combo_codes(&self) -> Result<HashSet<u16>> {
+        let mut codes = HashSet::new();
+        for (index, name) in self.open_combo.iter().enumerate() {
+            let code = gamepad_button_code(name)
+                .with_context(|| format!("gamepad.open_combo[{index}]"))?;
+            if !codes.insert(code) {
+                anyhow::bail!(
+                    "gamepad.open_combo contains duplicate code {code:#06x} via {name:?}"
+                );
+            }
+        }
+        if codes.len() == 1 {
+            anyhow::bail!("gamepad.open_combo must contain at least two unique button codes");
+        }
+        Ok(codes)
     }
 }
 
@@ -1556,6 +1585,7 @@ mod tests {
         assert_eq!(config.gamepad.preset, GamepadPreset::None);
         assert!(config.gamepad.devices.is_empty());
         assert!(config.gamepad.buttons.is_empty());
+        assert!(config.gamepad.open_combo.is_empty());
         config.validate().unwrap();
     }
 
@@ -1633,6 +1663,54 @@ mod tests {
             assert_eq!(config.gamepad.preset, preset);
             assert!(config.gamepad.buttons.is_empty());
         }
+    }
+
+    #[test]
+    fn gamepad_open_combo_accepts_names_and_numeric_codes() {
+        let config = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            devices = ["/dev/input/event0"]
+            open_combo = ["BTN_SELECT", "0x13b"]
+            "#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.gamepad.open_combo_codes().unwrap(),
+            HashSet::from([0x13a, 0x13b])
+        );
+    }
+
+    #[test]
+    fn gamepad_open_combo_requires_two_unique_codes() {
+        let error = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            preset = "auto"
+            devices = ["/dev/input/event0"]
+            open_combo = ["BTN_SELECT"]
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("at least two"), "{error:#}");
+
+        let error = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            preset = "auto"
+            devices = ["/dev/input/event0"]
+            open_combo = ["BTN_SELECT", "0x13a"]
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("duplicate code"), "{error:#}");
     }
 
     #[test]
