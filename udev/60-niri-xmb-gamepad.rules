@@ -1,0 +1,3 @@
+# Give the active seat user access to gamepads without adding them to the
+# broad "input" group. systemd-logind applies the ACL for the uaccess tag.
+ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_JOYSTICK}=="1", TAG+="uaccess"

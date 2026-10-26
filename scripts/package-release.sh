@@ -19,6 +19,10 @@ install -Dm644 themes/noctalia.toml "$stage/themes/noctalia.toml"
 install -Dm644 themes/material-3-expressive.toml "$stage/themes/material-3-expressive.toml"
 install -Dm644 themes/liquid-glass.toml "$stage/themes/liquid-glass.toml"
 install -Dm644 niri-xmb.service "$stage/niri-xmb.service"
+install -Dm644 udev/60-niri-xmb-gamepad.rules \
+    "$stage/udev/60-niri-xmb-gamepad.rules"
+install -Dm755 scripts/install-udev-rule.sh \
+    "$stage/scripts/install-udev-rule.sh"
 install -Dm644 LICENSE "$stage/LICENSE"
 
 mkdir -p "$output_dir"

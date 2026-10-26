@@ -138,6 +138,15 @@ already open. The press that completes the combo emits `open` instead of that
 button's configured action; further repeats are suppressed until one combo
 button is released. An empty list disables the combo.
 
+The daemon rescans `/dev/input/by-id` every 500 ms, starts a reader when a
+controller appears, and stops/joins readers when it disappears. Configured
+paths that are temporarily absent retry with a two-second backoff, so no
+daemon restart is needed after connecting a controller. Reading the event
+node still requires permission. The project-owned
+`udev/60-niri-xmb-gamepad.rules` tags joystick devices with `uaccess`, giving
+the active seat user an ACL without the broad `input` group; niri-xmb still
+owns discovery, reading, decoding, hotplug, and action handling.
+
 ## Drag and drop
 
 Pointer travel must exceed `drag_threshold` before a press becomes a drag.

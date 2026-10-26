@@ -26,6 +26,8 @@ cargo build --locked --release -p niri-xmb
 
 %install
 install -Dm755 target/release/niri-xmb %{buildroot}%{_bindir}/niri-xmb
+install -Dm644 udev/60-niri-xmb-gamepad.rules \
+    %{buildroot}%{_udevrulesdir}/60-niri-xmb-gamepad.rules
 # Noctalia v5 widget; point a [[plugins.source]] kind = "path" at this directory.
 mkdir -p %{buildroot}%{_datadir}/niri-xmb/noctalia-v5
 cp -r ports/noctalia-v5/plugins %{buildroot}%{_datadir}/niri-xmb/noctalia-v5/
@@ -33,6 +35,7 @@ cp -r ports/noctalia-v5/plugins %{buildroot}%{_datadir}/niri-xmb/noctalia-v5/
 %files
 %license LICENSE
 %{_bindir}/niri-xmb
+%{_udevrulesdir}/60-niri-xmb-gamepad.rules
 %{_datadir}/niri-xmb/
 
 %changelog

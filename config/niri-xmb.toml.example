@@ -127,8 +127,9 @@ close_on_escape = true       # Escape closes the popup
 # Optional evdev gamepad input. Disabled by default. Gamepads are read outside
 # the Wayland seat; actions apply only while the manual popup is open. Prefer
 # stable /dev/input/by-id paths; leave devices empty to discover
-# *-event-joystick and *-event-gamepad symlinks. Reading /dev/input usually
-# needs the "input" group or a udev rule.
+# *-event-joystick and *-event-gamepad symlinks. Hotplug is automatic. Reading
+# /dev/input needs access: install the project udev uaccess rule
+# (udev/60-niri-xmb-gamepad.rules) or use the "input" group.
 #
 # preset: "none" uses only the buttons map; "auto" detects each device from its
 # name, USB identity, and capabilities (Flydigi VADER4 and xpad-compatible pads

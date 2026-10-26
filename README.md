@@ -31,6 +31,19 @@ controller to open the manual popup from hidden or peek; it is disabled by
 default, does nothing when the manual popup is already open, and suppresses
 repeats until a combo button is released.
 
+The daemon watches `/dev/input/by-id` and attaches/detaches controllers live;
+no restart is needed after plugging one in. Reading the event device still
+requires permission. To avoid the broad `input` group, install the project's
+per-gamepad uaccess rule:
+
+```sh
+sudo ./scripts/install-udev-rule.sh
+```
+
+The rule only grants the active seat user an ACL for joystick devices;
+niri-xmb itself still performs all enumeration, reading, decoding, hotplug,
+and action handling.
+
 ## Installation
 
 ```sh

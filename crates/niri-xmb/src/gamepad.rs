@@ -8,7 +8,7 @@
 
 use crate::config::{GamepadAction, GamepadConfig, GamepadPreset, gamepad_button_code};
 use crate::wayland::WakeHandle;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, KeyCode};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
@@ -17,31 +17,40 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 const ACTION_QUEUE: usize = 32;
 const POLL_TIMEOUT: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: 200_000_000,
 };
+const HOTPLUG_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const HOTPLUG_SLEEP_SLICE: Duration = Duration::from_millis(100);
+const READER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const GAMEPAD_EVENT_SUFFIXES: [&str; 2] = ["-event-joystick", "-event-gamepad"];
 const BY_ID_DIR: &str = "/dev/input/by-id";
 
-/// A running set of gamepad reader threads.
+/// A running gamepad hotplug watcher.
 ///
-/// Dropping the service stops and joins every reader. The receiver is drained
-/// by the daemon loop after it is woken.
+/// Dropping the service stops the watcher and joins every reader. The receiver
+/// is drained by the daemon loop after it is woken.
 pub struct GamepadService {
     rx: Receiver<GamepadAction>,
     stop: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<()>>,
+    supervisor: Option<JoinHandle<()>>,
+}
+
+struct ActiveReader {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
 }
 
 impl GamepadService {
-    /// Start readers when the feature is enabled.
+    /// Start the hotplug watcher when the feature is enabled.
     ///
     /// Configuration errors are already rejected by `Config::validate`, so a
-    /// failure here is only logged. An unreadable device or a missing input
-    /// permission must not stop the daemon.
+    /// failure here is only logged. An absent, unreadable, or unplugged device
+    /// must not stop the daemon; the watcher retries while it stays present.
     pub fn start(config: &GamepadConfig, wake: WakeHandle) -> Option<Self> {
         if !config.enabled {
             return None;
@@ -55,97 +64,32 @@ impl GamepadService {
         };
         let (tx, rx) = bounded(ACTION_QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
-        let devices = discover_devices(&config.devices);
-        if devices.is_empty() {
-            tracing::warn!(
-                "gamepad.enabled is true but no gamepad event devices were configured or discovered"
-            );
-            return Some(Self {
-                rx,
-                stop,
-                threads: Vec::new(),
-            });
-        }
-
-        let mut threads = Vec::new();
-        for path in devices {
-            let device = match Device::open(&path) {
-                Ok(device) => device,
-                Err(error) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        %error,
-                        "cannot open gamepad; check the input group and udev permissions"
-                    );
-                    continue;
-                }
-            };
-            if let Err(error) = device.set_nonblocking(true) {
-                tracing::warn!(
-                    path = %path.display(),
-                    %error,
-                    "cannot make gamepad nonblocking"
-                );
-                continue;
-            }
-            let preset = match config.preset {
-                GamepadPreset::Auto => detect_preset(&path, &device),
-                preset => preset,
-            };
-            let bindings = match binding_map_for(config, preset) {
-                Ok(bindings) => bindings,
-                Err(error) => {
-                    tracing::error!(
-                        path = %path.display(),
-                        %error,
-                        "gamepad bindings are invalid; skipping this device"
-                    );
-                    continue;
-                }
-            };
-            if !has_gamepad_input(&bindings, &combo_codes) {
-                tracing::warn!(
-                    path = %path.display(),
-                    preset = ?preset,
-                    "gamepad has no button bindings or open combo; skipping device"
-                );
-                continue;
-            }
-
-            let name = device.name().unwrap_or("unknown").to_string();
-            tracing::info!(
-                path = %path.display(),
-                name = %name,
-                preset = ?preset,
-                bindings = bindings.len(),
-                "gamepad reader enabled"
-            );
-            let bindings = Arc::new(bindings);
-            let combo_codes = combo_codes.clone();
-            let path_for_log = path.clone();
+        let config = Arc::new(config.clone());
+        let combo_codes = Arc::new(combo_codes);
+        let supervisor = {
             let tx = tx.clone();
             let wake = wake.clone();
             let stop = Arc::clone(&stop);
-            match thread::Builder::new()
-                .name("niri-xmb-gamepad".into())
-                .spawn(move || reader_loop(path, device, bindings, combo_codes, tx, wake, stop))
-            {
-                Ok(handle) => threads.push(handle),
-                Err(error) => {
-                    tracing::warn!(
-                        path = %path_for_log.display(),
-                        %error,
-                        "failed to spawn gamepad reader"
-                    );
-                }
+            let config = Arc::clone(&config);
+            let combo_codes = Arc::clone(&combo_codes);
+            thread::Builder::new()
+                .name("niri-xmb-gamepad-hotplug".into())
+                .spawn(move || supervisor_loop(config, combo_codes, tx, wake, stop))
+        };
+        match supervisor {
+            Ok(handle) => Some(Self {
+                rx,
+                stop,
+                supervisor: Some(handle),
+            }),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "failed to start gamepad hotplug watcher; gamepad input disabled"
+                );
+                None
             }
         }
-        tracing::info!(
-            devices = threads.len(),
-            combo = combo_codes.len(),
-            "gamepad input enabled"
-        );
-        Some(Self { rx, stop, threads })
     }
 
     /// Next queued action, if any. Called by the daemon loop after a wake.
@@ -157,8 +101,8 @@ impl GamepadService {
 impl Drop for GamepadService {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
+        if let Some(supervisor) = self.supervisor.take() {
+            let _ = supervisor.join();
         }
     }
 }
@@ -497,6 +441,179 @@ fn dedupe_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
         }
     }
     unique
+}
+
+fn hotplug_diff(desired: &[PathBuf], active: &HashSet<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let desired_set: HashSet<&PathBuf> = desired.iter().collect();
+    let start = desired
+        .iter()
+        .filter(|path| !active.contains(*path))
+        .cloned()
+        .collect();
+    let stop = active
+        .iter()
+        .filter(|path| !desired_set.contains(path))
+        .cloned()
+        .collect();
+    (start, stop)
+}
+
+fn supervisor_loop(
+    config: Arc<GamepadConfig>,
+    combo_codes: Arc<HashSet<u16>>,
+    tx: Sender<GamepadAction>,
+    wake: WakeHandle,
+    stop: Arc<AtomicBool>,
+) {
+    let mut active: HashMap<PathBuf, ActiveReader> = HashMap::new();
+    let mut retry_at: HashMap<PathBuf, Instant> = HashMap::new();
+    let mut failures: HashSet<PathBuf> = HashSet::new();
+    let mut skipped: HashSet<PathBuf> = HashSet::new();
+    tracing::info!(combo = combo_codes.len(), "gamepad hotplug watcher started");
+
+    while !stop.load(Ordering::Relaxed) {
+        let desired = discover_devices(&config.devices);
+        let desired_set: HashSet<PathBuf> = desired.iter().cloned().collect();
+        retry_at.retain(|path, _| desired_set.contains(path));
+        failures.retain(|path| desired_set.contains(path));
+        skipped.retain(|path| desired_set.contains(path));
+
+        let finished: Vec<PathBuf> = active
+            .iter()
+            .filter(|(_, reader)| reader.handle.is_finished())
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in finished {
+            if let Some(reader) = active.remove(&path) {
+                let _ = reader.handle.join();
+                tracing::info!(path = %path.display(), "gamepad reader stopped");
+            }
+            if desired_set.contains(&path) {
+                retry_at.insert(path, Instant::now() + READER_RETRY_BACKOFF);
+            }
+        }
+
+        let active_paths: HashSet<PathBuf> = active.keys().cloned().collect();
+        let (start_paths, stale_paths) = hotplug_diff(&desired, &active_paths);
+        for path in stale_paths {
+            if let Some(reader) = active.remove(&path) {
+                reader.stop.store(true, Ordering::Relaxed);
+                let _ = reader.handle.join();
+                tracing::info!(path = %path.display(), "gamepad disconnected");
+            }
+            retry_at.remove(&path);
+            failures.remove(&path);
+            skipped.remove(&path);
+        }
+
+        for path in start_paths {
+            if skipped.contains(&path) {
+                continue;
+            }
+            let now = Instant::now();
+            if retry_at.get(&path).is_some_and(|until| now < *until) {
+                continue;
+            }
+            match start_reader(&path, &config, &combo_codes, &tx, &wake) {
+                Ok(Some(reader)) => {
+                    active.insert(path.clone(), reader);
+                    retry_at.remove(&path);
+                    failures.remove(&path);
+                    skipped.remove(&path);
+                }
+                Ok(None) => {
+                    retry_at.remove(&path);
+                    failures.remove(&path);
+                    skipped.insert(path);
+                }
+                Err(error) => {
+                    if failures.insert(path.clone()) {
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "cannot start gamepad reader; will retry"
+                        );
+                    }
+                    retry_at.insert(path, now + READER_RETRY_BACKOFF);
+                }
+            }
+        }
+
+        let deadline = Instant::now() + HOTPLUG_POLL_INTERVAL;
+        while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+            thread::sleep(HOTPLUG_SLEEP_SLICE);
+        }
+    }
+
+    for (path, reader) in active.drain() {
+        reader.stop.store(true, Ordering::Relaxed);
+        let _ = reader.handle.join();
+        tracing::debug!(path = %path.display(), "gamepad reader stopped");
+    }
+    tracing::info!("gamepad hotplug watcher stopped");
+}
+
+fn start_reader(
+    path: &Path,
+    config: &GamepadConfig,
+    combo_codes: &HashSet<u16>,
+    tx: &Sender<GamepadAction>,
+    wake: &WakeHandle,
+) -> Result<Option<ActiveReader>> {
+    let device =
+        Device::open(path).with_context(|| format!("cannot open gamepad {}", path.display()))?;
+    device
+        .set_nonblocking(true)
+        .with_context(|| format!("cannot make gamepad nonblocking: {}", path.display()))?;
+    let preset = match config.preset {
+        GamepadPreset::Auto => detect_preset(path, &device),
+        preset => preset,
+    };
+    let bindings = binding_map_for(config, preset)
+        .with_context(|| format!("gamepad bindings for {}", path.display()))?;
+    if !has_gamepad_input(&bindings, combo_codes) {
+        tracing::warn!(
+            path = %path.display(),
+            preset = ?preset,
+            "gamepad has no button bindings or open combo; skipping"
+        );
+        return Ok(None);
+    }
+
+    let name = device.name().unwrap_or("unknown").to_string();
+    let binding_count = bindings.len();
+    let bindings = Arc::new(bindings);
+    let combo_codes = combo_codes.clone();
+    let reader_stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&reader_stop);
+    let thread_path = path.to_path_buf();
+    let tx = tx.clone();
+    let wake = wake.clone();
+    let handle = thread::Builder::new()
+        .name("niri-xmb-gamepad".into())
+        .spawn(move || {
+            reader_loop(
+                thread_path,
+                device,
+                bindings,
+                combo_codes,
+                tx,
+                wake,
+                thread_stop,
+            )
+        })
+        .context("failed to spawn gamepad reader")?;
+    tracing::info!(
+        path = %path.display(),
+        name = %name,
+        preset = ?preset,
+        bindings = binding_count,
+        "gamepad reader enabled"
+    );
+    Ok(Some(ActiveReader {
+        stop: reader_stop,
+        handle,
+    }))
 }
 
 fn reader_loop(
@@ -951,6 +1068,24 @@ mod tests {
     fn configured_device_paths_are_trimmed_and_used() {
         let devices = discover_devices(&[" /dev/input/event0 ".into()]);
         assert_eq!(devices, vec![PathBuf::from("/dev/input/event0")]);
+    }
+
+    #[test]
+    fn hotplug_diff_starts_new_and_stops_removed_devices() {
+        let a = PathBuf::from("/dev/input/by-id/a-event-joystick");
+        let b = PathBuf::from("/dev/input/by-id/b-event-joystick");
+        let c = PathBuf::from("/dev/input/by-id/c-event-joystick");
+
+        let (start, stop) = hotplug_diff(
+            &[a.clone(), b.clone()],
+            &HashSet::from([b.clone(), c.clone()]),
+        );
+        assert_eq!(start, vec![a.clone()]);
+        assert_eq!(stop, vec![c]);
+
+        let (start, stop) = hotplug_diff(std::slice::from_ref(&a), &HashSet::from([a.clone()]));
+        assert!(start.is_empty());
+        assert!(stop.is_empty());
     }
 
     #[test]
