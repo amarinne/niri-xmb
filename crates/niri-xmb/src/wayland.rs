@@ -112,14 +112,21 @@ pub enum UiEventKind {
     Release {
         button: u32,
     },
-    /// One complete wheel step. High-resolution packet values are accumulated
-    /// before this event reaches the UI.
+    /// One or more complete wheel steps. High-resolution packet values are
+    /// accumulated before this event reaches the UI.
     Scroll {
+        axis: ScrollAxis,
         steps: i32,
     },
     Key {
         keysym: u32,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollAxis {
+    Vertical,
+    Horizontal,
 }
 
 /// Convert high-resolution Wayland wheel data into complete wheel steps.
@@ -129,29 +136,60 @@ pub enum UiEventKind {
 /// workspace rows. Free-spin still emits completed 120-unit steps rapidly.
 #[derive(Debug, Default)]
 struct WheelStepAccumulator {
-    value120_remainder: i32,
+    value120_remainder: i64,
+    suppress_fallback_once: bool,
 }
 
 impl WheelStepAccumulator {
     fn steps(&mut self, value120: i32, discrete: i32, absolute: f64) -> i32 {
         if value120 != 0 {
-            self.value120_remainder += value120;
-            if self.value120_remainder >= 120 {
-                self.value120_remainder -= 120;
-                1
-            } else if self.value120_remainder <= -120 {
-                self.value120_remainder += 120;
-                -1
-            } else {
-                0
+            // A single event may contain several complete logical wheel steps.
+            // Keep the signed remainder so a direction change cannot turn a
+            // partial packet into an extra step.
+            self.value120_remainder += i64::from(value120);
+            let complete = self.value120_remainder / 120;
+            self.value120_remainder %= 120;
+            // Some compositors expose both the deprecated discrete event and
+            // value120 for one packet. Ignore the paired fallback if SCTK
+            // delivers it as a separate Axis event.
+            self.suppress_fallback_once = true;
+            complete as i32
+        } else if self.suppress_fallback_once {
+            if discrete != 0 || absolute.abs() > f64::EPSILON {
+                self.suppress_fallback_once = false;
             }
+            0
         } else if discrete != 0 {
+            // `axis_discrete` is a fallback for older compositors. SCTK merges
+            // it with `axis_value120` in one Axis event, so this branch cannot
+            // duplicate a value120 report from the same physical packet.
             discrete.signum()
         } else if absolute.abs() > f64::EPSILON {
             absolute.signum() as i32
         } else {
             0
         }
+    }
+
+    fn finish_axis(&mut self) {
+        self.value120_remainder = 0;
+        self.suppress_fallback_once = false;
+    }
+}
+
+#[derive(Debug, Default)]
+struct WheelStepAccumulators {
+    vertical: WheelStepAccumulator,
+    horizontal: WheelStepAccumulator,
+}
+
+impl WheelStepAccumulators {
+    fn steps(&mut self, axis: ScrollAxis, value120: i32, discrete: i32, absolute: f64) -> i32 {
+        let accumulator = match axis {
+            ScrollAxis::Vertical => &mut self.vertical,
+            ScrollAxis::Horizontal => &mut self.horizontal,
+        };
+        accumulator.steps(value120, discrete, absolute)
     }
 }
 
@@ -375,7 +413,7 @@ impl SurfaceManager {
             pointer_x: 0.0,
             pointer_y: 0.0,
             pointer_surface: None,
-            wheel_steps: WheelStepAccumulator::default(),
+            wheel_steps: WheelStepAccumulators::default(),
             keyboard_surface: None,
             _virtual_pointer_manager: virtual_pointer_manager,
             virtual_pointer,
@@ -955,8 +993,9 @@ fn copy_rgba_to_argb8888(destination: &mut [u8], source: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DamageRect, SurfaceSpecKind, WheelStepAccumulator, alpha_bounds, copy_rgba_to_argb8888,
-        copy_rgba_to_argb8888_region, ensure_popup_spec, presentation_damage,
+        DamageRect, ScrollAxis, SurfaceSpecKind, WheelStepAccumulator, WheelStepAccumulators,
+        alpha_bounds, copy_rgba_to_argb8888, copy_rgba_to_argb8888_region, ensure_popup_spec,
+        presentation_damage,
     };
 
     #[test]
@@ -1054,23 +1093,63 @@ mod tests {
     }
 
     #[test]
-    fn high_resolution_wheel_waits_for_a_full_value120_step() {
+    fn g502x_ratchet_accumulates_30_plus_six_15_packets() {
         let mut wheel = WheelStepAccumulator::default();
         assert_eq!(wheel.steps(30, 0, 3.75), 0);
         for _ in 0..5 {
             assert_eq!(wheel.steps(15, 0, 1.88), 0);
         }
         assert_eq!(wheel.steps(15, 0, 1.88), 1);
-        assert_eq!(wheel.steps(-120, 0, -15.0), -1);
     }
 
     #[test]
-    fn legacy_wheel_data_keeps_its_step_count() {
+    fn high_resolution_wheel_preserves_negative_sequences() {
+        let mut wheel = WheelStepAccumulator::default();
+        assert_eq!(wheel.steps(-30, 0, -3.75), 0);
+        for _ in 0..5 {
+            assert_eq!(wheel.steps(-15, 0, -1.88), 0);
+        }
+        assert_eq!(wheel.steps(-15, 0, -1.88), -1);
+    }
+
+    #[test]
+    fn high_resolution_wheel_emits_every_complete_step_in_a_large_burst() {
+        let mut wheel = WheelStepAccumulator::default();
+        assert_eq!(wheel.steps(360, 0, 45.0), 3);
+        assert_eq!(wheel.steps(-480, 0, -60.0), -4);
+    }
+
+    #[test]
+    fn high_resolution_wheel_keeps_partial_packets_until_the_next_packet() {
+        let mut wheel = WheelStepAccumulator::default();
+        assert_eq!(wheel.steps(90, 0, 11.25), 0);
+        assert_eq!(wheel.steps(29, 0, 3.63), 0);
+        assert_eq!(wheel.steps(1, 0, 0.12), 1);
+        assert_eq!(wheel.steps(-90, 0, -11.25), 0);
+        assert_eq!(wheel.steps(-31, 0, -3.88), -1);
+    }
+
+    #[test]
+    fn discrete_and_absolute_wheel_data_are_fallbacks() {
         let mut wheel = WheelStepAccumulator::default();
         assert_eq!(wheel.steps(0, 2, 0.0), 1);
-        assert_eq!(wheel.steps(0, -1, 0.0), -1);
+        assert_eq!(wheel.steps(0, -2, 0.0), -1);
         assert_eq!(wheel.steps(0, 0, 8.0), 1);
         assert_eq!(wheel.steps(0, 0, -8.0), -1);
+        // A coupled value120 report wins over the deprecated discrete field,
+        // so one physical wheel packet cannot create two workspace changes.
+        assert_eq!(wheel.steps(30, 1, 3.75), 0);
+        assert_eq!(wheel.steps(0, 1, 15.0), 0);
+        assert_eq!(wheel.steps(0, 0, 0.0), 0);
+        assert_eq!(wheel.steps(0, 1, 15.0), 1);
+    }
+
+    #[test]
+    fn wheel_axes_accumulate_independently() {
+        let mut wheels = WheelStepAccumulators::default();
+        assert_eq!(wheels.steps(ScrollAxis::Vertical, 90, 0, 11.25), 0);
+        assert_eq!(wheels.steps(ScrollAxis::Horizontal, 120, 0, 15.0), 1);
+        assert_eq!(wheels.steps(ScrollAxis::Vertical, 30, 0, 3.75), 1);
     }
 }
 
@@ -1119,7 +1198,7 @@ struct WaylandState {
     pointer_x: f64,
     pointer_y: f64,
     pointer_surface: Option<usize>,
-    wheel_steps: WheelStepAccumulator,
+    wheel_steps: WheelStepAccumulators,
     /// Where key events go, tracked separately from the pointer.
     ///
     /// The two focuses move independently: the pointer leaves the panel while
@@ -1623,17 +1702,44 @@ impl PointerHandler for WaylandState {
                     vertical,
                     ..
                 } => {
-                    let steps = self.wheel_steps.steps(
+                    let vertical_steps = self.wheel_steps.steps(
+                        ScrollAxis::Vertical,
                         vertical.value120,
                         vertical.discrete,
                         vertical.absolute,
                     );
-                    if steps != 0
-                        && let Some(id) = self.pointer_surface.or(surface_id)
-                    {
-                        self.emit(id, UiEventKind::Scroll { steps });
+                    let horizontal_steps = self.wheel_steps.steps(
+                        ScrollAxis::Horizontal,
+                        horizontal.value120,
+                        horizontal.discrete,
+                        horizontal.absolute,
+                    );
+                    if vertical.stop {
+                        self.wheel_steps.vertical.finish_axis();
                     }
-                    let _ = horizontal;
+                    if horizontal.stop {
+                        self.wheel_steps.horizontal.finish_axis();
+                    }
+                    if let Some(id) = self.pointer_surface.or(surface_id) {
+                        if vertical_steps != 0 {
+                            self.emit(
+                                id,
+                                UiEventKind::Scroll {
+                                    axis: ScrollAxis::Vertical,
+                                    steps: vertical_steps,
+                                },
+                            );
+                        }
+                        if horizontal_steps != 0 {
+                            self.emit(
+                                id,
+                                UiEventKind::Scroll {
+                                    axis: ScrollAxis::Horizontal,
+                                    steps: horizontal_steps,
+                                },
+                            );
+                        }
+                    }
                 }
             }
         }

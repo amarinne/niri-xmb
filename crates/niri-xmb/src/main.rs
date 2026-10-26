@@ -42,7 +42,9 @@ use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use wayland::{PopupInput, SurfaceKind, SurfaceManager, UiEvent, UiEventKind, WakePipe};
+use wayland::{
+    PopupInput, ScrollAxis, SurfaceKind, SurfaceManager, UiEvent, UiEventKind, WakePipe,
+};
 
 /// How long after niri-xmb moves focus itself that the resulting snapshot is
 /// treated as our own echo rather than as external navigation.
@@ -1896,8 +1898,11 @@ fn handle_ui_event(
             }
             Ok(true)
         }
-        UiEventKind::Scroll { steps } => {
+        UiEventKind::Scroll { axis, steps } => {
             if let SurfaceKind::Bar(index) = event.kind {
+                if axis != ScrollAxis::Vertical {
+                    return Ok(true);
+                }
                 if let Some(bar) = config.bars.get(index).filter(|bar| bar.scroll_to_switch) {
                     let mut delta = steps;
                     if bar.scroll_reverse {
@@ -1922,7 +1927,11 @@ fn handle_ui_event(
                     }
                 }
             } else {
-                move_selection(selection, snapshot, steps, 0);
+                let (workspace_delta, window_delta) = match axis {
+                    ScrollAxis::Vertical => (steps, 0),
+                    ScrollAxis::Horizontal => (0, steps),
+                };
+                move_selection(selection, snapshot, workspace_delta, window_delta);
                 follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
             }
             Ok(true)

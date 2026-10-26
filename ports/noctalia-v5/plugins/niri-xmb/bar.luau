@@ -1748,6 +1748,10 @@ function update()
 end
 
 function onScroll(axis, steps, startsGesture)
+    -- The host reports complete signed logical steps. Keep the full count so a
+    -- free-spin packet containing several detents does not create duplicate
+    -- workspace changes or lose its remaining steps. The pending totals stay
+    -- separate by axis and flush through one intent per axis.
     local validatedSteps = finiteNumber(steps)
     if validatedSteps == nil or validatedSteps == 0 then
         return

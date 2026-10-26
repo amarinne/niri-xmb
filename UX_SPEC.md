@@ -133,6 +133,10 @@ A wheel gesture must keep a stable target until the pointer changes rows.
 Queued requests must use the previous queued target until Niri updates state.
 Ratchet input must move one workspace per complete 120-unit step.
 Free-spin input must use the configured repeat limit.
+High-resolution packets must accumulate across frames and preserve every complete
+step in a packet, including multiple steps from one burst. Vertical and
+horizontal axes must keep independent remainders. A packet that includes both
+deprecated discrete data and value120 data must produce one logical report.
 
 A configured middle-click command must replace native window close.
 An omitted or empty command must keep native window close.
