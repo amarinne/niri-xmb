@@ -27,7 +27,7 @@ use crossbeam_channel::unbounded;
 use drop_plan::{DropPoint, DropPolicy, DropRequest, DropTarget, plan_drop};
 use drop_transaction::DropTransactionState;
 use focus::{FOCUS_SETTLE, FocusVerdict, FocusWatcher};
-use gamepad::GamepadEvent;
+use gamepad::{GamepadEvent, GamepadStatus};
 use ipc::{ControlCommand, ControlRequest};
 use model::Snapshot;
 use niri::{NiriCommand, NiriHealth, NiriRequest, spawn as spawn_niri};
@@ -698,15 +698,18 @@ fn status_response(
     cursor_restore: bool,
     niri_health: &NiriHealth,
     drop_transactions: &DropTransactionState,
-    gamepad_mode: Option<GamepadMode>,
+    gamepad: Option<GamepadStatus>,
     subscribers: usize,
 ) -> String {
     serde_json::json!({
         "visible": !popup_outputs.is_empty(),
         "mode": popup_mode_name(popup_mode),
         "gamepad": {
-            "enabled": gamepad_mode.is_some(),
-            "mode": gamepad_mode.map(gamepad_mode_name),
+            "enabled": gamepad.is_some(),
+            "mode": gamepad.map(|status| gamepad_mode_name(status.mode)),
+            "preset": gamepad.map(|status| status.preset),
+            "open_combo": gamepad.is_some_and(|status| status.open_combo),
+            "devices": gamepad.map_or(0, |status| status.devices),
         },
         "selection": selection.map(|visual| {
             serde_json::json!({
@@ -1046,7 +1049,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     surfaces.cursor_restore_available(),
                     &niri_health,
                     &drop_transactions,
-                    gamepad.as_ref().map(|gamepad| gamepad.mode()),
+                    gamepad.as_ref().map(|gamepad| gamepad.status()),
                     subscriptions.subscriber_count(),
                 ),
                 ControlCommand::Snapshot { output } => {
@@ -2801,13 +2804,21 @@ mod tests {
             true,
             &NiriHealth::default(),
             &DropTransactionState::default(),
-            Some(GamepadMode::Navi),
+            Some(GamepadStatus {
+                mode: GamepadMode::Navi,
+                preset: crate::config::GamepadPreset::Auto,
+                open_combo: true,
+                devices: 1,
+            }),
             0,
         ))
         .unwrap();
 
         assert_eq!(value["gamepad"]["enabled"], true);
         assert_eq!(value["gamepad"]["mode"], "navi");
+        assert_eq!(value["gamepad"]["preset"], "auto");
+        assert_eq!(value["gamepad"]["open_combo"], true);
+        assert_eq!(value["gamepad"]["devices"], 1);
     }
 
     #[test]

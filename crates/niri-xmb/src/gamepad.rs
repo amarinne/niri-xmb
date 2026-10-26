@@ -20,7 +20,7 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -182,7 +182,19 @@ pub struct GamepadService {
     rx: Receiver<GamepadEvent>,
     stop: Arc<AtomicBool>,
     mode: Arc<AtomicU8>,
+    preset: GamepadPreset,
+    open_combo: bool,
+    devices: Arc<AtomicUsize>,
     supervisor: Option<JoinHandle<()>>,
+}
+
+/// Read-only gamepad state exposed by the daemon status response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GamepadStatus {
+    pub mode: GamepadMode,
+    pub preset: GamepadPreset,
+    pub open_combo: bool,
+    pub devices: usize,
 }
 
 struct ActiveReader {
@@ -217,6 +229,9 @@ impl GamepadService {
         let (tx, rx) = bounded(ACTION_QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
         let mode = Arc::new(AtomicU8::new(mode_to_u8(navi.default_mode)));
+        let devices = Arc::new(AtomicUsize::new(0));
+        let preset = config.preset;
+        let open_combo = !combo_codes.is_empty();
         let config = Arc::new(config.clone());
         let combo_codes = Arc::new(combo_codes);
         let supervisor = {
@@ -227,15 +242,21 @@ impl GamepadService {
             let combo_codes = Arc::clone(&combo_codes);
             let navi = Arc::clone(&navi);
             let mode = Arc::clone(&mode);
+            let devices = Arc::clone(&devices);
             thread::Builder::new()
                 .name("niri-xmb-gamepad-hotplug".into())
-                .spawn(move || supervisor_loop(config, combo_codes, navi, mode, tx, wake, stop))
+                .spawn(move || {
+                    supervisor_loop(config, combo_codes, navi, mode, devices, tx, wake, stop)
+                })
         };
         match supervisor {
             Ok(handle) => Some(Self {
                 rx,
                 stop,
                 mode,
+                preset,
+                open_combo,
+                devices,
                 supervisor: Some(handle),
             }),
             Err(error) => {
@@ -251,6 +272,16 @@ impl GamepadService {
     /// Current game/navi mode.
     pub fn mode(&self) -> GamepadMode {
         mode_from_u8(self.mode.load(Ordering::Relaxed))
+    }
+
+    /// Current mode, configured preset, combo availability, and reader count.
+    pub fn status(&self) -> GamepadStatus {
+        GamepadStatus {
+            mode: self.mode(),
+            preset: self.preset,
+            open_combo: self.open_combo,
+            devices: self.devices.load(Ordering::Relaxed),
+        }
     }
 
     /// Next queued event, if any. Called by the daemon loop after a wake.
@@ -1124,11 +1155,13 @@ fn hotplug_diff(desired: &[PathBuf], active: &HashSet<PathBuf>) -> (Vec<PathBuf>
     (start, stop)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn supervisor_loop(
     config: Arc<GamepadConfig>,
     combo_codes: Arc<HashSet<u16>>,
     navi: Arc<NaviRuntime>,
     mode: Arc<AtomicU8>,
+    devices: Arc<AtomicUsize>,
     tx: Sender<GamepadEvent>,
     wake: WakeHandle,
     stop: Arc<AtomicBool>,
@@ -1213,6 +1246,8 @@ fn supervisor_loop(
             }
         }
 
+        devices.store(active.len(), Ordering::Relaxed);
+
         if had_active
             && active.is_empty()
             && desired.is_empty()
@@ -1235,6 +1270,7 @@ fn supervisor_loop(
         let _ = reader.handle.join();
         tracing::debug!(path = %path.display(), "gamepad reader stopped");
     }
+    devices.store(0, Ordering::Relaxed);
     tracing::info!("gamepad hotplug watcher stopped");
 }
 

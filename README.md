@@ -32,7 +32,8 @@ normal input. `gamepad.mode.toggle` (default `BTN_MODE` + `BTN_START`) switches
 to **navi** mode, where niri-xmb grabs the controller and drives the desktop:
 left stick pointer, right stick scroll, face-button clicks, and hold layers for
 workspaces, window moves, and monitors. Toggle back to release the grab. The
-mode is exposed in `niri-xmb status`; the manual XMB keeps the existing
+mode, configured preset, open-combo availability, and active reader count are
+exposed in `niri-xmb status`; the manual XMB keeps the existing
 `[gamepad.buttons]` context while it is open.
 
 In navi mode, analog triggers also shape pointer and scroll speed around the
