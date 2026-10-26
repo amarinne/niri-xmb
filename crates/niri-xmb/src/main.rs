@@ -161,6 +161,10 @@ enum Command {
     },
     /// Print the fully commented configuration template.
     PrintDefaultConfig,
+    /// Validate a config file with the daemon's loader without restarting it.
+    ConfigCheck,
+    /// Print the loaded config as JSON, including defaults and theme merge.
+    ConfigJson,
     /// Stream daemon state as NDJSON frames until interrupted.
     Subscribe,
 }
@@ -265,6 +269,18 @@ fn main() -> Result<()> {
             cursor_y,
         }),
         Command::Quit => print_control(ControlCommand::Quit),
+        Command::ConfigCheck => {
+            let path = cli.config.unwrap_or_else(Config::default_path);
+            Config::load(&path)?;
+            println!("config valid: {}", path.display());
+            Ok(())
+        }
+        Command::ConfigJson => {
+            let path = cli.config.unwrap_or_else(Config::default_path);
+            let config = Config::load(&path)?;
+            println!("{}", serde_json::to_string_pretty(&config)?);
+            Ok(())
+        }
         Command::Restart => {
             restart_daemon(cli.config.unwrap_or_else(Config::default_path), cli.verbose)
         }
@@ -2819,6 +2835,22 @@ mod tests {
         assert_eq!(value["gamepad"]["preset"], "auto");
         assert_eq!(value["gamepad"]["open_combo"], true);
         assert_eq!(value["gamepad"]["devices"], 1);
+    }
+
+    #[test]
+    fn config_check_and_json_are_cli_subcommands() {
+        assert!(matches!(
+            Cli::try_parse_from(["niri-xmb", "config-check"])
+                .unwrap()
+                .command,
+            Some(Command::ConfigCheck)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["niri-xmb", "config-json"])
+                .unwrap()
+                .command,
+            Some(Command::ConfigJson)
+        ));
     }
 
     #[test]

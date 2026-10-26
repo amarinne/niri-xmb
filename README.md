@@ -51,6 +51,12 @@ The current Flydigi xpad interface exposes the standard Xbox controls only.
 Full Vader 4 paddles and gyro require the DInput/vendor-HID mode and a virtual
 gamepad target; that is a separate follow-up phase.
 
+A native config editor is available as `niri-xmb-config-studio`: it edits the
+controller and XMB TOML, previews panel/bar geometry and bindings, validates
+through the real loader, and saves atomically. Restart is explicit. Install the
+desktop entry with `scripts/install-config-studio.sh`; see
+[CONFIG_STUDIO.md](CONFIG_STUDIO.md).
+
 The daemon watches `/dev/input/by-id` and attaches/detaches controllers live;
 no restart is needed after plugging one in. Reading the event device still
 requires permission. To avoid the broad `input` group, install the project's

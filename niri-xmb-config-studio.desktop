@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=niri-xmb Config
+GenericName=Controller and XMB Configuration
+Comment=Edit niri-xmb controller and XMB settings
+Exec=niri-xmb-config-studio
+Icon=niri-xmb-config-studio
+Terminal=false
+Categories=Settings;
+StartupWMClass=niri-xmb-config-studio
+Keywords=niri;xmb;gamepad;controller;config;
