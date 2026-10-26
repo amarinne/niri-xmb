@@ -118,6 +118,18 @@ navigate, tab/back select the next/previous output, confirm activates the
 selection, and close follows `close_on_escape`. Presses trigger one action;
 releases and repeats are ignored. Gamepad input is disabled by default.
 
+`gamepad.preset` selects `none`, `auto`, `xbox`, or `ds4`. Explicit
+`gamepad.buttons` entries override preset entries by evdev code. `auto` maps
+Flydigi VADER4 and other xpad-compatible pads with face buttons to `xbox`, and
+Sony/DualShock/DualSense devices to `ds4`; it falls back to explicit bindings
+for devices without a recognized layout. Both presets map the D-pad to
+navigation, South/Cross to confirm, East/Circle to close, West/Square to back,
+North/Triangle to tab, TL/Select to back, TR/Start to confirm, and Mode to
+close. D-pad `ABS_HAT0X`/`ABS_HAT0Y` axes are translated to the configured
+`BTN_DPAD_*` actions, with neutral values acting as releases and no repeat
+while a direction is held. A device that reports both hat axes and D-pad key
+events produces one action per direction.
+
 ## Drag and drop
 
 Pointer travel must exceed `drag_threshold` before a press becomes a drag.

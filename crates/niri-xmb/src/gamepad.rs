@@ -6,14 +6,14 @@
 //! never block the Wayland or Niri event paths, and the device is never
 //! grabbed, so other clients keep receiving its input.
 
-use crate::config::{GamepadAction, GamepadConfig, gamepad_button_code};
+use crate::config::{GamepadAction, GamepadConfig, GamepadPreset, gamepad_button_code};
 use crate::wayland::WakeHandle;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
-use evdev::{Device, EventType, InputEvent};
+use evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, KeyCode};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -46,13 +46,6 @@ impl GamepadService {
         if !config.enabled {
             return None;
         }
-        let bindings = match binding_map(&config.buttons) {
-            Ok(bindings) => Arc::new(bindings),
-            Err(error) => {
-                tracing::error!(%error, "gamepad bindings are invalid; gamepad input disabled");
-                return None;
-            }
-        };
         let (tx, rx) = bounded(ACTION_QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
         let devices = discover_devices(&config.devices);
@@ -69,14 +62,65 @@ impl GamepadService {
 
         let mut threads = Vec::new();
         for path in devices {
+            let device = match Device::open(&path) {
+                Ok(device) => device,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "cannot open gamepad; check the input group and udev permissions"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = device.set_nonblocking(true) {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "cannot make gamepad nonblocking"
+                );
+                continue;
+            }
+            let preset = match config.preset {
+                GamepadPreset::Auto => detect_preset(&path, &device),
+                preset => preset,
+            };
+            let bindings = match binding_map_for(config, preset) {
+                Ok(bindings) => bindings,
+                Err(error) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        %error,
+                        "gamepad bindings are invalid; skipping this device"
+                    );
+                    continue;
+                }
+            };
+            if bindings.is_empty() {
+                tracing::warn!(
+                    path = %path.display(),
+                    preset = ?preset,
+                    "gamepad preset has no bindings and no explicit overrides; skipping device"
+                );
+                continue;
+            }
+
+            let name = device.name().unwrap_or("unknown").to_string();
+            tracing::info!(
+                path = %path.display(),
+                name = %name,
+                preset = ?preset,
+                bindings = bindings.len(),
+                "gamepad reader enabled"
+            );
+            let bindings = Arc::new(bindings);
             let path_for_log = path.clone();
             let tx = tx.clone();
-            let bindings = Arc::clone(&bindings);
             let wake = wake.clone();
             let stop = Arc::clone(&stop);
             match thread::Builder::new()
                 .name("niri-xmb-gamepad".into())
-                .spawn(move || reader_loop(path, bindings, tx, wake, stop))
+                .spawn(move || reader_loop(path, device, bindings, tx, wake, stop))
             {
                 Ok(handle) => threads.push(handle),
                 Err(error) => {
@@ -88,11 +132,7 @@ impl GamepadService {
                 }
             }
         }
-        tracing::info!(
-            devices = threads.len(),
-            bindings = bindings.len(),
-            "gamepad input enabled"
-        );
+        tracing::info!(devices = threads.len(), "gamepad input enabled");
         Some(Self { rx, stop, threads })
     }
 
@@ -111,17 +151,251 @@ impl Drop for GamepadService {
     }
 }
 
-fn binding_map(buttons: &BTreeMap<String, GamepadAction>) -> Result<HashMap<u16, GamepadAction>> {
-    let mut bindings = HashMap::with_capacity(buttons.len());
-    for (name, action) in buttons {
-        let code = gamepad_button_code(name)?;
-        if let Some(existing) = bindings.insert(code, *action) {
-            anyhow::bail!(
-                "gamepad buttons {name:?} and another binding both map to code {code:#06x} ({existing:?})"
-            );
-        }
+/// Standard Xbox/xpad positional layout.
+///
+/// The Flydigi VADER4 exposes this profile through xpad even though its
+/// D-pad arrives as `ABS_HAT0X/Y` rather than `BTN_DPAD_*` key events.
+const XBOX_PRESET: &[(&str, GamepadAction)] = &[
+    ("BTN_DPAD_UP", GamepadAction::Up),
+    ("BTN_DPAD_DOWN", GamepadAction::Down),
+    ("BTN_DPAD_LEFT", GamepadAction::Left),
+    ("BTN_DPAD_RIGHT", GamepadAction::Right),
+    ("BTN_SOUTH", GamepadAction::Confirm),
+    ("BTN_EAST", GamepadAction::Close),
+    ("BTN_WEST", GamepadAction::Back),
+    ("BTN_NORTH", GamepadAction::Tab),
+    ("BTN_TL", GamepadAction::Back),
+    ("BTN_TR", GamepadAction::Tab),
+    ("BTN_SELECT", GamepadAction::Back),
+    ("BTN_START", GamepadAction::Confirm),
+    ("BTN_MODE", GamepadAction::Close),
+];
+
+/// Standard DualShock 4 positional layout.
+///
+/// Linux exposes the same positional key codes as Xbox. The preset is kept
+/// separate so the two families can diverge without changing user overrides.
+const DS4_PRESET: &[(&str, GamepadAction)] = &[
+    ("BTN_DPAD_UP", GamepadAction::Up),
+    ("BTN_DPAD_DOWN", GamepadAction::Down),
+    ("BTN_DPAD_LEFT", GamepadAction::Left),
+    ("BTN_DPAD_RIGHT", GamepadAction::Right),
+    ("BTN_SOUTH", GamepadAction::Confirm),
+    ("BTN_EAST", GamepadAction::Close),
+    ("BTN_WEST", GamepadAction::Back),
+    ("BTN_NORTH", GamepadAction::Tab),
+    ("BTN_TL", GamepadAction::Back),
+    ("BTN_TR", GamepadAction::Tab),
+    ("BTN_SELECT", GamepadAction::Back),
+    ("BTN_START", GamepadAction::Confirm),
+    ("BTN_MODE", GamepadAction::Close),
+];
+
+fn preset_bindings(preset: GamepadPreset) -> &'static [(&'static str, GamepadAction)] {
+    match preset {
+        GamepadPreset::Xbox => XBOX_PRESET,
+        GamepadPreset::Ds4 => DS4_PRESET,
+        GamepadPreset::None | GamepadPreset::Auto => &[],
+    }
+}
+
+/// Merge a preset with the explicit config map. Explicit entries win by
+/// evdev code, so `0x130` overrides a preset's `BTN_SOUTH` entry.
+fn binding_map_for(
+    config: &GamepadConfig,
+    preset: GamepadPreset,
+) -> Result<HashMap<u16, GamepadAction>> {
+    let mut bindings = HashMap::new();
+    for (name, action) in preset_bindings(preset) {
+        bindings.insert(gamepad_button_code(name)?, *action);
+    }
+    for (name, action) in &config.buttons {
+        bindings.insert(gamepad_button_code(name)?, *action);
     }
     Ok(bindings)
+}
+
+fn preset_from_identity(
+    path: &str,
+    name: &str,
+    vendor: u16,
+    has_face_buttons: bool,
+) -> GamepadPreset {
+    let identity = format!("{path} {name}").to_ascii_lowercase();
+    if vendor == 0x054c
+        || identity.contains("dualshock")
+        || identity.contains("dualsense")
+        || identity.contains("sony")
+        || identity.contains("wireless controller")
+        || identity.contains("ds4")
+    {
+        return GamepadPreset::Ds4;
+    }
+    if identity.contains("flydigi")
+        || identity.contains("vader")
+        || identity.contains("xbox")
+        || identity.contains("x-box")
+        || identity.contains("xpad")
+        || identity.contains("microsoft")
+        || has_face_buttons
+    {
+        return GamepadPreset::Xbox;
+    }
+    GamepadPreset::None
+}
+
+fn detect_preset(path: &Path, device: &Device) -> GamepadPreset {
+    let has_face_buttons = device
+        .supported_keys()
+        .is_some_and(|keys| keys.contains(KeyCode::BTN_SOUTH) && keys.contains(KeyCode::BTN_EAST));
+    preset_from_identity(
+        &path.display().to_string(),
+        device.name().unwrap_or(""),
+        device.input_id().vendor(),
+        has_face_buttons,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HatAxis {
+    X,
+    Y,
+}
+
+const DPAD_UP: usize = 0;
+const DPAD_DOWN: usize = 1;
+const DPAD_LEFT: usize = 2;
+const DPAD_RIGHT: usize = 3;
+const DPAD_UP_CODE: u16 = KeyCode::BTN_DPAD_UP.0;
+const DPAD_DOWN_CODE: u16 = KeyCode::BTN_DPAD_DOWN.0;
+const DPAD_LEFT_CODE: u16 = KeyCode::BTN_DPAD_LEFT.0;
+const DPAD_RIGHT_CODE: u16 = KeyCode::BTN_DPAD_RIGHT.0;
+
+fn dpad_index(code: u16) -> Option<usize> {
+    match code {
+        DPAD_UP_CODE => Some(DPAD_UP),
+        DPAD_DOWN_CODE => Some(DPAD_DOWN),
+        DPAD_LEFT_CODE => Some(DPAD_LEFT),
+        DPAD_RIGHT_CODE => Some(DPAD_RIGHT),
+        _ => None,
+    }
+}
+
+fn dpad_code(index: usize) -> u16 {
+    match index {
+        DPAD_UP => DPAD_UP_CODE,
+        DPAD_DOWN => DPAD_DOWN_CODE,
+        DPAD_LEFT => DPAD_LEFT_CODE,
+        DPAD_RIGHT => DPAD_RIGHT_CODE,
+        _ => unreachable!("gamepad D-pad index"),
+    }
+}
+
+fn hat_direction(axis: HatAxis, value: i32) -> Option<usize> {
+    match (axis, value.signum()) {
+        (HatAxis::X, -1) => Some(DPAD_LEFT),
+        (HatAxis::X, 1) => Some(DPAD_RIGHT),
+        (HatAxis::Y, -1) => Some(DPAD_UP),
+        (HatAxis::Y, 1) => Some(DPAD_DOWN),
+        _ => None,
+    }
+}
+
+/// Translate key and hat events into one action while suppressing duplicate
+/// reports when a device exposes both `BTN_DPAD_*` and `ABS_HAT0*`.
+#[derive(Debug, Default)]
+struct HatTracker {
+    hat_x: i32,
+    hat_y: i32,
+    /// A direction whose hat transition already dispatched an action.
+    hat_active: [bool; 4],
+    /// A bound `BTN_DPAD_*` key currently owns this direction.
+    dpad_down: [bool; 4],
+}
+
+impl HatTracker {
+    fn update(
+        &mut self,
+        event: &InputEvent,
+        bindings: &HashMap<u16, GamepadAction>,
+    ) -> Option<GamepadAction> {
+        match event.event_type() {
+            EventType::KEY => self.key_event(event.code(), event.value(), bindings),
+            EventType::ABSOLUTE => self.absolute_event(event.code(), event.value(), bindings),
+            _ => None,
+        }
+    }
+
+    fn key_event(
+        &mut self,
+        code: u16,
+        value: i32,
+        bindings: &HashMap<u16, GamepadAction>,
+    ) -> Option<GamepadAction> {
+        if let Some(index) = dpad_index(code) {
+            return match value {
+                1 => {
+                    let bound = bindings.contains_key(&code);
+                    let duplicate = self.hat_active[index];
+                    self.dpad_down[index] = bound;
+                    if bound && !duplicate {
+                        bindings.get(&code).copied()
+                    } else {
+                        None
+                    }
+                }
+                0 => {
+                    self.dpad_down[index] = false;
+                    None
+                }
+                _ => None,
+            };
+        }
+        if value == 1 {
+            bindings.get(&code).copied()
+        } else {
+            None
+        }
+    }
+
+    fn absolute_event(
+        &mut self,
+        code: u16,
+        value: i32,
+        bindings: &HashMap<u16, GamepadAction>,
+    ) -> Option<GamepadAction> {
+        let axis = if code == AbsoluteAxisCode::ABS_HAT0X.0 {
+            HatAxis::X
+        } else if code == AbsoluteAxisCode::ABS_HAT0Y.0 {
+            HatAxis::Y
+        } else {
+            return None;
+        };
+        let old = match axis {
+            HatAxis::X => self.hat_x,
+            HatAxis::Y => self.hat_y,
+        };
+        let new = value.signum();
+        if new == old {
+            return None;
+        }
+        if let Some(index) = hat_direction(axis, old) {
+            self.hat_active[index] = false;
+        }
+        match axis {
+            HatAxis::X => self.hat_x = new,
+            HatAxis::Y => self.hat_y = new,
+        }
+        let index = hat_direction(axis, new)?;
+        let code = dpad_code(index);
+        let bound = bindings.contains_key(&code);
+        self.hat_active[index] = bound;
+        if bound && !self.dpad_down[index] {
+            bindings.get(&code).copied()
+        } else {
+            None
+        }
+    }
 }
 
 pub(crate) fn is_gamepad_event_name(name: &str) -> bool {
@@ -166,32 +440,13 @@ fn dedupe_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
 
 fn reader_loop(
     path: PathBuf,
+    mut device: Device,
     bindings: Arc<HashMap<u16, GamepadAction>>,
     tx: Sender<GamepadAction>,
     wake: WakeHandle,
     stop: Arc<AtomicBool>,
 ) {
-    let mut device = match Device::open(&path) {
-        Ok(device) => device,
-        Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                %error,
-                "cannot open gamepad; check the input group and udev permissions"
-            );
-            return;
-        }
-    };
-    if let Err(error) = device.set_nonblocking(true) {
-        tracing::warn!(
-            path = %path.display(),
-            %error,
-            "cannot make gamepad nonblocking"
-        );
-        return;
-    }
-    tracing::info!(path = %path.display(), "gamepad reader started");
-
+    let mut tracker = HatTracker::default();
     let mut full_logged = false;
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -220,7 +475,7 @@ fn reader_loop(
         match device.fetch_events() {
             Ok(events) => {
                 for event in events {
-                    let Some(action) = action_for_event(&event, &bindings) else {
+                    let Some(action) = tracker.update(&event, &bindings) else {
                         continue;
                     };
                     match tx.try_send(action) {
@@ -249,28 +504,47 @@ fn reader_loop(
     tracing::debug!(path = %path.display(), "gamepad reader stopped");
 }
 
-fn action_for_event(
-    event: &InputEvent,
-    bindings: &HashMap<u16, GamepadAction>,
-) -> Option<GamepadAction> {
-    if event.event_type() != EventType::KEY || event.value() != 1 {
-        return None;
-    }
-    bindings.get(&event.code()).copied()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::wayland::WakePipe;
     use evdev::KeyCode;
+    use std::collections::BTreeMap;
     use std::path::Path;
 
-    fn bindings() -> BTreeMap<String, GamepadAction> {
-        BTreeMap::from([
-            ("BTN_SOUTH".into(), GamepadAction::Confirm),
-            ("0x221".into(), GamepadAction::Down),
-        ])
+    fn config_with(buttons: &[(&str, GamepadAction)]) -> GamepadConfig {
+        GamepadConfig {
+            enabled: true,
+            preset: GamepadPreset::None,
+            devices: Vec::new(),
+            buttons: buttons
+                .iter()
+                .map(|(name, action)| ((*name).to_string(), *action))
+                .collect(),
+        }
+    }
+
+    fn explicit_bindings() -> HashMap<u16, GamepadAction> {
+        binding_map_for(
+            &config_with(&[
+                ("BTN_SOUTH", GamepadAction::Confirm),
+                ("0x221", GamepadAction::Down),
+            ]),
+            GamepadPreset::None,
+        )
+        .unwrap()
+    }
+
+    fn preset_map(preset: GamepadPreset) -> HashMap<u16, GamepadAction> {
+        binding_map_for(&GamepadConfig::default(), preset).unwrap()
+    }
+
+    fn key(code: KeyCode, value: i32) -> InputEvent {
+        InputEvent::new(EventType::KEY.0, code.0, value)
+    }
+
+    fn hat(axis: AbsoluteAxisCode, value: i32) -> InputEvent {
+        InputEvent::new(EventType::ABSOLUTE.0, axis.0, value)
     }
 
     #[test]
@@ -282,35 +556,236 @@ mod tests {
     }
 
     #[test]
-    fn binding_map_accepts_names_and_numeric_codes() {
-        let map = binding_map(&bindings()).unwrap();
+    fn explicit_bindings_accept_names_and_numeric_codes() {
+        let map = explicit_bindings();
         assert_eq!(map.get(&0x130), Some(&GamepadAction::Confirm));
         assert_eq!(map.get(&0x221), Some(&GamepadAction::Down));
     }
 
     #[test]
-    fn binding_map_rejects_duplicate_codes() {
-        let duplicate = BTreeMap::from([
-            ("BTN_SOUTH".into(), GamepadAction::Confirm),
-            ("0x130".into(), GamepadAction::Close),
-        ]);
-        assert!(binding_map(&duplicate).is_err());
+    fn xbox_preset_covers_dpad_face_and_system_buttons() {
+        let map = preset_map(GamepadPreset::Xbox);
+        assert_eq!(map.get(&KeyCode::BTN_DPAD_UP.0), Some(&GamepadAction::Up));
+        assert_eq!(
+            map.get(&KeyCode::BTN_DPAD_DOWN.0),
+            Some(&GamepadAction::Down)
+        );
+        assert_eq!(
+            map.get(&KeyCode::BTN_DPAD_LEFT.0),
+            Some(&GamepadAction::Left)
+        );
+        assert_eq!(
+            map.get(&KeyCode::BTN_DPAD_RIGHT.0),
+            Some(&GamepadAction::Right)
+        );
+        assert_eq!(
+            map.get(&KeyCode::BTN_SOUTH.0),
+            Some(&GamepadAction::Confirm)
+        );
+        assert_eq!(map.get(&KeyCode::BTN_EAST.0), Some(&GamepadAction::Close));
+        assert_eq!(map.get(&KeyCode::BTN_WEST.0), Some(&GamepadAction::Back));
+        assert_eq!(map.get(&KeyCode::BTN_NORTH.0), Some(&GamepadAction::Tab));
+        assert_eq!(
+            map.get(&KeyCode::BTN_START.0),
+            Some(&GamepadAction::Confirm)
+        );
+        assert_eq!(map.get(&KeyCode::BTN_MODE.0), Some(&GamepadAction::Close));
+        assert_eq!(map.len(), XBOX_PRESET.len());
+    }
+
+    #[test]
+    fn ds4_preset_covers_dpad_face_and_system_buttons() {
+        let map = preset_map(GamepadPreset::Ds4);
+        assert_eq!(map.get(&KeyCode::BTN_DPAD_UP.0), Some(&GamepadAction::Up));
+        assert_eq!(
+            map.get(&KeyCode::BTN_DPAD_LEFT.0),
+            Some(&GamepadAction::Left)
+        );
+        assert_eq!(
+            map.get(&KeyCode::BTN_SOUTH.0),
+            Some(&GamepadAction::Confirm)
+        );
+        assert_eq!(map.get(&KeyCode::BTN_EAST.0), Some(&GamepadAction::Close));
+        assert_eq!(
+            map.get(&KeyCode::BTN_START.0),
+            Some(&GamepadAction::Confirm)
+        );
+        assert_eq!(map.len(), DS4_PRESET.len());
+    }
+
+    #[test]
+    fn explicit_overrides_win_over_a_preset_by_code() {
+        let config = GamepadConfig {
+            enabled: true,
+            preset: GamepadPreset::Xbox,
+            devices: Vec::new(),
+            buttons: BTreeMap::from([
+                ("0x130".into(), GamepadAction::Close),
+                ("BTN_EAST".into(), GamepadAction::Tab),
+            ]),
+        };
+        let map = binding_map_for(&config, GamepadPreset::Xbox).unwrap();
+        assert_eq!(map.get(&KeyCode::BTN_SOUTH.0), Some(&GamepadAction::Close));
+        assert_eq!(map.get(&KeyCode::BTN_EAST.0), Some(&GamepadAction::Tab));
+    }
+
+    #[test]
+    fn auto_detection_maps_flydigi_vader_to_xbox() {
+        assert_eq!(
+            preset_from_identity(
+                "/dev/input/by-id/usb-Flydigi_Flydigi_VADER4-event-joystick",
+                "Flydigi VADER4",
+                0x045e,
+                true
+            ),
+            GamepadPreset::Xbox
+        );
+    }
+
+    #[test]
+    fn auto_detection_maps_sony_devices_to_ds4() {
+        assert_eq!(
+            preset_from_identity(
+                "/dev/input/by-id/usb-Sony_Interactive_Entertainment_Wireless_Controller-event-joystick",
+                "Sony Interactive Entertainment Wireless Controller",
+                0,
+                true
+            ),
+            GamepadPreset::Ds4
+        );
+        assert_eq!(
+            preset_from_identity("", "", 0x054c, true),
+            GamepadPreset::Ds4
+        );
+    }
+
+    #[test]
+    fn auto_detection_uses_xbox_for_other_face_button_gamepads() {
+        assert_eq!(
+            preset_from_identity("", "Microsoft X-Box 360 pad", 0x045e, true),
+            GamepadPreset::Xbox
+        );
+        assert_eq!(
+            preset_from_identity("", "Unknown pad", 0, true),
+            GamepadPreset::Xbox
+        );
+        assert_eq!(
+            preset_from_identity("", "Unknown hat-only device", 0, false),
+            GamepadPreset::None
+        );
     }
 
     #[test]
     fn only_key_presses_become_actions() {
-        let map = binding_map(&bindings()).unwrap();
-        let press = InputEvent::new(EventType::KEY.0, KeyCode::BTN_SOUTH.0, 1);
-        assert_eq!(action_for_event(&press, &map), Some(GamepadAction::Confirm));
+        let map = explicit_bindings();
+        let mut tracker = HatTracker::default();
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_SOUTH, 1), &map),
+            Some(GamepadAction::Confirm)
+        );
+        assert_eq!(tracker.update(&key(KeyCode::BTN_SOUTH, 0), &map), None);
+        assert_eq!(tracker.update(&key(KeyCode::BTN_SOUTH, 2), &map), None);
+        assert_eq!(
+            tracker.update(&InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 1), &map),
+            None
+        );
+        assert_eq!(tracker.update(&key(KeyCode::BTN_EAST, 1), &map), None);
+    }
 
-        let release = InputEvent::new(EventType::KEY.0, KeyCode::BTN_SOUTH.0, 0);
-        assert_eq!(action_for_event(&release, &map), None);
-        let repeat = InputEvent::new(EventType::KEY.0, KeyCode::BTN_SOUTH.0, 2);
-        assert_eq!(action_for_event(&repeat, &map), None);
-        let other_type = InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 1);
-        assert_eq!(action_for_event(&other_type, &map), None);
-        let unbound = InputEvent::new(EventType::KEY.0, KeyCode::BTN_EAST.0, 1);
-        assert_eq!(action_for_event(&unbound, &map), None);
+    #[test]
+    fn hat_axis_values_map_to_dpad_actions() {
+        let map = preset_map(GamepadPreset::Xbox);
+        let mut tracker = HatTracker::default();
+
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_HAT0X, -1), &map),
+            Some(GamepadAction::Left)
+        );
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_HAT0X, -1), &map),
+            None,
+            "a held hat value must not repeat"
+        );
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_HAT0X, 0), &map),
+            None,
+            "neutral is a release, not an action"
+        );
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_HAT0X, -1), &map),
+            Some(GamepadAction::Left)
+        );
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_HAT0X, 1), &map),
+            Some(GamepadAction::Right),
+            "a direct reversal dispatches the new direction"
+        );
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_HAT0Y, -1), &map),
+            Some(GamepadAction::Up)
+        );
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_HAT0Y, 1), &map),
+            Some(GamepadAction::Down)
+        );
+    }
+
+    #[test]
+    fn diagonal_hat_axes_emit_both_directions() {
+        let map = preset_map(GamepadPreset::Xbox);
+        let mut tracker = HatTracker::default();
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_HAT0X, -1), &map),
+            Some(GamepadAction::Left)
+        );
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_HAT0Y, -1), &map),
+            Some(GamepadAction::Up)
+        );
+    }
+
+    #[test]
+    fn dpad_key_and_hat_do_not_double_dispatch() {
+        let map = preset_map(GamepadPreset::Xbox);
+
+        // Key event first.
+        let mut tracker = HatTracker::default();
+        assert_eq!(
+            tracker.update(&key(KeyCode::BTN_DPAD_UP, 1), &map),
+            Some(GamepadAction::Up)
+        );
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_HAT0Y, -1), &map),
+            None
+        );
+        assert_eq!(tracker.update(&key(KeyCode::BTN_DPAD_UP, 0), &map), None);
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_HAT0Y, 0), &map),
+            None
+        );
+
+        // Hat event first.
+        let mut tracker = HatTracker::default();
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_HAT0Y, -1), &map),
+            Some(GamepadAction::Up)
+        );
+        assert_eq!(tracker.update(&key(KeyCode::BTN_DPAD_UP, 1), &map), None);
+        assert_eq!(tracker.update(&key(KeyCode::BTN_DPAD_UP, 0), &map), None);
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_HAT0Y, 0), &map),
+            None
+        );
+    }
+
+    #[test]
+    fn non_hat_absolute_axes_are_ignored() {
+        let map = preset_map(GamepadPreset::Xbox);
+        let mut tracker = HatTracker::default();
+        assert_eq!(
+            tracker.update(&hat(AbsoluteAxisCode::ABS_X, 100), &map),
+            None
+        );
     }
 
     #[test]

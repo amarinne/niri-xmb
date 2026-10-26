@@ -124,20 +124,28 @@ close_on_external_focus_change = false # close after another surface changes Nir
 replay_outside_click = true # replay the captured click when virtual pointer support exists
 close_on_escape = true       # Escape closes the popup
 
-# Optional evdev gamepad button map. Disabled by default. Gamepads are read
-# outside the Wayland seat; actions apply only while the manual popup is open.
-# Prefer stable /dev/input/by-id paths; leave devices empty to discover
+# Optional evdev gamepad input. Disabled by default. Gamepads are read outside
+# the Wayland seat; actions apply only while the manual popup is open. Prefer
+# stable /dev/input/by-id paths; leave devices empty to discover
 # *-event-joystick and *-event-gamepad symlinks. Reading /dev/input usually
-# needs the "input" group or a udev rule. Button keys accept evdev names or
-# 16-bit decimal/hex codes. Actions: up, down, left, right, tab, back (previous
-# output), confirm, close.
+# needs the "input" group or a udev rule.
+#
+# preset: "none" uses only the buttons map; "auto" detects each device from its
+# name, USB identity, and capabilities (Flydigi VADER4 and xpad-compatible pads
+# use "xbox"; Sony/DualShock/DualSense use "ds4"); "xbox" and "ds4" force a
+# layout. Explicit buttons below override preset entries by evdev code.
+# D-pad hat axes (ABS_HAT0X/Y) are translated to the configured BTN_DPAD_*
+# actions, so controllers without BTN_DPAD_* key events work.
+# Actions: up, down, left, right, tab, back (previous output), confirm, close.
 [gamepad]
 enabled = false
+preset = "auto"
 devices = []
 
 [gamepad.buttons]
 # BTN_SOUTH = "confirm"
 # BTN_EAST = "close"
+# "0x130" = "close"     # numeric overrides work too
 # BTN_DPAD_UP = "up"
 # BTN_DPAD_DOWN = "down"
 # BTN_DPAD_LEFT = "left"

@@ -994,6 +994,20 @@ impl Default for BehaviorConfig {
     }
 }
 
+/// Optional built-in controller layout.
+///
+/// `Auto` detects the layout per device from its name, USB identity, and
+/// capabilities. `None` keeps the explicit `buttons` map only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GamepadPreset {
+    #[default]
+    None,
+    Auto,
+    Xbox,
+    Ds4,
+}
+
 /// One action a gamepad button can trigger while the manual popup is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1020,19 +1034,22 @@ pub enum GamepadAction {
 #[serde(default)]
 pub struct GamepadConfig {
     pub enabled: bool,
+    /// Built-in layout, automatic detection, or no preset. Explicit
+    /// `buttons` entries override preset entries by evdev code.
+    pub preset: GamepadPreset,
     /// Absolute evdev event device paths. Empty means discover stable
     /// `/dev/input/by-id/*-event-joystick` and `*-event-gamepad` symlinks.
     pub devices: Vec<String>,
     /// evdev button name such as `BTN_SOUTH`, or a 16-bit decimal/hex code,
-    /// mapped to one manual-popup action.
+    /// mapped to one manual-popup action. These override preset entries.
     pub buttons: BTreeMap<String, GamepadAction>,
 }
 
 impl GamepadConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.enabled && self.buttons.is_empty() {
+        if self.enabled && self.preset == GamepadPreset::None && self.buttons.is_empty() {
             anyhow::bail!(
-                "gamepad.buttons must define at least one binding when gamepad.enabled is true"
+                "gamepad.buttons must define at least one binding when gamepad.enabled is true and gamepad.preset is \"none\""
             );
         }
         for (index, device) in self.devices.iter().enumerate() {
@@ -1536,6 +1553,7 @@ mod tests {
     fn gamepad_is_disabled_by_default() {
         let config = Config::default();
         assert!(!config.gamepad.enabled);
+        assert_eq!(config.gamepad.preset, GamepadPreset::None);
         assert!(config.gamepad.devices.is_empty());
         assert!(config.gamepad.buttons.is_empty());
         config.validate().unwrap();
@@ -1547,6 +1565,7 @@ mod tests {
             r#"
             [gamepad]
             enabled = true
+            preset = "auto"
             devices = ["/dev/input/by-id/usb-test-event-joystick"]
             [gamepad.buttons]
             BTN_SOUTH = "confirm"
@@ -1558,6 +1577,7 @@ mod tests {
         .unwrap();
 
         assert!(config.gamepad.enabled);
+        assert_eq!(config.gamepad.preset, GamepadPreset::Auto);
         assert_eq!(
             config.gamepad.buttons.get("BTN_SOUTH"),
             Some(&GamepadAction::Confirm)
@@ -1575,7 +1595,7 @@ mod tests {
     }
 
     #[test]
-    fn gamepad_rejects_empty_bindings_when_enabled() {
+    fn gamepad_rejects_empty_bindings_when_enabled_without_a_preset() {
         let error = load_source(
             r#"
             [gamepad]
@@ -1589,6 +1609,42 @@ mod tests {
             format!("{error:#}").contains("gamepad.buttons"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn gamepad_presets_allow_empty_overrides() {
+        for (name, preset) in [
+            ("auto", GamepadPreset::Auto),
+            ("xbox", GamepadPreset::Xbox),
+            ("ds4", GamepadPreset::Ds4),
+        ] {
+            let config = load_source(
+                &format!(
+                    r#"
+                    [gamepad]
+                    enabled = true
+                    preset = "{name}"
+                    devices = ["/dev/input/event0"]
+                    "#
+                ),
+                None,
+            )
+            .unwrap();
+            assert_eq!(config.gamepad.preset, preset);
+            assert!(config.gamepad.buttons.is_empty());
+        }
+    }
+
+    #[test]
+    fn gamepad_rejects_unknown_presets() {
+        let error = toml::from_str::<Config>(
+            r#"
+            [gamepad]
+            preset = "nope"
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{error}").contains("nope"), "{error}");
     }
 
     #[test]
