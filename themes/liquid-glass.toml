@@ -1,0 +1,18 @@
+# Derived from a "liquid glass" style: translucent frosted layers over the
+# desktop, a soft white gradient, restrained shadow, and a clear blue accent
+# for the active input. Only colours are set here; layout and sizing are left
+# to the built-in defaults.
+[style]
+background = "#f2f6f8fa"       # light translucent lift of the panel
+background_end = "#f2eef2f6"   # slightly cooler bottom stop
+surface = "#66ffffff"          # frosted white panel tint
+surface_hover = "#40007aff"    # blue hover tint at light alpha
+border = "#5cffffff"           # soft white border
+border_soft = "#2affffff"      # fainter white edge
+accent = "#ff007aff"           # blue, clear active-input accent
+selection_border = "#90007aff" # blue at a stronger alpha
+text = "#ff1c1c1e"             # near-black readable text
+muted = "#ff6e6e73"            # secondary grey text
+urgent = "#ffff3b30"           # system red
+shadow = "#26000000"           # restrained dark shadow
+floating_backing = "#beffffff" # near-white disc behind floating icons
