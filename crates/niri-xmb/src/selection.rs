@@ -28,6 +28,18 @@ impl Selection {
         select_active_workspace(self, snapshot);
     }
 
+    /// Move selection ownership only when the target panel changed.
+    ///
+    /// Wheel packets arrive faster than snapshots. Resetting on every packet
+    /// would discard the staged workspace/window and make a burst advance one
+    /// step at most.
+    pub(crate) fn ensure_output(&mut self, output: &str, snapshot: &Snapshot) {
+        if self.output != output {
+            self.output = output.to_string();
+            select_active_workspace(self, snapshot);
+        }
+    }
+
     /// Record the current position so returning to this workspace restores it.
     fn remember(&mut self, snapshot: &Snapshot) {
         if let (Some(workspace), Some(window)) = (
@@ -306,6 +318,49 @@ mod tests {
             generation: 1,
             content_revision: 0,
         }
+    }
+
+    #[test]
+    fn ensure_output_keeps_the_staged_position_until_the_panel_changes() {
+        let mut snapshot = snapshot();
+        let mut dp2_workspace = workspace(4, 2, 1);
+        dp2_workspace.active = true;
+        dp2_workspace.focused = true;
+        snapshot.outputs.insert(
+            "DP-2".into(),
+            OutputModel {
+                name: "DP-2".into(),
+                x: 2560,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                workspaces: vec![dp2_workspace],
+            },
+        );
+
+        let mut selection = Selection {
+            output: "DP-1".into(),
+            workspace: 1,
+            window: 2,
+            ..Selection::default()
+        };
+        selection.ensure_output("DP-1", &snapshot);
+        assert_eq!(
+            (selection.workspace, selection.window),
+            (1, 2),
+            "the same panel must not reset the staged selection"
+        );
+
+        selection.ensure_output("DP-2", &snapshot);
+        assert_eq!(selection.output, "DP-2");
+        assert_eq!(
+            (selection.workspace, selection.window),
+            (0, 1),
+            "a panel transition starts from that output's active state"
+        );
+
+        selection.ensure_output("DP-2", &snapshot);
+        assert_eq!((selection.workspace, selection.window), (0, 1));
     }
 
     #[test]

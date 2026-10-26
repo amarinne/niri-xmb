@@ -128,8 +128,13 @@ No target zone may create a joined Niri column in this mode.
 Each taskbar widget must target one Niri output.
 Each widget must route focus, workspace cycling, and drag through `niri-xmb`.
 Taskbar focus changes must not raise peek unless the event policy requests it.
-Wheel input must start from the workspace row under the pointer.
-A wheel gesture must keep a stable target until the pointer changes rows.
+Wheel input goes to the panel under the pointer. When no panel is under the
+pointer, it goes to the open panel on the focused output; a fixed panel keeps
+its own output. With no open panel, it goes to the bar on the focused output.
+Keyboard focus must not choose the wheel target.
+When the pointer is over a bar, wheel input must start from the workspace row
+under the pointer.
+A wheel gesture must keep a stable target until the pointer changes rows or panels.
 Queued requests must use the previous queued target until Niri updates state.
 Ratchet input must move one workspace per complete 120-unit step.
 Free-spin input must use the configured repeat limit.

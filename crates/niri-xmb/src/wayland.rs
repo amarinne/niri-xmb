@@ -117,6 +117,7 @@ pub enum UiEventKind {
     Scroll {
         axis: ScrollAxis,
         steps: i32,
+        target: ScrollTarget,
     },
     Key {
         keysym: u32,
@@ -127,6 +128,17 @@ pub enum UiEventKind {
 pub enum ScrollAxis {
     Vertical,
     Horizontal,
+}
+
+/// Where wheel input should go.
+///
+/// `Hovered` carries the surface under the pointer. `Focused` means the
+/// pointer is not over any XMB panel, so the UI resolves the panel on the
+/// focused output. Keyboard focus is deliberately not part of this choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollTarget {
+    Hovered,
+    Focused,
 }
 
 /// Convert high-resolution Wayland wheel data into complete wheel steps.
@@ -1414,6 +1426,34 @@ impl WaylandState {
             event,
         });
     }
+
+    /// Whether `id` is a configured panel surface that can own wheel input.
+    ///
+    /// The pointer surface is the authority for hover. A bar or popup that is
+    /// not configured yet cannot receive the gesture, so it falls through to
+    /// the focused-panel path rather than swallowing the wheel.
+    fn is_hovered_target(&self, id: usize) -> bool {
+        self.surfaces.iter().any(|surface| {
+            surface.id == id
+                && surface.configured
+                && matches!(surface.kind, SurfaceKind::Bar(_) | SurfaceKind::Popup)
+        })
+    }
+
+    /// Send a wheel event with no hovered panel. The UI resolves the panel
+    /// from the focused output; the sentinel surface fields are never read.
+    fn emit_focused_scroll(&self, event: UiEventKind) {
+        let _ = self.event_tx.try_send(UiEvent {
+            surface_id: usize::MAX,
+            kind: SurfaceKind::Popup,
+            output: String::new(),
+            x: 0.0,
+            y: 0.0,
+            global_x: 0.0,
+            global_y: 0.0,
+            event,
+        });
+    }
 }
 
 fn configure_bar(layer_surface: &SctLayerSurface, config: &BarConfig) {
@@ -1720,26 +1760,30 @@ impl PointerHandler for WaylandState {
                     if horizontal.stop {
                         self.wheel_steps.horizontal.finish_axis();
                     }
-                    if let Some(id) = self.pointer_surface.or(surface_id) {
-                        if vertical_steps != 0 {
-                            self.emit(
-                                id,
-                                UiEventKind::Scroll {
-                                    axis: ScrollAxis::Vertical,
-                                    steps: vertical_steps,
-                                },
-                            );
+                    let hovered = self
+                        .pointer_surface
+                        .or(surface_id)
+                        .filter(|id| self.is_hovered_target(*id));
+                    let send = |axis, steps| {
+                        if steps == 0 {
+                            return;
                         }
-                        if horizontal_steps != 0 {
-                            self.emit(
-                                id,
-                                UiEventKind::Scroll {
-                                    axis: ScrollAxis::Horizontal,
-                                    steps: horizontal_steps,
-                                },
-                            );
+                        let event = UiEventKind::Scroll {
+                            axis,
+                            steps,
+                            target: if hovered.is_some() {
+                                ScrollTarget::Hovered
+                            } else {
+                                ScrollTarget::Focused
+                            },
+                        };
+                        match hovered {
+                            Some(id) => self.emit(id, event),
+                            None => self.emit_focused_scroll(event),
                         }
-                    }
+                    };
+                    send(ScrollAxis::Vertical, vertical_steps);
+                    send(ScrollAxis::Horizontal, horizontal_steps);
                 }
             }
         }

@@ -43,7 +43,8 @@ use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wayland::{
-    PopupInput, ScrollAxis, SurfaceKind, SurfaceManager, UiEvent, UiEventKind, WakePipe,
+    PopupInput, ScrollAxis, ScrollTarget, SurfaceInfo, SurfaceKind, SurfaceManager, UiEvent,
+    UiEventKind, WakePipe,
 };
 
 /// How long after niri-xmb moves focus itself that the resulting snapshot is
@@ -1474,7 +1475,11 @@ fn classify_peek_pointer(event: &UiEvent) -> PeekPointer {
         return PeekPointer::Ignore;
     }
     match event.event {
-        UiEventKind::Motion | UiEventKind::Scroll { .. } => PeekPointer::Arm,
+        UiEventKind::Motion
+        | UiEventKind::Scroll {
+            target: ScrollTarget::Hovered,
+            ..
+        } => PeekPointer::Arm,
         UiEventKind::Leave => PeekPointer::Disarm,
         UiEventKind::Press { button } if button == BTN_LEFT => PeekPointer::Promote,
         _ => PeekPointer::Ignore,
@@ -1641,6 +1646,84 @@ fn update_following_popup(
     panel.outputs_mut().insert(active_output.clone());
     selection.select_output(active_output, snapshot);
     Ok(true)
+}
+
+/// A resolved wheel target.
+///
+/// A hovered bar keeps the surface id so the existing row-under-pointer target
+/// still starts the gesture. The focused fallback has no pointer row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WheelTarget {
+    Bar {
+        index: usize,
+        output: String,
+        surface_id: Option<usize>,
+    },
+    Popup {
+        output: String,
+    },
+}
+
+fn wheel_target_from_surface(surface: &SurfaceInfo, hovered: bool) -> WheelTarget {
+    match surface.kind {
+        SurfaceKind::Bar(index) => WheelTarget::Bar {
+            index,
+            output: surface.output.clone(),
+            surface_id: hovered.then_some(surface.id),
+        },
+        SurfaceKind::Popup => WheelTarget::Popup {
+            output: surface.output.clone(),
+        },
+    }
+}
+
+/// Pick the panel that owns wheel input.
+///
+/// The surface under the pointer always wins. Without one, the open panel is
+/// the focused panel: prefer its surface on the focused output, then any
+/// visible popup (a fixed panel can sit on another output). With no open
+/// popup, use the bar on the focused output. `keyboard_surface` is never
+/// consulted because it moves independently from the pointer.
+fn resolve_wheel_target(
+    hovered: Option<&SurfaceInfo>,
+    focused_output: Option<&str>,
+    surfaces: &[SurfaceInfo],
+    popup_open: bool,
+) -> Option<WheelTarget> {
+    if let Some(surface) = hovered.filter(|surface| surface.configured) {
+        return Some(wheel_target_from_surface(surface, true));
+    }
+    if popup_open {
+        let popup = surfaces
+            .iter()
+            .find(|surface| {
+                surface.configured
+                    && matches!(surface.kind, SurfaceKind::Popup)
+                    && Some(surface.output.as_str()) == focused_output
+            })
+            .or_else(|| {
+                surfaces.iter().find(|surface| {
+                    surface.configured && matches!(surface.kind, SurfaceKind::Popup)
+                })
+            });
+        if let Some(popup) = popup {
+            return Some(wheel_target_from_surface(popup, false));
+        }
+    }
+    let focused_output = focused_output?;
+    let bar = surfaces.iter().find(|surface| {
+        surface.configured
+            && matches!(surface.kind, SurfaceKind::Bar(_))
+            && surface.output.as_str() == focused_output
+    })?;
+    Some(wheel_target_from_surface(bar, false))
+}
+
+fn scroll_deltas(axis: ScrollAxis, steps: i32) -> (i32, i32) {
+    match axis {
+        ScrollAxis::Vertical => (steps, 0),
+        ScrollAxis::Horizontal => (0, steps),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1896,41 +1979,68 @@ fn handle_ui_event(
             }
             Ok(true)
         }
-        UiEventKind::Scroll { axis, steps } => {
-            if let SurfaceKind::Bar(index) = event.kind {
-                if axis != ScrollAxis::Vertical {
-                    return Ok(true);
-                }
-                if let Some(bar) = config.bars.get(index).filter(|bar| bar.scroll_to_switch) {
-                    let mut delta = steps;
-                    if bar.scroll_reverse {
-                        delta = -delta;
+        UiEventKind::Scroll {
+            axis,
+            steps,
+            target,
+        } => {
+            let surface_infos = surfaces.surfaces();
+            let hovered = match target {
+                ScrollTarget::Hovered => surface_infos
+                    .iter()
+                    .find(|surface| surface.id == event.surface_id),
+                ScrollTarget::Focused => None,
+            };
+            let Some(wheel_target) = resolve_wheel_target(
+                hovered,
+                snapshot.focused_output(),
+                &surface_infos,
+                panel.is_open(),
+            ) else {
+                return Ok(true);
+            };
+            match wheel_target {
+                WheelTarget::Bar {
+                    index,
+                    output,
+                    surface_id,
+                } => {
+                    if axis != ScrollAxis::Vertical {
+                        return Ok(true);
                     }
-                    let hovered_workspace =
-                        renderer.workspace_at(event.surface_id, event.x, event.y);
-                    if focus_adjacent_workspace(
-                        snapshot,
-                        &event.output,
-                        hovered_workspace,
-                        delta,
-                        bar.scroll_wrap,
-                        Duration::from_millis(bar.scroll_repeat_ms),
-                        bar_scrolls.entry(event.output.clone()).or_default(),
-                        niri_tx,
-                    ) {
-                        // Bar wheel input is routed through niri-xmb. It is a
-                        // direct widget command, not external workspace
-                        // navigation that should raise a passive peek.
-                        *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
+                    if let Some(bar) = config.bars.get(index).filter(|bar| bar.scroll_to_switch) {
+                        let mut delta = steps;
+                        if bar.scroll_reverse {
+                            delta = -delta;
+                        }
+                        let hovered_workspace =
+                            surface_id.and_then(|id| renderer.workspace_at(id, event.x, event.y));
+                        if focus_adjacent_workspace(
+                            snapshot,
+                            &output,
+                            hovered_workspace,
+                            delta,
+                            bar.scroll_wrap,
+                            Duration::from_millis(bar.scroll_repeat_ms),
+                            bar_scrolls.entry(output.clone()).or_default(),
+                            niri_tx,
+                        ) {
+                            // Bar wheel input is routed through niri-xmb. It is
+                            // a direct widget command, not external workspace
+                            // navigation that should raise a passive peek.
+                            *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
+                        }
                     }
                 }
-            } else {
-                let (workspace_delta, window_delta) = match axis {
-                    ScrollAxis::Vertical => (steps, 0),
-                    ScrollAxis::Horizontal => (0, steps),
-                };
-                move_selection(selection, snapshot, workspace_delta, window_delta);
-                follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+                WheelTarget::Popup { output } => {
+                    // Keep the staged selection when the target panel is
+                    // unchanged; only a panel/output transition starts from
+                    // that output's live state.
+                    selection.ensure_output(&output, snapshot);
+                    let (workspace_delta, window_delta) = scroll_deltas(axis, steps);
+                    move_selection(selection, snapshot, workspace_delta, window_delta);
+                    follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+                }
             }
             Ok(true)
         }
@@ -2833,6 +2943,191 @@ mod ui_tests {
         }
     }
 
+    fn focused_dp2_snapshot() -> Snapshot {
+        let mut snapshot = snapshot();
+        snapshot.outputs.get_mut("DP-1").unwrap().workspaces[0].focused = false;
+        let mut dp2_workspace = workspace(4, 2, 1);
+        dp2_workspace.active = true;
+        dp2_workspace.focused = true;
+        snapshot.outputs.insert(
+            "DP-2".into(),
+            OutputModel {
+                name: "DP-2".into(),
+                x: 2560,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                workspaces: vec![dp2_workspace],
+            },
+        );
+        snapshot
+    }
+
+    fn surface_info(id: usize, kind: SurfaceKind, output: &str, configured: bool) -> SurfaceInfo {
+        SurfaceInfo {
+            id,
+            kind,
+            output: output.into(),
+            global_x: 0.0,
+            global_y: 0.0,
+            width: 1920,
+            height: 1080,
+            configured,
+            frame_ready: true,
+            needs_full_redraw: false,
+            scale_factor: 1,
+        }
+    }
+
+    #[test]
+    fn a_hovered_panel_wins_over_the_focused_output() {
+        let snapshot = focused_dp2_snapshot();
+        let surfaces = vec![
+            surface_info(1, SurfaceKind::Bar(0), "DP-2", true),
+            surface_info(2, SurfaceKind::Popup, "DP-1", true),
+        ];
+        assert_eq!(
+            resolve_wheel_target(
+                Some(&surfaces[1]),
+                snapshot.focused_output(),
+                &surfaces,
+                true
+            ),
+            Some(WheelTarget::Popup {
+                output: "DP-1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn pointer_away_falls_back_to_the_focused_output_bar() {
+        let snapshot = focused_dp2_snapshot();
+        let surfaces = vec![
+            surface_info(1, SurfaceKind::Popup, "DP-1", true),
+            surface_info(2, SurfaceKind::Bar(1), "DP-2", true),
+        ];
+        assert_eq!(
+            resolve_wheel_target(None, snapshot.focused_output(), &surfaces, false),
+            Some(WheelTarget::Bar {
+                index: 1,
+                output: "DP-2".into(),
+                surface_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn pointer_away_prefers_the_open_panel_on_the_focused_output() {
+        let snapshot = focused_dp2_snapshot();
+        let surfaces = vec![
+            surface_info(1, SurfaceKind::Popup, "DP-1", true),
+            surface_info(2, SurfaceKind::Popup, "DP-2", true),
+        ];
+        assert_eq!(
+            resolve_wheel_target(None, snapshot.focused_output(), &surfaces, true),
+            Some(WheelTarget::Popup {
+                output: "DP-2".into()
+            })
+        );
+    }
+
+    #[test]
+    fn pointer_away_uses_a_fixed_popup_when_the_focused_output_has_no_panel() {
+        let snapshot = focused_dp2_snapshot();
+        let surfaces = vec![
+            surface_info(1, SurfaceKind::Popup, "DP-1", true),
+            surface_info(2, SurfaceKind::Bar(1), "DP-2", true),
+        ];
+        // The open panel is the focused panel even when Niri focus moved on.
+        assert_eq!(
+            resolve_wheel_target(None, snapshot.focused_output(), &surfaces, true),
+            Some(WheelTarget::Popup {
+                output: "DP-1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn panel_transitions_switch_the_wheel_target_output() {
+        let snapshot = focused_dp2_snapshot();
+        let surfaces = vec![
+            surface_info(1, SurfaceKind::Bar(0), "DP-1", true),
+            surface_info(2, SurfaceKind::Bar(1), "DP-2", true),
+        ];
+        assert_eq!(
+            resolve_wheel_target(
+                Some(&surfaces[0]),
+                snapshot.focused_output(),
+                &surfaces,
+                false
+            ),
+            Some(WheelTarget::Bar {
+                index: 0,
+                output: "DP-1".into(),
+                surface_id: Some(1),
+            })
+        );
+        assert_eq!(
+            resolve_wheel_target(
+                Some(&surfaces[1]),
+                snapshot.focused_output(),
+                &surfaces,
+                false
+            ),
+            Some(WheelTarget::Bar {
+                index: 1,
+                output: "DP-2".into(),
+                surface_id: Some(2),
+            })
+        );
+        assert_eq!(
+            resolve_wheel_target(None, snapshot.focused_output(), &surfaces, false),
+            Some(WheelTarget::Bar {
+                index: 1,
+                output: "DP-2".into(),
+                surface_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_hovered_panel_falls_back_to_focus() {
+        let snapshot = focused_dp2_snapshot();
+        let surfaces = vec![
+            surface_info(1, SurfaceKind::Popup, "DP-1", false),
+            surface_info(2, SurfaceKind::Bar(0), "DP-2", true),
+        ];
+        assert_eq!(
+            resolve_wheel_target(
+                Some(&surfaces[0]),
+                snapshot.focused_output(),
+                &surfaces,
+                true
+            ),
+            Some(WheelTarget::Bar {
+                index: 0,
+                output: "DP-2".into(),
+                surface_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn no_panel_means_no_wheel_target() {
+        let snapshot = focused_dp2_snapshot();
+        let surfaces = vec![surface_info(1, SurfaceKind::Popup, "DP-1", true)];
+        assert_eq!(
+            resolve_wheel_target(None, snapshot.focused_output(), &surfaces, false),
+            None
+        );
+    }
+
+    #[test]
+    fn wheel_axes_keep_their_existing_deltas() {
+        assert_eq!(scroll_deltas(ScrollAxis::Vertical, 3), (3, 0));
+        assert_eq!(scroll_deltas(ScrollAxis::Horizontal, -2), (0, -2));
+    }
+
     /// A peek overlay would only duplicate Niri's own overview, so navigation
     /// while the overview is open must not raise one.
     #[test]
@@ -2878,6 +3173,26 @@ mod ui_tests {
         assert_eq!(
             classify_peek_pointer(&popup_event(UiEventKind::Motion)),
             PeekPointer::Arm
+        );
+    }
+
+    #[test]
+    fn a_focused_scroll_does_not_arm_the_peek_overlay() {
+        assert_eq!(
+            classify_peek_pointer(&popup_event(UiEventKind::Scroll {
+                axis: ScrollAxis::Vertical,
+                steps: 1,
+                target: ScrollTarget::Hovered,
+            })),
+            PeekPointer::Arm
+        );
+        assert_eq!(
+            classify_peek_pointer(&popup_event(UiEventKind::Scroll {
+                axis: ScrollAxis::Vertical,
+                steps: 1,
+                target: ScrollTarget::Focused,
+            })),
+            PeekPointer::Ignore
         );
     }
 
