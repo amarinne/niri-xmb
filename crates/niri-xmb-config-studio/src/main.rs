@@ -1538,9 +1538,16 @@ impl StudioApp {
 
     fn trigger_response(&mut self, ui: &mut Ui) {
         ui.label(
-            RichText::new("Target multiplier; smoothing is applied by the daemon, not simulated.")
+            RichText::new("Y = speed multiplier (1.0× = baseline). X = trigger pull.")
                 .size(10.0)
                 .color(TEXT_DIM),
+        );
+        ui.label(
+            RichText::new(
+                "LT is the brake (full pull = slower). RT is the gas (full pull = faster).",
+            )
+            .size(10.0)
+            .color(TEXT_DIM),
         );
         ui.add_space(6.0);
         if ui.available_width() >= 620.0 {
@@ -1555,7 +1562,7 @@ impl StudioApp {
         }
         ui.add_space(4.0);
         ui.label(
-            RichText::new("Drag LT/RT endpoints; dz and curve handles shape the pull.")
+            RichText::new("Drag the LT/RT endpoints and the deadzone/curve handles to edit the real settings.")
                 .size(9.5)
                 .color(TEXT_DIM),
         );
@@ -1609,7 +1616,11 @@ impl StudioApp {
         let painter = ui.painter().clone();
         painter.rect_filled(plot, 5.0, FIELD_BG);
         painter.rect_stroke(plot, 5.0, Stroke::new(1.0_f32, BORDER), StrokeKind::Inside);
-        for value in [0.0, 1.0, y_max] {
+        for (value, label) in [
+            (0.0, "0×".to_string()),
+            (1.0, "1× base".to_string()),
+            (y_max, format!("{y_max:.1}×")),
+        ] {
             let y = to_pos(0.0, value).y;
             painter.line_segment(
                 [Pos2::new(plot.min.x, y), Pos2::new(plot.max.x, y)],
@@ -1625,7 +1636,7 @@ impl StudioApp {
             painter.text(
                 Pos2::new(plot.min.x - 5.0, y),
                 Align2::RIGHT_CENTER,
-                format!("{value:.1}"),
+                label,
                 FontId::monospace(8.0),
                 TEXT_DIM,
             );
@@ -1641,14 +1652,14 @@ impl StudioApp {
         painter.text(
             Pos2::new(deadzone_x, plot.min.y + 2.0),
             Align2::CENTER_TOP,
-            "dz",
+            "deadzone",
             FontId::monospace(8.0),
             TEXT_DIM,
         );
         painter.text(
             Pos2::new(plot.min.x, plot.max.y + 4.0),
             Align2::LEFT_TOP,
-            "0",
+            "0%",
             FontId::monospace(8.0),
             TEXT_DIM,
         );
@@ -1662,7 +1673,7 @@ impl StudioApp {
         painter.text(
             Pos2::new(plot.max.x, plot.max.y + 4.0),
             Align2::RIGHT_TOP,
-            "1",
+            "100%",
             FontId::monospace(8.0),
             TEXT_DIM,
         );
@@ -1771,7 +1782,7 @@ impl StudioApp {
             painter.text(
                 Pos2::new(shape_pos.x + 8.0, shape_pos.y - 2.0),
                 Align2::LEFT_BOTTOM,
-                "curve",
+                "shape",
                 FontId::monospace(8.0),
                 TEXT_DIM,
             );
@@ -1779,7 +1790,9 @@ impl StudioApp {
                 shape_response
                     .clone()
                     .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-                    .on_hover_text("Pull curve");
+                    .on_hover_text(
+                        "Response curve: 1.0 is linear; higher stays slower until deeper pull",
+                    );
             }
         }
 
@@ -1807,44 +1820,56 @@ impl StudioApp {
         painter.text(
             Pos2::new(dz_pos.x + 8.0, dz_pos.y - 2.0),
             Align2::LEFT_BOTTOM,
-            "dz",
+            "deadzone",
             FontId::monospace(8.0),
             TEXT_DIM,
         );
         if lt_response.hovered() {
             lt_response
                 .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-                .on_hover_text("LT decel floor");
+                .on_hover_text("Full LT brake speed multiplier");
         }
         if rt_response.hovered() {
             rt_response
                 .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-                .on_hover_text("RT boost cap");
+                .on_hover_text("Full RT gas speed multiplier");
         }
         if dz_response.hovered() {
             dz_response
                 .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
-                .on_hover_text("Trigger deadzone (shared)");
+                .on_hover_text("Initial trigger travel ignored");
         }
 
         ui.horizontal_wrapped(|ui| {
             ui.label(
-                RichText::new(format!("LT {decel_floor:.2}"))
-                    .monospace()
-                    .size(10.0)
-                    .color(WARN),
+                RichText::new(format!(
+                    "LT full brake {:.2}× ({:.0}% speed)",
+                    decel_floor,
+                    decel_floor * 100.0
+                ))
+                .monospace()
+                .size(10.0)
+                .color(WARN),
             );
             ui.label(
-                RichText::new(format!("RT {boost_cap:.2}"))
-                    .monospace()
-                    .size(10.0)
-                    .color(OK),
+                RichText::new(format!(
+                    "RT full gas {:.2}× ({:.0}% speed)",
+                    boost_cap,
+                    boost_cap * 100.0
+                ))
+                .monospace()
+                .size(10.0)
+                .color(OK),
             );
             ui.label(
-                RichText::new(format!("dz {deadzone:.2} · curve {curve:.2} shared"))
-                    .monospace()
-                    .size(10.0)
-                    .color(TEXT_DIM),
+                RichText::new(format!(
+                    "deadzone {:.0}% · curve {:.2} (shared)",
+                    deadzone * 100.0,
+                    curve
+                ))
+                .monospace()
+                .size(10.0)
+                .color(TEXT_DIM),
             );
         });
     }
@@ -1885,7 +1910,7 @@ impl StudioApp {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(
-                    "Simulated pull only; not live input. Uses the same trigger settings.",
+                    "Drag pedals to simulate pull; not live controller input. Uses the same trigger settings.",
                 )
                 .size(10.0)
                 .color(TEXT_DIM),
@@ -1899,8 +1924,20 @@ impl StudioApp {
         });
         ui.add_space(4.0);
         ui.columns(2, |cols| {
-            pedal_control(&mut cols[0], "LT brake", &mut self.sim_lt, WARN, deadzone);
-            pedal_control(&mut cols[1], "RT gas", &mut self.sim_rt, OK, deadzone);
+            pedal_control(
+                &mut cols[0],
+                "LT brake (decel)",
+                &mut self.sim_lt,
+                WARN,
+                deadzone,
+            );
+            pedal_control(
+                &mut cols[1],
+                "RT gas (accel)",
+                &mut self.sim_rt,
+                OK,
+                deadzone,
+            );
         });
         ui.add_space(4.0);
         let lt_shape = trigger_shape(self.sim_lt, deadzone, curve);
@@ -1930,7 +1967,7 @@ impl StudioApp {
             1.0
         };
         ui.label(
-            RichText::new("Target multiplier (no smoothing)")
+            RichText::new("Target speed vs baseline (no smoothing)")
                 .size(9.5)
                 .color(TEXT_DIM),
         );
@@ -1938,7 +1975,7 @@ impl StudioApp {
         multiplier_row(ui, "Scroll", scroll_multiplier, scroll_enabled);
         ui.label(
             RichText::new(format!(
-                "Shaped pull LT {:.0}% · RT {:.0}%",
+                "After deadzone/curve: LT {:.0}% · RT {:.0}%",
                 lt_shape * 100.0,
                 rt_shape * 100.0
             ))
@@ -1954,12 +1991,19 @@ impl StudioApp {
         self.f32_field(
             ui,
             &format!("{base}.decel_floor"),
-            "LT floor",
+            "Full brake ×",
             0.01,
             1.0,
             0.01,
         );
-        self.f32_field(ui, &format!("{base}.boost_cap"), "RT cap", 1.0, 10.0, 0.05);
+        self.f32_field(
+            ui,
+            &format!("{base}.boost_cap"),
+            "Full gas ×",
+            1.0,
+            10.0,
+            0.05,
+        );
         self.f32_field(
             ui,
             &format!("{base}.smoothing_ms"),
@@ -1967,6 +2011,11 @@ impl StudioApp {
             0.0,
             500.0,
             1.0,
+        );
+        ui.label(
+            RichText::new("1.0× = baseline; below 1 is slower, above 1 is faster.")
+                .size(9.0)
+                .color(TEXT_DIM),
         );
     }
 
@@ -1978,7 +2027,7 @@ impl StudioApp {
                 self.f32_field(
                     &mut cols[0],
                     &format!("{pointer}.trigger_deadzone"),
-                    "Deadzone",
+                    "Pull deadzone",
                     0.0,
                     0.9,
                     0.005,
@@ -1986,7 +2035,7 @@ impl StudioApp {
                 self.f32_field(
                     &mut cols[0],
                     &format!("{pointer}.trigger_curve"),
-                    "Curve",
+                    "Shape curve",
                     0.05,
                     5.0,
                     0.05,
@@ -2015,7 +2064,7 @@ impl StudioApp {
             self.f32_field(
                 ui,
                 &format!("{pointer}.trigger_deadzone"),
-                "Deadzone",
+                "Pull deadzone",
                 0.0,
                 0.9,
                 0.005,
@@ -2023,7 +2072,7 @@ impl StudioApp {
             self.f32_field(
                 ui,
                 &format!("{pointer}.trigger_curve"),
-                "Curve",
+                "Shape curve",
                 0.05,
                 5.0,
                 0.05,
@@ -3520,10 +3569,14 @@ fn paint_handle(painter: &egui::Painter, center: Pos2, color: Color32, active: b
 
 fn multiplier_row(ui: &mut Ui, label: &str, value: f32, enabled: bool) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(11.0).color(TEXT_MUTED));
+        ui.label(
+            RichText::new(format!("{label} speed"))
+                .size(11.0)
+                .color(TEXT_MUTED),
+        );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
-                RichText::new(format!("x{value:.2}"))
+                RichText::new(format!("{value:.2}× baseline"))
                     .monospace()
                     .size(13.0)
                     .color(if enabled { TEXT } else { TEXT_DIM }),
