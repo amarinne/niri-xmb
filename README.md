@@ -15,6 +15,11 @@ Features:
 - Noctalia taskbar integration
 - persistent daemon for fast panel startup
 
+Popup movement is off by default. Enable `behavior.move_popup` to press and
+hold the configured border region, then move the pointer after the normal
+`behavior.drag_threshold`. The offset lasts for the current session only;
+`peek.move_popup` is a separate opt-in for an armed peek overlay.
+
 ## Installation
 
 ```sh

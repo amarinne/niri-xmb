@@ -285,6 +285,8 @@ pub struct Renderer {
     icons: IconCache,
     hit_zones: HashMap<usize, Vec<HitZone>>,
     popup_origins: HashMap<String, (f32, f32)>,
+    /// Session-only manual offsets, keyed by the output hosting the popup.
+    popup_offsets: HashMap<String, (f32, f32)>,
     hovered_surface: Option<usize>,
     hovered_target: Option<HoverTarget>,
     render_surface: Option<usize>,
@@ -335,6 +337,7 @@ impl Renderer {
             icons: IconCache::new(),
             hit_zones: HashMap::new(),
             popup_origins: HashMap::new(),
+            popup_offsets: HashMap::new(),
             hovered_surface: None,
             hovered_target: None,
             render_surface: None,
@@ -440,6 +443,23 @@ impl Renderer {
             .insert(output.to_string(), (x as f32, y as f32));
     }
 
+    /// Move a popup by a pointer delta. Offsets live only in this renderer and
+    /// are cleared when the panel session ends; config placement remains the
+    /// source of truth for the next session.
+    pub fn move_popup(&mut self, output: &str, dx: f64, dy: f64) -> bool {
+        if dx == 0.0 && dy == 0.0 {
+            return false;
+        }
+        let offset = self.popup_offsets.entry(output.to_owned()).or_default();
+        offset.0 += dx as f32;
+        offset.1 += dy as f32;
+        true
+    }
+
+    pub fn clear_popup_offsets(&mut self) {
+        self.popup_offsets.clear();
+    }
+
     pub fn hit_test(&self, surface_id: usize, x: f64, y: f64) -> Option<&HitTarget> {
         self.hit_zones
             .get(&surface_id)?
@@ -474,6 +494,31 @@ impl Renderer {
             .iter()
             .find_map(|zone| matches!(zone.target, HitTarget::Panel).then_some(zone.rect))?;
         damage_for_rect(panel, 0.0, width, height)
+    }
+
+    /// Return true when a point is inside the configured inset from the panel
+    /// edge. Content zones are deliberately excluded by the caller.
+    pub fn panel_grab_hit(&self, surface_id: usize, x: f64, y: f64, inset: f64) -> bool {
+        if inset <= 0.0 {
+            return false;
+        }
+        self.hit_zones
+            .get(&surface_id)
+            .into_iter()
+            .flat_map(|zones| zones.iter())
+            .find_map(|zone| {
+                if !matches!(zone.target, HitTarget::Panel) || !zone.rect.contains(x, y) {
+                    return None;
+                }
+                let edge = (x - zone.rect.x as f64)
+                    .min(zone.rect.x as f64 + zone.rect.width as f64 - x)
+                    .min(
+                        (y - zone.rect.y as f64)
+                            .min(zone.rect.y as f64 + zone.rect.height as f64 - y),
+                    );
+                Some(edge <= inset)
+            })
+            .unwrap_or(false)
     }
 
     pub fn update_hover(&mut self, surface_id: usize, x: f64, y: f64) -> bool {
@@ -1037,6 +1082,12 @@ impl Renderer {
         };
         panel_x = panel_x.clamp(12.0, (logical_width - panel_width - 12.0).max(12.0));
         panel_y = panel_y.clamp(12.0, (logical_height - panel_height - 12.0).max(12.0));
+        if let Some((offset_x, offset_y)) = self.popup_offsets.get(host_output).copied() {
+            panel_x =
+                (panel_x + offset_x).clamp(12.0, (logical_width - panel_width - 12.0).max(12.0));
+            panel_y =
+                (panel_y + offset_y).clamp(12.0, (logical_height - panel_height - 12.0).max(12.0));
+        }
         let panel = Rect {
             x: panel_x,
             y: panel_y,
@@ -1700,6 +1751,28 @@ mod tests {
         assert_eq!(hit.width, 15.0);
         assert!(hit.contains(109.0, 55.0));
         assert!(!hit.contains(110.0, 55.0));
+    }
+
+    #[test]
+    fn popup_grab_hit_is_limited_to_the_panel_border_inset() {
+        let mut renderer = Renderer::new();
+        renderer.hit_zones.insert(
+            1,
+            vec![HitZone {
+                rect: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 100.0,
+                    height: 80.0,
+                },
+                target: HitTarget::Panel,
+            }],
+        );
+
+        assert!(renderer.panel_grab_hit(1, 12.0, 50.0, 4.0));
+        assert!(renderer.panel_grab_hit(1, 50.0, 97.0, 4.0));
+        assert!(!renderer.panel_grab_hit(1, 50.0, 60.0, 4.0));
+        assert!(!renderer.panel_grab_hit(1, 5.0, 50.0, 4.0));
     }
     use crate::model::OutputModel;
     use std::collections::BTreeMap;

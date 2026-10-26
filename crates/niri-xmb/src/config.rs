@@ -249,6 +249,12 @@ impl Config {
             0.0,
             MAX_LOGICAL_DIMENSION as f64,
         )?;
+        validate_f64_range(
+            "behavior.popup_grab_region",
+            self.behavior.popup_grab_region,
+            0.0,
+            MAX_LOGICAL_DIMENSION as f64,
+        )?;
         self.style.validate()?;
         if self
             .theme
@@ -897,6 +903,8 @@ pub struct PeekConfig {
     /// Off by default: it trades a click-through panel for a grabbable one, and
     /// that is a change of character rather than a refinement.
     pub pointer_promote: bool,
+    /// Allow moving an armed peek from its border. Off keeps peek passive.
+    pub move_popup: bool,
     /// How long the overlay stays click-through after appearing.
     ///
     /// A click already travelling towards whatever the overlay just covered must
@@ -915,6 +923,7 @@ impl Default for PeekConfig {
             enabled: false,
             duration_ms: 1200,
             pointer_promote: false,
+            move_popup: false,
             arm_grace_ms: 150,
             demote_ms: 400,
         }
@@ -937,6 +946,10 @@ pub struct BehaviorConfig {
     /// `deferred` queues the move until confirmed; `live` follows immediately.
     pub navigation: NavigationMode,
     pub drag_threshold: f64,
+    /// Allow a manual popup to move when its border is pressed and held.
+    pub move_popup: bool,
+    /// Border inset, in logical pixels, that starts a popup move press.
+    pub popup_grab_region: f64,
     pub empty_drop_floats: bool,
     pub floating_drop_tiles: bool,
     pub focus_after_drop: bool,
@@ -957,6 +970,8 @@ impl Default for BehaviorConfig {
         Self {
             navigation: NavigationMode::Deferred,
             drag_threshold: 7.0,
+            move_popup: false,
+            popup_grab_region: 24.0,
             empty_drop_floats: false,
             floating_drop_tiles: true,
             focus_after_drop: false,

@@ -109,6 +109,11 @@ Pointer travel must exceed `drag_threshold` before a press becomes a drag.
 Drop behavior settings must control tiled, floating, focus, and cursor results.
 The result must match those settings for empty workspaces and window targets.
 
+When `behavior.move_popup` is enabled, pressing the configured popup border and
+moving beyond `behavior.drag_threshold` moves the panel for that session.
+`peek.move_popup` separately opts an armed peek into this movement; passive peek
+remains click-through. A border press never dispatches a Niri focus action.
+
 When column joining is disabled, a window target must have two zones.
 The left zone inserts before the target. The right zone inserts after the target.
 No target zone may create a joined Niri column in this mode.

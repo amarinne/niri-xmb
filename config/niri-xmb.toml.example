@@ -102,12 +102,15 @@ duration_ms = 1200      # linger time, 0-60000 milliseconds
 pointer_promote = false # let the pointer grab the overlay instead of passing through
 arm_grace_ms = 150      # click-through grace, 0-60000 milliseconds
 demote_ms = 400         # pointer-leave linger, 0-60000 milliseconds
+move_popup = false      # allow border movement while an armed peek is active
 
 [behavior]
 # "deferred": arrows stage a selection, Enter or a click applies it.
 # "live":     arrows move Niri's focus immediately, alt-tab style.
 navigation = "deferred"
 drag_threshold = 7.0         # drag distance, 0-8192 logical pixels
+move_popup = false            # allow pressing and holding the popup border to move it
+popup_grab_region = 24.0      # border inset in logical pixels used for popup movement
 empty_drop_floats = false    # drop on empty map space creates floating windows
 floating_drop_tiles = true   # dropping a floating window on icons tiles it
 focus_after_drop = false     # focus the moved window after rearranging

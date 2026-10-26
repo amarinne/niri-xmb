@@ -56,6 +56,7 @@ const BAR_SCROLL_TARGET_GRACE: Duration = Duration::from_millis(500);
 /// Adjacent high-resolution packets identify the free-spinning wheel. A
 /// ratchet click arrives after this gap and must not be rate limited.
 const FREE_SPIN_PACKET_GAP: Duration = Duration::from_millis(30);
+const POPUP_MOVE_PRESS: u64 = u64::MAX;
 
 /// Keep free-spin classification briefly after its last rapid packet.
 const FREE_SPIN_IDLE: Duration = Duration::from_millis(140);
@@ -69,6 +70,10 @@ const KEY_RIGHT: u32 = 0xff53;
 const KEY_DOWN: u32 = 0xff54;
 const KEY_TAB: u32 = 0xff09;
 const KEY_SHIFT_TAB: u32 = 0xfe20;
+
+fn drag_threshold_reached(start_x: f64, start_y: f64, x: f64, y: f64, threshold: f64) -> bool {
+    (x - start_x).hypot(y - start_y) >= threshold
+}
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -190,6 +195,12 @@ struct PressState {
     current_x: f64,
     current_y: f64,
     dragging: bool,
+}
+
+impl PressState {
+    fn popup_move(&self) -> bool {
+        self.window_id == POPUP_MOVE_PRESS
+    }
 }
 
 /// Last workspace requested by wheel input on one output.
@@ -909,6 +920,9 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             && now >= peek_suppressed_until
         {
             let was_hidden = panel.mode() == PopupMode::Hidden;
+            if was_hidden {
+                renderer.clear_popup_offsets();
+            }
             let pointer_live = panel.peek().pointer_live();
             let mut mode = panel.mode();
             let deadline = trigger_peek(
@@ -965,6 +979,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             let response = match request.command {
                 ControlCommand::Show => {
                     if panel.mode() != PopupMode::Manual {
+                        renderer.clear_popup_offsets();
                         panel.set_origin_focus(snapshot.focused_window);
                     }
                     let origin_focus = panel.origin_focus();
@@ -994,6 +1009,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                         surfaces.hide_all_popups()?;
                         panel.close();
                     } else {
+                        renderer.clear_popup_offsets();
                         let origin_focus = snapshot.focused_window;
                         show_popup(
                             &mut surfaces,
@@ -1198,11 +1214,25 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             if panel.mode().is_peek() {
                 match classify_peek_pointer(&event) {
                     PeekPointer::Promote => {
-                        let capture = popup_capture_outside(&config, PopupInput::FULL);
-                        surfaces.set_popup_input(PopupInput::FULL, capture)?;
-                        panel.promote(snapshot.focused_window);
-                        reset_selection(&mut selection, &snapshot);
-                        dirty = true;
+                        if config.peek.move_popup
+                            && matches!(event.kind, SurfaceKind::Popup)
+                            && renderer.panel_grab_hit(
+                                event.surface_id,
+                                event.x,
+                                event.y,
+                                config.behavior.popup_grab_region,
+                            )
+                        {
+                            // A separately enabled peek move keeps the
+                            // overlay passive: border presses move it without
+                            // promoting it into a focus-owning session.
+                        } else {
+                            let capture = popup_capture_outside(&config, PopupInput::FULL);
+                            surfaces.set_popup_input(PopupInput::FULL, capture)?;
+                            panel.promote(snapshot.focused_window);
+                            reset_selection(&mut selection, &snapshot);
+                            dirty = true;
+                        }
                     }
                     PeekPointer::Arm => {
                         if panel.mode() != PopupMode::PeekArmed {
@@ -1268,6 +1298,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         // confirmed pick, IPC — in one place, and end the staging session.
         let popup_open = panel.is_open();
         if popup_was_open && !popup_open {
+            renderer.clear_popup_offsets();
             selection.clear_session();
             // Escape and outside clicks land here with a press still
             // tracked; closing must cancel it, or the release that follows
@@ -1316,11 +1347,13 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                 let drag = panel
                     .press()
                     .filter(|press| press.dragging)
-                    .map(|press| DragVisual {
-                        window_id: press.window_id,
-                        app_id: press.app_id.clone(),
-                        global_x: press.current_x,
-                        global_y: press.current_y,
+                    .and_then(|press| {
+                        (!press.popup_move()).then_some(DragVisual {
+                            window_id: press.window_id,
+                            app_id: press.app_id.clone(),
+                            global_x: press.current_x,
+                            global_y: press.current_y,
+                        })
                     });
                 for surface in &surface_infos {
                     // A None result means the surface is already blank.
@@ -1665,7 +1698,31 @@ fn handle_ui_event(
                             panel.outputs_mut().clear();
                         }
                     }
-                    HitTarget::Canvas { .. } | HitTarget::Panel => {}
+                    HitTarget::Canvas { .. } => {}
+                    HitTarget::Panel => {
+                        let can_move = panel.mode() == PopupMode::Manual
+                            && config.behavior.move_popup
+                            || panel.mode() == PopupMode::PeekArmed && config.peek.move_popup;
+                        if can_move
+                            && matches!(event.kind, SurfaceKind::Popup)
+                            && renderer.panel_grab_hit(
+                                event.surface_id,
+                                event.x,
+                                event.y,
+                                config.behavior.popup_grab_region,
+                            )
+                        {
+                            panel.begin_press(PressState {
+                                window_id: POPUP_MOVE_PRESS,
+                                app_id: event.output.clone(),
+                                start_x: event.global_x,
+                                start_y: event.global_y,
+                                current_x: event.global_x,
+                                current_y: event.global_y,
+                                dragging: false,
+                            });
+                        }
+                    }
                 }
             } else if matches!(event.kind, SurfaceKind::Popup)
                 && config.behavior.close_on_outside_click
@@ -1680,12 +1737,34 @@ fn handle_ui_event(
         }
         UiEventKind::Motion => {
             if let Some(press) = panel.press_mut() {
+                let previous_x = press.current_x;
+                let previous_y = press.current_y;
                 press.current_x = event.global_x;
                 press.current_y = event.global_y;
+                let was_dragging = press.dragging;
                 let dx = press.current_x - press.start_x;
                 let dy = press.current_y - press.start_y;
-                if dx.hypot(dy) >= config.behavior.drag_threshold {
+                if drag_threshold_reached(
+                    press.start_x,
+                    press.start_y,
+                    press.current_x,
+                    press.current_y,
+                    config.behavior.drag_threshold,
+                ) {
                     press.dragging = true;
+                }
+                if press.dragging && press.popup_move() {
+                    let moved_x = if was_dragging {
+                        event.global_x - previous_x
+                    } else {
+                        dx
+                    };
+                    let moved_y = if was_dragging {
+                        event.global_y - previous_y
+                    } else {
+                        dy
+                    };
+                    renderer.move_popup(&press.app_id, moved_x, moved_y);
                 }
                 return Ok(true);
             }
@@ -1697,7 +1776,10 @@ fn handle_ui_event(
             let Some(released) = panel.take_press() else {
                 return Ok(false);
             };
-            if released.dragging {
+            if released.popup_move() {
+                // Moving the panel is session state only and never dispatches
+                // a Niri focus or window action, even below the threshold.
+            } else if released.dragging {
                 let surface_infos = surfaces.surfaces();
                 if let Some((_surface, target, local_x, local_y)) =
                     renderer.hit_test_global(&surface_infos, released.current_x, released.current_y)
@@ -3004,4 +3086,23 @@ mod ui_tests {
             BarConfig::default().scroll_wrap
         );
     }
+}
+#[test]
+fn popup_move_uses_the_existing_drag_threshold() {
+    assert!(!drag_threshold_reached(0.0, 0.0, 3.0, 4.0, 7.0));
+    assert!(drag_threshold_reached(0.0, 0.0, 5.0, 5.0, 7.0));
+}
+
+#[test]
+fn popup_move_press_cannot_be_treated_as_a_window_drag() {
+    let press = PressState {
+        window_id: POPUP_MOVE_PRESS,
+        app_id: "DP-1".into(),
+        start_x: 10.0,
+        start_y: 10.0,
+        current_x: 30.0,
+        current_y: 30.0,
+        dragging: true,
+    };
+    assert!(press.popup_move());
 }
