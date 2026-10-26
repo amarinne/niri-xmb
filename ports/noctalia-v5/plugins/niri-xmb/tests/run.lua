@@ -519,6 +519,16 @@ local function findCommand(env, needle)
     return nil
 end
 
+local function lastCommand(env, needle)
+    local found = nil
+    for _, record in ipairs(env.async) do
+        if record.command:find(needle, 1, true) then
+            found = record
+        end
+    end
+    return found
+end
+
 local function countCommands(env, needle)
     local count = 0
     for _, record in ipairs(env.async) do
@@ -575,6 +585,22 @@ local function setMirror(env, value)
     env.mirrorContents = json.encode(value)
 end
 
+local function scrollEnvironment()
+    local env = newEnvironment()
+    setMirror(env, snapshot(1, 0, { activeWorkspace = 1, focusedWindow = 10 }))
+    loadPlugin(env)
+    update()
+    emitHello(env)
+    emitSnapshot(env, snapshot(2, 0, { activeWorkspace = 1, focusedWindow = 10 }))
+    update()
+    return env
+end
+
+local function advance(env, milliseconds)
+    env.now = env.now + milliseconds
+    update()
+end
+
 -- Test runner ----------------------------------------------------------------
 
 local tests = {}
@@ -604,6 +630,15 @@ end
 
 local function assertRenderDelta(env, before, expected, message)
     assertEqual(env.renders - before, expected, message or "unexpected render count")
+end
+
+local function assertCycleDelta(env, needle, delta, message)
+    local command = lastCommand(env, needle)
+    assertTrue(command ~= nil, message or "scroll command missing")
+    assertTrue(
+        command.command:find("'" .. tostring(delta) .. "'", 1, true) ~= nil,
+        (message or "scroll command") .. " (expected delta " .. tostring(delta) .. ")"
+    )
 end
 
 -- Tests ----------------------------------------------------------------------
@@ -951,6 +986,101 @@ test("an unconfirmed wheel intent times out and refreshes", function()
     update()
     assertTrue(hasLog(env, "workspace cycle was not confirmed"), "timeout is reported")
     assertTrue(#env.reads > reads, "timeout forces a refresh")
+end)
+
+test("touchpad fractions accumulate to one complete step", function()
+    local env = scrollEnvironment()
+    onScroll("vertical", 0.4, true)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 0, "a sub-step must not scroll")
+    onScroll("vertical", 0.4, false)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 0, "two sub-steps are still below one step")
+    onScroll("vertical", 0.2, false)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 1, "the accumulated step dispatches once")
+    assertCycleDelta(env, "cycle-workspace", 1)
+end)
+
+test("a large fractional frame adds at most one step", function()
+    local env = scrollEnvironment()
+    onScroll("vertical", 0.9, true)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 0)
+    onScroll("vertical", 0.9, false)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 1)
+    assertCycleDelta(env, "cycle-workspace", 1)
+    onScroll("vertical", 0.9, false)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 1, "overshoot is discarded, not queued")
+end)
+
+test("fractional scroll is independent per axis", function()
+    local env = scrollEnvironment()
+    onScroll("vertical", 0.6, true)
+    onScroll("horizontal", 0.6, true)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 0)
+    assertEqual(countCommands(env, "cycle-window"), 0)
+    onScroll("vertical", 0.4, false)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 1)
+    assertEqual(countCommands(env, "cycle-window"), 0)
+    onScroll("horizontal", 0.4, false)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 1)
+    assertEqual(countCommands(env, "cycle-window"), 1)
+    assertCycleDelta(env, "cycle-window", 1)
+end)
+
+test("fractional direction reversal clears the residue", function()
+    local env = scrollEnvironment()
+    onScroll("vertical", 0.6, true)
+    onScroll("vertical", -0.6, false)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 0)
+    onScroll("vertical", -0.4, false)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 1)
+    assertCycleDelta(env, "cycle-workspace", -1)
+end)
+
+test("integer bursts keep their count and their fraction", function()
+    local env = scrollEnvironment()
+    onScroll("vertical", 2.5, true)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 1)
+    assertCycleDelta(env, "cycle-workspace", 2)
+    onScroll("vertical", 0.5, false)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 2)
+    assertCycleDelta(env, "cycle-workspace", 1)
+end)
+
+test("a new gesture or zero start clears the fractional residue", function()
+    local env = scrollEnvironment()
+    onScroll("vertical", 0.6, false)
+    onScroll("vertical", 0.6, true)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 0, "a new gesture must not complete the old residue")
+    onScroll("vertical", 0.6, false)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 1)
+    onScroll("vertical", 0.6, false)
+    onScroll("vertical", 0, true)
+    onScroll("vertical", 0.6, false)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 1, "a zero start must not complete the old residue")
+end)
+
+test("config change clears the fractional scroll residue", function()
+    local env = scrollEnvironment()
+    onScroll("vertical", 0.6, false)
+    onConfigChanged()
+    onScroll("vertical", 0.6, false)
+    advance(env, 41)
+    assertEqual(countCommands(env, "cycle-workspace"), 0, "config change starts a fresh residue")
 end)
 
 test("drop preview survives a stale reply and the newest reply reconciles", function()

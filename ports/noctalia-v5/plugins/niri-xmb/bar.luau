@@ -19,6 +19,10 @@ local STREAM_RESYNC_MS = 30000
 local FOCUS_INTENT_TIMEOUT_MS = 2000
 local CYCLE_INTENT_TIMEOUT_MS = 2000
 local CYCLE_INTENT_MAX_MS = 4000
+-- The host reports whole logical steps for a wheel and sub-step deltas for a
+-- touchpad. Accumulate one host step before dispatching a fractional move;
+-- one callback can add at most one such step.
+local FRACTIONAL_SCROLL_STEP = 1.0
 
 local state = {
     snapshot = nil,
@@ -76,6 +80,9 @@ local state = {
     logged = {},
     -- Coalesced wheel steps waiting to be sent, per axis.
     pendingScroll = { vertical = 0, horizontal = 0 },
+    -- Sub-step continuous deltas, kept separate so a touchpad frame cannot
+    -- become a whole workspace step by itself.
+    scrollRemainder = { vertical = 0, horizontal = 0 },
     scrollFlushAt = nil,
 }
 
@@ -1748,30 +1755,60 @@ function update()
 end
 
 function onScroll(axis, steps, startsGesture)
-    -- The host reports complete signed logical steps. Keep the full count so a
-    -- free-spin packet containing several detents does not create duplicate
-    -- workspace changes or lose its remaining steps. The pending totals stay
-    -- separate by axis and flush through one intent per axis.
-    local validatedSteps = finiteNumber(steps)
-    if validatedSteps == nil or validatedSteps == 0 then
-        return
-    end
+    -- The host reports complete signed logical steps for a wheel and fractional
+    -- deltas for a touchpad. Keep integer bursts intact, but require a
+    -- fractional gesture to accumulate a full host step before it queues a
+    -- workspace/window move. The pending totals stay separate by axis and
+    -- flush through one intent per axis.
     if axis ~= "vertical" and axis ~= "horizontal" then
         return
     end
-    local whole = validatedSteps
-    if whole > 0 then
-        whole = math.floor(whole)
-        if whole < 1 then
-            whole = 1
-        end
-    else
-        whole = math.ceil(whole)
-        if whole > -1 then
-            whole = -1
-        end
+    local validatedSteps = finiteNumber(steps)
+    if validatedSteps == nil then
+        return
     end
-    state.pendingScroll[axis] = state.pendingScroll[axis] + whole
+    if startsGesture == true then
+        state.scrollRemainder[axis] = 0
+    end
+    if validatedSteps == 0 then
+        return
+    end
+
+    local whole = 0
+    local fraction = validatedSteps
+    if validatedSteps >= 1 then
+        whole = math.floor(validatedSteps)
+        fraction = validatedSteps - whole
+    elseif validatedSteps <= -1 then
+        whole = math.ceil(validatedSteps)
+        fraction = validatedSteps - whole
+    end
+
+    local dispatch = whole
+    if fraction ~= 0 then
+        local remainder = state.scrollRemainder[axis]
+        if remainder ~= 0 and remainder * fraction < 0 then
+            -- A direction reversal starts a fresh gesture residue.
+            remainder = 0
+        end
+        remainder = remainder + fraction
+        if math.abs(remainder) >= FRACTIONAL_SCROLL_STEP then
+            -- One callback adds at most one fractional step. Discard the
+            -- overshoot so a large frame cannot queue several moves.
+            dispatch = dispatch + (remainder > 0 and 1 or -1)
+            remainder = 0
+        end
+        state.scrollRemainder[axis] = remainder
+    elseif whole ~= 0 then
+        -- A pure whole-step event is a discrete wheel report. Do not carry a
+        -- stale touchpad sub-step into a different device gesture.
+        state.scrollRemainder[axis] = 0
+    end
+
+    if dispatch == 0 then
+        return
+    end
+    state.pendingScroll[axis] = state.pendingScroll[axis] + dispatch
     state.scrollFlushAt = noctalia.nowMs() + 40
 end
 
@@ -1787,6 +1824,11 @@ function onConfigChanged()
     state.pendingFocus = nil
     state.pendingCycle.workspace = nil
     state.pendingCycle.window = nil
+    state.pendingScroll.vertical = 0
+    state.pendingScroll.horizontal = 0
+    state.scrollRemainder.vertical = 0
+    state.scrollRemainder.horizontal = 0
+    state.scrollFlushAt = nil
     state.nextPollAt = nil
 
     -- The stream command captured the old backend. There is no stop handle in

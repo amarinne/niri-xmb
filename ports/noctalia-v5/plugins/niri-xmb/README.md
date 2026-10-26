@@ -86,6 +86,16 @@ is left per widget instance until the entry reloads. The daemon bounds active
 subscribers at eight; keep widget instances below that. A `[[service]]` bridge
 would share one child across outputs, but it needs a manifest change.
 
+## Wheel input
+
+`onScroll` keeps complete signed host steps (for example, a free-spin burst of
+`5`) and accumulates only the sub-step fraction, per axis. A fraction must
+reach one host step before a workspace or window move is queued. One callback
+adds at most one fractional step; a direction change, a new gesture, a config
+change, or a pure whole-step wheel event clears the remainder. The existing
+40 ms coalescing still applies, and the vertical and horizontal accumulators
+are independent.
+
 ## Checks
 
 The deterministic harness mocks the Noctalia host and drives stream framing,
