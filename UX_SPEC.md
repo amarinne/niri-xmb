@@ -19,7 +19,7 @@ The words **must**, **should**, and **may** state requirement levels.
 | Mode | Trigger | Pointer input | Keyboard input | Close rule |
 | --- | --- | --- | --- | --- |
 | Hidden | Startup or explicit hide | None | None | Not applicable |
-| Manual | `show` or `toggle` | Panel, or configured capture surface | Yes | Behavior settings control closure |
+| Manual | `show` or `toggle` | Panel and capture surface | Yes | Outside click always closes |
 | Peek | Niri workspace navigation | None, or panel with pointer promotion | None | Hide after `peek.duration_ms` |
 | Peek armed | Pointer moves onto a promoted peek panel | Panel only | None | Hide after configured pointer exit delay |
 
@@ -74,9 +74,14 @@ Windows, bars, and docks outside those regions must receive normal pointer input
 Dock magnification and drag operations must work while the popup is open.
 
 `close_on_external_focus_change` controls external focus handling.
-`close_on_outside_click` controls whether an outside click closes manual mode.
-`replay_outside_click` controls whether the daemon replays that click.
+Manual mode always captures and closes on an outside click. The legacy
+`close_on_outside_click` setting is deprecated and ignored. `replay_outside_click`
+independently controls whether the daemon replays that click after dismissal.
 Click replay cannot reproduce hover or drag motion.
+
+An outside press does not close while a press begun inside the panel is active.
+The release resolves the click or drag first; a completed drag follows the
+drop closure setting.
 
 ## Popup lifetime
 

@@ -119,7 +119,8 @@ close_on_window_click = true # close after activating a window
 close_on_workspace_click = false # close after activating a workspace
 close_on_drop = false        # close after a successful drag-and-drop
 close_on_external_focus_change = false # close after another surface changes Niri focus
-close_on_outside_click = true # click outside the panel closes the XMB
+# close_on_outside_click is deprecated and ignored; a manual outside click
+# always closes.
 replay_outside_click = true # replay the captured click when virtual pointer support exists
 close_on_escape = true       # Escape closes the popup
 

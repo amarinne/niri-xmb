@@ -302,6 +302,8 @@ struct SurfaceEntry {
     configured: bool,
     visible: bool,
     input: PopupInput,
+    /// Whether pointer input covers the whole output so manual mode can see
+    /// clicks outside its panel. This is independent of keyboard focus.
     capture_outside: bool,
     input_rect: Option<DamageRect>,
     frame_ready: bool,
@@ -590,6 +592,8 @@ impl SurfaceManager {
         input: PopupInput,
         capture_outside: bool,
     ) -> Result<()> {
+        // `capture_outside` is intentionally separate from `input.keyboard`:
+        // pointer-only manual capture must still observe an outside press.
         for index in 0..self.state.surfaces.len() {
             if self.state.surfaces[index].kind != SurfaceKind::Popup {
                 continue;
