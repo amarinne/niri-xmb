@@ -147,6 +147,11 @@ impl SubscriptionHub {
         // subscriber would hold its slot until the next publish -- on an idle
         // desktop, forever.
         if let Ok(reader) = stream.try_clone() {
+            // The control server leaves a short request read timeout on the
+            // socket. A subscriber sends nothing after its request, so that
+            // timeout would fire and look like EOF, disconnecting a healthy
+            // stream after one second.
+            let _ = reader.set_read_timeout(None);
             let hub = Arc::clone(self);
             let closed = Arc::clone(&closed);
             thread::Builder::new()
@@ -155,10 +160,13 @@ impl SubscriptionHub {
                     let mut reader = reader;
                     let mut discard = [0u8; 64];
                     // Subscribers are not expected to say anything; anything
-                    // they do send is ignored. Only EOF or an error matters.
-                    while let Ok(read) = reader.read(&mut discard) {
-                        if read == 0 {
-                            break;
+                    // they do send is ignored. Only EOF or a real error matters.
+                    loop {
+                        match reader.read(&mut discard) {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(_) => break,
                         }
                     }
                     if !closed.swap(true, Ordering::SeqCst) {

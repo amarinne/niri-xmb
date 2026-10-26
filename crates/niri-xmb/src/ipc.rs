@@ -768,6 +768,11 @@ mod tests {
         assert_eq!(frame["type"], "hello");
         assert_eq!(frame["protocol"], 1);
 
+        // The request path leaves CLIENT_IO_TIMEOUT on the socket. A healthy
+        // subscriber sends nothing after its request; sitting past that
+        // timeout must not be mistaken for a disconnect.
+        std::thread::sleep(CLIENT_IO_TIMEOUT + Duration::from_millis(250));
+
         subscriptions.publish(7, r#"{"generation":7}"#);
         line.clear();
         reader.read_line(&mut line).unwrap();
