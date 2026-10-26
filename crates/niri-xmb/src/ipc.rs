@@ -3,7 +3,7 @@ use crate::wayland::WakeHandle;
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use std::fs::{File, OpenOptions, Permissions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -359,9 +359,12 @@ fn handle_client(
 
 fn read_request(stream: &mut UnixStream) -> std::io::Result<String> {
     let mut bytes = Vec::with_capacity(128);
-    (&mut *stream)
-        .take((MAX_REQUEST_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
+    let mut limited = (&mut *stream).take((MAX_REQUEST_BYTES + 1) as u64);
+    // Read one line instead of waiting for the peer to close its write half.
+    // A subscriber keeps that half open for the life of the stream, and the
+    // subscription's EOF watcher treats a read EOF as a disconnect. One-shot
+    // clients still work: they either send a newline or shut down for EOF.
+    BufReader::new(&mut limited).read_until(b'\n', &mut bytes)?;
     if bytes.len() > MAX_REQUEST_BYTES {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
@@ -747,18 +750,31 @@ mod tests {
             path.clone(),
             request_tx,
             wake.handle(),
-            Some(subscriptions)
+            Some(subscriptions.clone())
         ));
 
         let mut stream = UnixStream::connect(&path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         stream.write_all(b"subscribe 1\n").unwrap();
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
-
+        // Keep the write half open. `niri-xmb subscribe` does the same now;
+        // half-closing after the request used to make the server's EOF watcher
+        // disconnect a healthy subscriber right after hello.
+        let mut reader = std::io::BufReader::new(&mut stream);
         let mut line = String::new();
-        std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut stream), &mut line).unwrap();
+        reader.read_line(&mut line).unwrap();
         let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(frame["type"], "hello");
         assert_eq!(frame["protocol"], 1);
+
+        subscriptions.publish(7, r#"{"generation":7}"#);
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&line)
+            .expect("a subscriber that keeps its write half open must still receive frames");
+        assert_eq!(frame["type"], "snapshot");
+        assert_eq!(frame["generation"], 7);
     }
 
     #[test]

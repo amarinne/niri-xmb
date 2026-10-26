@@ -321,7 +321,9 @@ fn connect_and_stream(stream: UnixStream, reported_outage: &mut bool) -> bool {
         return false;
     }
     let _ = writer.flush();
-    let _ = writer.shutdown(std::net::Shutdown::Write);
+    // Keep the write half open. The server now reads one request line, and
+    // its EOF watcher treats a read EOF as a disconnected subscriber; closing
+    // this half after the request would kill the stream right after hello.
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let mut delivered = false;
