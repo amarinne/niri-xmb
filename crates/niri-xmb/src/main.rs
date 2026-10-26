@@ -753,12 +753,12 @@ fn resolve_bars(config: &mut Config, output_names: &[String]) {
     }
 }
 
-/// Mirror the newest snapshot and hand it to any stream subscribers.
+/// Mirror the newest snapshot and keep the latest frame for stream subscribers.
 ///
-/// Serialising is the expensive part, so it happens once. The hub is only
-/// given the result when someone is actually listening -- in the normal
-/// deployment nobody is, and the mirror is the only reader that justifies
-/// serialising at all.
+/// The hub retains the frame even when nobody is listening yet. A subscriber
+/// that connects between publishes must receive the last known state right
+/// after hello; gating this call on `subscriber_count` left every new
+/// subscriber waiting for the next Niri change.
 fn publish_snapshot(
     snapshot: &Snapshot,
     subscriptions: &subscribe::SubscriptionHub,
@@ -768,9 +768,7 @@ fn publish_snapshot(
     if let Some(mirror) = mirror {
         mirror.write(&body);
     }
-    if subscriptions.subscriber_count() > 0 {
-        subscriptions.publish(snapshot.generation, &body);
-    }
+    subscriptions.publish(snapshot.generation, &body);
 }
 
 /// The soonest of everything the loop is waiting for.
@@ -2270,6 +2268,36 @@ mod tests {
     use super::*;
     use crate::model::{OutputModel, WindowModel, WorkspaceModel};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn a_new_subscriber_receives_the_last_snapshot_published_while_idle() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+
+        let subscriptions = Arc::new(subscribe::SubscriptionHub::new());
+        let snapshot = protocol_snapshot();
+        publish_snapshot(&snapshot, &subscriptions, None);
+
+        let (client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        subscriptions.attach(server, subscribe::STREAM_PROTOCOL);
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+
+        reader.read_line(&mut line).expect("hello frame");
+        let hello: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(hello["type"], "hello");
+
+        line.clear();
+        reader
+            .read_line(&mut line)
+            .expect("a new subscriber must receive the last published snapshot");
+        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["type"], "snapshot");
+        assert_eq!(frame["generation"], snapshot.generation);
+    }
 
     fn protocol_snapshot() -> Snapshot {
         let window = WindowModel {
