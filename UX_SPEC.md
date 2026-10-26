@@ -108,6 +108,16 @@ In `navigation = "live"` mode, each navigation step may move Niri focus.
 XMB-generated focus changes must not count as external changes.
 External Niri keybinds must not change manual mode into hidden or peek mode.
 
+## Gamepad input
+
+Optional evdev gamepads may map button presses to the manual popup's actions.
+The daemon reads only configured absolute device paths; an empty list discovers
+`/dev/input/by-id/*-event-joystick` and `*-event-gamepad`. It never grabs the
+device. Actions apply only while a manual popup is open: up/down/left/right
+navigate, tab/back select the next/previous output, confirm activates the
+selection, and close follows `close_on_escape`. Presses trigger one action;
+releases and repeats are ignored. Gamepad input is disabled by default.
+
 ## Drag and drop
 
 Pointer travel must exceed `drag_threshold` before a press becomes a drag.

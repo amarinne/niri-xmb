@@ -124,6 +124,27 @@ close_on_external_focus_change = false # close after another surface changes Nir
 replay_outside_click = true # replay the captured click when virtual pointer support exists
 close_on_escape = true       # Escape closes the popup
 
+# Optional evdev gamepad button map. Disabled by default. Gamepads are read
+# outside the Wayland seat; actions apply only while the manual popup is open.
+# Prefer stable /dev/input/by-id paths; leave devices empty to discover
+# *-event-joystick and *-event-gamepad symlinks. Reading /dev/input usually
+# needs the "input" group or a udev rule. Button keys accept evdev names or
+# 16-bit decimal/hex codes. Actions: up, down, left, right, tab, back (previous
+# output), confirm, close.
+[gamepad]
+enabled = false
+devices = []
+
+[gamepad.buttons]
+# BTN_SOUTH = "confirm"
+# BTN_EAST = "close"
+# BTN_DPAD_UP = "up"
+# BTN_DPAD_DOWN = "down"
+# BTN_DPAD_LEFT = "left"
+# BTN_DPAD_RIGHT = "right"
+# BTN_TL = "back"
+# BTN_TR = "tab"
+
 [animation]
 enabled = true        # false applies every visual change immediately
 panel_ms = 140.0    # panel transition, 0-60000 milliseconds

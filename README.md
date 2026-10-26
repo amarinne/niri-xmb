@@ -12,6 +12,7 @@ Features:
 - cursor-positioned workspace navigator
 - passive workspace peek
 - themes and window urgency
+- optional evdev gamepad buttons for the manual popup
 - Noctalia taskbar integration
 - persistent daemon for fast panel startup
 
@@ -19,6 +20,10 @@ Popup movement is off by default. Enable `behavior.move_popup` to press and
 hold the configured border region, then move the pointer after the normal
 `behavior.drag_threshold`. The offset lasts for the current session only;
 `peek.move_popup` is a separate opt-in for an armed peek overlay.
+
+Gamepad input is off by default. The `[gamepad]` table maps evdev button names
+or 16-bit codes to manual-popup actions; see the example configuration for the
+stable `/dev/input/by-id` paths and the available actions.
 
 ## Installation
 

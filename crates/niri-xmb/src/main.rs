@@ -4,6 +4,7 @@ mod draw;
 mod drop_plan;
 mod drop_transaction;
 mod focus;
+mod gamepad;
 mod icons;
 mod ipc;
 mod mirror;
@@ -18,7 +19,9 @@ mod wayland;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use config::{BarConfig, Config, NavigationMode, PopupOutputs, PopupPosition, PopupSurfaceMode};
+use config::{
+    BarConfig, Config, GamepadAction, NavigationMode, PopupOutputs, PopupPosition, PopupSurfaceMode,
+};
 use crossbeam_channel::unbounded;
 use drop_plan::{DropPoint, DropPolicy, DropRequest, DropTarget, plan_drop};
 use drop_transaction::DropTransactionState;
@@ -836,6 +839,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut surfaces = SurfaceManager::new(&surface_bars, &output_names, ui_tx)
         .context("failed to initialize layer-shell surfaces")?;
     let mut renderer = Renderer::new();
+    let gamepad = gamepad::GamepadService::start(&config.gamepad, wake.handle());
 
     let (control_tx, control_rx) = unbounded::<ControlRequest>();
     let subscriptions = std::sync::Arc::new(subscribe::SubscriptionHub::new());
@@ -1286,6 +1290,21 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
             )?;
         }
 
+        if let Some(gamepad) = &gamepad {
+            while let Some(action) = gamepad.try_recv() {
+                dirty |= handle_gamepad_action(
+                    action,
+                    &mut surfaces,
+                    &config,
+                    &snapshot,
+                    &niri_command_tx,
+                    &mut panel,
+                    &mut selection,
+                    &mut peek_suppressed_until,
+                )?;
+            }
+        }
+
         // Only the manual popup uses the delayed follow. A peek overlay is
         // re-placed on the focused output the moment focus moves, and routing
         // it through here would re-show it as an input-grabbing surface.
@@ -1726,6 +1745,123 @@ fn scroll_deltas(axis: ScrollAxis, steps: i32) -> (i32, i32) {
     }
 }
 
+/// Map a gamepad action onto the popup keyboard controls.
+///
+/// `Back` is previous output (Shift+Tab); `Close` is Escape and therefore
+/// follows `close_on_escape`. The mapping is applied only while a manual
+/// popup is open, matching keyboard focus.
+fn gamepad_keysym(action: GamepadAction) -> u32 {
+    match action {
+        GamepadAction::Up => KEY_UP,
+        GamepadAction::Down => KEY_DOWN,
+        GamepadAction::Left => KEY_LEFT,
+        GamepadAction::Right => KEY_RIGHT,
+        GamepadAction::Tab => KEY_TAB,
+        GamepadAction::Back => KEY_SHIFT_TAB,
+        GamepadAction::Confirm => KEY_RETURN,
+        GamepadAction::Close => KEY_ESCAPE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_popup_keysym(
+    keysym: u32,
+    surfaces: &mut SurfaceManager,
+    config: &Config,
+    snapshot: &Snapshot,
+    niri_tx: &crossbeam_channel::Sender<NiriRequest>,
+    panel: &mut PanelState,
+    selection: &mut Selection,
+    suppress_peek: &mut Instant,
+) -> Result<bool> {
+    match keysym {
+        KEY_ESCAPE => {
+            if config.behavior.close_on_escape {
+                surfaces.hide_all_popups()?;
+                panel.outputs_mut().clear();
+            }
+        }
+        KEY_LEFT => {
+            move_selection(selection, snapshot, 0, -1);
+            follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+        }
+        KEY_RIGHT => {
+            move_selection(selection, snapshot, 0, 1);
+            follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+        }
+        KEY_UP => {
+            move_selection(selection, snapshot, -1, 0);
+            follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+        }
+        KEY_DOWN => {
+            move_selection(selection, snapshot, 1, 0);
+            follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+        }
+        KEY_TAB => {
+            move_output_selection(selection, snapshot, 1);
+            follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+        }
+        KEY_SHIFT_TAB => {
+            move_output_selection(selection, snapshot, -1);
+            follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
+        }
+        KEY_RETURN => {
+            let (submitted, close) = if let Some(window_id) = selected_window(selection, snapshot) {
+                (
+                    submit_niri_command(niri_tx, NiriCommand::FocusWindow(window_id)),
+                    config.behavior.close_on_window_click,
+                )
+            } else if let Some(workspace_id) = selected_workspace(selection, snapshot) {
+                (
+                    submit_niri_command(niri_tx, NiriCommand::FocusWorkspace(workspace_id)),
+                    config.behavior.close_on_workspace_click,
+                )
+            } else {
+                (false, false)
+            };
+            if submitted {
+                // The queued move is resolved after successful submission. If
+                // the worker is unavailable, preserve the staged selection so
+                // the user can retry.
+                selection.clear_session();
+                *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
+            }
+            if submitted && close {
+                surfaces.hide_all_popups()?;
+                panel.outputs_mut().clear();
+            }
+        }
+        _ => {}
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_gamepad_action(
+    action: GamepadAction,
+    surfaces: &mut SurfaceManager,
+    config: &Config,
+    snapshot: &Snapshot,
+    niri_tx: &crossbeam_channel::Sender<NiriRequest>,
+    panel: &mut PanelState,
+    selection: &mut Selection,
+    suppress_peek: &mut Instant,
+) -> Result<bool> {
+    if panel.mode() != PopupMode::Manual {
+        return Ok(false);
+    }
+    handle_popup_keysym(
+        gamepad_keysym(action),
+        surfaces,
+        config,
+        snapshot,
+        niri_tx,
+        panel,
+        selection,
+        suppress_peek,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_ui_event(
     event: UiEvent,
@@ -1916,68 +2052,16 @@ fn handle_ui_event(
             Ok(true)
         }
         UiEventKind::Key { keysym } if matches!(event.kind, SurfaceKind::Popup) => {
-            match keysym {
-                KEY_ESCAPE => {
-                    if config.behavior.close_on_escape {
-                        surfaces.hide_all_popups()?;
-                        panel.outputs_mut().clear();
-                    }
-                }
-                KEY_LEFT => {
-                    move_selection(selection, snapshot, 0, -1);
-                    follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
-                }
-                KEY_RIGHT => {
-                    move_selection(selection, snapshot, 0, 1);
-                    follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
-                }
-                KEY_UP => {
-                    move_selection(selection, snapshot, -1, 0);
-                    follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
-                }
-                KEY_DOWN => {
-                    move_selection(selection, snapshot, 1, 0);
-                    follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
-                }
-                KEY_TAB => {
-                    move_output_selection(selection, snapshot, 1);
-                    follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
-                }
-                KEY_SHIFT_TAB => {
-                    move_output_selection(selection, snapshot, -1);
-                    follow_selection(config, selection, snapshot, niri_tx, suppress_peek);
-                }
-                KEY_RETURN => {
-                    let (submitted, close) = if let Some(window_id) =
-                        selected_window(selection, snapshot)
-                    {
-                        (
-                            submit_niri_command(niri_tx, NiriCommand::FocusWindow(window_id)),
-                            config.behavior.close_on_window_click,
-                        )
-                    } else if let Some(workspace_id) = selected_workspace(selection, snapshot) {
-                        (
-                            submit_niri_command(niri_tx, NiriCommand::FocusWorkspace(workspace_id)),
-                            config.behavior.close_on_workspace_click,
-                        )
-                    } else {
-                        (false, false)
-                    };
-                    if submitted {
-                        // The queued move is resolved after successful
-                        // submission. If the worker is unavailable, preserve
-                        // the staged selection so the user can retry.
-                        selection.clear_session();
-                        *suppress_peek = Instant::now() + SELF_FOCUS_GRACE;
-                    }
-                    if submitted && close {
-                        surfaces.hide_all_popups()?;
-                        panel.outputs_mut().clear();
-                    }
-                }
-                _ => {}
-            }
-            Ok(true)
+            handle_popup_keysym(
+                keysym,
+                surfaces,
+                config,
+                snapshot,
+                niri_tx,
+                panel,
+                selection,
+                suppress_peek,
+            )
         }
         UiEventKind::Scroll {
             axis,
@@ -3126,6 +3210,18 @@ mod ui_tests {
     fn wheel_axes_keep_their_existing_deltas() {
         assert_eq!(scroll_deltas(ScrollAxis::Vertical, 3), (3, 0));
         assert_eq!(scroll_deltas(ScrollAxis::Horizontal, -2), (0, -2));
+    }
+
+    #[test]
+    fn gamepad_actions_map_to_popup_keyboard_controls() {
+        assert_eq!(gamepad_keysym(GamepadAction::Up), KEY_UP);
+        assert_eq!(gamepad_keysym(GamepadAction::Down), KEY_DOWN);
+        assert_eq!(gamepad_keysym(GamepadAction::Left), KEY_LEFT);
+        assert_eq!(gamepad_keysym(GamepadAction::Right), KEY_RIGHT);
+        assert_eq!(gamepad_keysym(GamepadAction::Tab), KEY_TAB);
+        assert_eq!(gamepad_keysym(GamepadAction::Back), KEY_SHIFT_TAB);
+        assert_eq!(gamepad_keysym(GamepadAction::Confirm), KEY_RETURN);
+        assert_eq!(gamepad_keysym(GamepadAction::Close), KEY_ESCAPE);
     }
 
     /// A peek overlay would only duplicate Niri's own overview, so navigation

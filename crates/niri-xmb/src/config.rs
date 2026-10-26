@@ -1,8 +1,10 @@
 use crate::draw::StyleColor;
 use anyhow::{Context, Result};
+use evdev::KeyCode;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 const MAX_LOGICAL_DIMENSION: f32 = 8192.0;
 const MAX_OFFSET: f32 = 8192.0;
@@ -21,6 +23,7 @@ pub struct Config {
     pub animation: AnimationConfig,
     pub style: StyleConfig,
     pub behavior: BehaviorConfig,
+    pub gamepad: GamepadConfig,
     /// Path to a theme file whose `[style]` table is merged over this one's,
     /// key by key. A leading `~/` expands to `$HOME`; a relative path is
     /// resolved against the directory containing this config file.
@@ -255,6 +258,7 @@ impl Config {
             0.0,
             MAX_LOGICAL_DIMENSION as f64,
         )?;
+        self.gamepad.validate()?;
         self.style.validate()?;
         if self
             .theme
@@ -285,6 +289,7 @@ impl Default for Config {
             animation: AnimationConfig::default(),
             style: StyleConfig::default(),
             behavior: BehaviorConfig::default(),
+            gamepad: GamepadConfig::default(),
             theme: None,
         }
     }
@@ -989,6 +994,87 @@ impl Default for BehaviorConfig {
     }
 }
 
+/// One action a gamepad button can trigger while the manual popup is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GamepadAction {
+    Up,
+    Down,
+    Left,
+    Right,
+    /// Next output; matches Tab in the popup.
+    Tab,
+    /// Previous output; matches Shift+Tab in the popup.
+    Back,
+    /// Activate the selected window or workspace; matches Return.
+    Confirm,
+    /// Close the manual popup; matches Escape and follows `close_on_escape`.
+    Close,
+}
+
+/// Optional evdev gamepad button map.
+///
+/// Gamepads are read outside the Wayland seat. The daemon never grabs the
+/// device, so other clients keep receiving its input.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GamepadConfig {
+    pub enabled: bool,
+    /// Absolute evdev event device paths. Empty means discover stable
+    /// `/dev/input/by-id/*-event-joystick` and `*-event-gamepad` symlinks.
+    pub devices: Vec<String>,
+    /// evdev button name such as `BTN_SOUTH`, or a 16-bit decimal/hex code,
+    /// mapped to one manual-popup action.
+    pub buttons: BTreeMap<String, GamepadAction>,
+}
+
+impl GamepadConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.enabled && self.buttons.is_empty() {
+            anyhow::bail!(
+                "gamepad.buttons must define at least one binding when gamepad.enabled is true"
+            );
+        }
+        for (index, device) in self.devices.iter().enumerate() {
+            let device = device.trim();
+            if device.is_empty() {
+                anyhow::bail!("gamepad.devices[{index}] must not be empty");
+            }
+            if !Path::new(device).is_absolute() {
+                anyhow::bail!("gamepad.devices[{index}] must be an absolute path: {device}");
+            }
+        }
+        let mut codes = HashSet::new();
+        for name in self.buttons.keys() {
+            let code =
+                gamepad_button_code(name).with_context(|| format!("gamepad.buttons.{name}"))?;
+            if !codes.insert(code) {
+                anyhow::bail!("gamepad.buttons contains duplicate code {code:#06x} via {name:?}");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parse an evdev button name or a 16-bit numeric code.
+pub(crate) fn gamepad_button_code(name: &str) -> Result<u16> {
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("gamepad button name must not be empty");
+    }
+    if let Ok(code) = KeyCode::from_str(name) {
+        return Ok(code.code());
+    }
+    let number = if let Some(hex) = name.strip_prefix("0x").or_else(|| name.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).ok()
+    } else {
+        name.parse::<u16>().ok()
+    };
+    number.with_context(|| {
+        format!("unknown gamepad button {name:?}; use an evdev name or a 16-bit code")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1444,5 +1530,125 @@ mod tests {
         assert!(toml::from_str::<Config>("[style]\naccent = \"#gggggg\"\n").is_err());
         assert!(toml::from_str::<Config>("[style]\naccent = \"#1e1e2e\"\n").is_ok());
         assert!(toml::from_str::<Config>("[style]\naccent = \"#ff1e1e2e\"\n").is_ok());
+    }
+
+    #[test]
+    fn gamepad_is_disabled_by_default() {
+        let config = Config::default();
+        assert!(!config.gamepad.enabled);
+        assert!(config.gamepad.devices.is_empty());
+        assert!(config.gamepad.buttons.is_empty());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn gamepad_bindings_validate_and_parse() {
+        let config = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            devices = ["/dev/input/by-id/usb-test-event-joystick"]
+            [gamepad.buttons]
+            BTN_SOUTH = "confirm"
+            "0x221" = "down"
+            "0x131" = "close"
+            "#,
+            None,
+        )
+        .unwrap();
+
+        assert!(config.gamepad.enabled);
+        assert_eq!(
+            config.gamepad.buttons.get("BTN_SOUTH"),
+            Some(&GamepadAction::Confirm)
+        );
+        assert_eq!(
+            config.gamepad.buttons.get("0x221"),
+            Some(&GamepadAction::Down)
+        );
+        assert_eq!(
+            config.gamepad.buttons.get("0x131"),
+            Some(&GamepadAction::Close)
+        );
+        assert_eq!(gamepad_button_code("BTN_SOUTH").unwrap(), 0x130);
+        assert_eq!(gamepad_button_code("0x221").unwrap(), 0x221);
+    }
+
+    #[test]
+    fn gamepad_rejects_empty_bindings_when_enabled() {
+        let error = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            devices = ["/dev/input/event0"]
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("gamepad.buttons"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn gamepad_rejects_relative_device_paths() {
+        let error = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            devices = ["event0"]
+            [gamepad.buttons]
+            BTN_SOUTH = "confirm"
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("absolute"), "{error:#}");
+    }
+
+    #[test]
+    fn gamepad_rejects_unknown_buttons() {
+        let error = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            devices = ["/dev/input/event0"]
+            [gamepad.buttons]
+            NOT_A_BUTTON = "confirm"
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("NOT_A_BUTTON"), "{error:#}");
+    }
+
+    #[test]
+    fn gamepad_rejects_unknown_actions() {
+        let error = toml::from_str::<Config>(
+            r#"
+            [gamepad.buttons]
+            BTN_SOUTH = "jump"
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{error}").contains("jump"), "{error}");
+    }
+
+    #[test]
+    fn gamepad_rejects_duplicate_button_codes() {
+        let error = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            devices = ["/dev/input/event0"]
+            [gamepad.buttons]
+            BTN_SOUTH = "confirm"
+            "0x130" = "close"
+            "#,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("duplicate code"), "{error:#}");
     }
 }
