@@ -1,13 +1,35 @@
+local STREAM_PROTOCOL = 1
+local STREAM_SCHEMA = 1
+-- Stream frames are applied on update ticks so an event burst collapses to
+-- one render. A fast tick keeps that latency below a display frame; the
+-- polling fallback uses the configured interval instead.
+local STREAM_TICK_MS = 16
+local STREAM_START_TIMEOUT_MS = 1500
+local STREAM_SNAPSHOT_TIMEOUT_MS = 3000
+local STREAM_RETRY_MIN_MS = 2000
+local STREAM_RETRY_MAX_MS = 30000
+-- One entry runtime gets a few chances to establish a stream. Every launch
+-- that ends without a frame leaves a dead child behind, and Noctalia bounds
+-- each host to four live stream children.
+local STREAM_MAX_LAUNCHES = 3
+-- Noctalia drops a runStream line above 64 KiB, while the daemon allows
+-- 256 KiB frames. A low-frequency mirror read recovers from a dropped frame
+-- or a stream child that died without an exit callback.
+local STREAM_RESYNC_MS = 30000
+local FOCUS_INTENT_TIMEOUT_MS = 2000
+local CYCLE_INTENT_TIMEOUT_MS = 2000
+local CYCLE_INTENT_MAX_MS = 4000
+
 local state = {
     snapshot = nil,
-    polling = false,
-    lastGeneration = -1,
-    -- Titles move without the layout moving, so the daemon bumps
-    -- content_revision and leaves generation alone. Gating on
-    -- generation alone left tooltips showing the title captured at
-    -- the last layout change.
-    lastContentRevision = -1,
-    lastError = nil,
+    -- Last applied snapshot identity. Stream frames carry a daemon instance,
+    -- so freshness is comparable within one daemon run. Poll results carry no
+    -- instance and are deduplicated by (generation, content_revision).
+    lastFrame = nil,
+    -- Newest decoded frame not yet applied. Stream and poll callbacks only
+    -- replace this slot; update() applies at most one frame and renders once.
+    pendingFrame = nil,
+    renderPending = false,
     icons = {},
     iconRetryAt = {},
     -- appIconPath can scan desktop entries and the icon theme. Keep those
@@ -20,14 +42,38 @@ local state = {
     hoveredWindowId = nil,
     pendingDrop = nil,
     dropErrorUntil = nil,
+    -- Inputs that were dispatched but are not yet visible in the authoritative
+    -- snapshot. They never drive rendering; they only bound how long the
+    -- widget keeps treating its last state as transitional.
+    intentSeq = 0,
+    pendingFocus = nil,
+    pendingCycle = { workspace = nil, window = nil },
     -- Set while the one-off `status` call that learns the mirror path is
     -- outstanding, so ticks in between do not pile up more of them.
     learningMirror = false,
+    nextMirrorLearnAt = nil,
     -- Path of the daemon's snapshot mirror, learned once from `status`.
     mirrorPath = nil,
     -- When the in-flight poll must be considered lost. Without this a
     -- callback that never fires leaves `polling` true and freezes the widget.
+    polling = false,
     pollDeadline = nil,
+    pollSeq = 0,
+    lastPollResultSeq = 0,
+    nextPollAt = nil,
+    -- Native stream state: idle | connecting | awaiting | reconnecting |
+    -- healthy | stalled | retrying | unavailable.
+    streamMode = "idle",
+    streamGeneration = 0,
+    streamLaunches = 0,
+    streamNextAttemptAt = nil,
+    streamFrameDeadline = nil,
+    streamInstance = nil,
+    streamBackend = nil,
+    streamLastFrameAt = nil,
+    streamResyncAt = nil,
+    tickIntervalMs = nil,
+    logged = {},
     -- Coalesced wheel steps waiting to be sent, per axis.
     pendingScroll = { vertical = 0, horizontal = 0 },
     scrollFlushAt = nil,
@@ -35,6 +81,9 @@ local state = {
 
 local render
 local poll
+local nextIntentToken
+local beginFocusIntent
+local beginCycleIntent
 
 local function config(key, fallback)
     local value = noctalia.getConfig(key)
@@ -89,6 +138,28 @@ local function optionalId(value)
     return number
 end
 
+local function nonNegativeInteger(value)
+    local number = finiteNumber(value)
+    if number == nil or number < 0 or number ~= math.floor(number) then
+        return nil
+    end
+    return number
+end
+
+local function pollInterval()
+    return finiteNumber(config("poll_interval_ms", 250)) or 250
+end
+
+-- Stream and poll failures can repeat every tick. Log one distinct message,
+-- not one per frame, so a broken daemon cannot flood Noctalia's log.
+local function logOnce(key, message)
+    if state.logged[key] == message then
+        return
+    end
+    state.logged[key] = message
+    noctalia.log(message)
+end
+
 local function targetOutput()
     local configured = tostring(config("target_output", ""))
     if configured ~= "" then
@@ -97,16 +168,55 @@ local function targetOutput()
     return barWidget.outputName() or noctalia.focusedOutputName() or ""
 end
 
-local function findOutput(name)
-    if state.snapshot == nil or state.snapshot.outputs == nil then
+local function findOutputIn(snapshot, name)
+    if snapshot == nil or snapshot.outputs == nil then
         return nil
     end
-    for _, output in ipairs(state.snapshot.outputs) do
+    for _, output in ipairs(snapshot.outputs) do
         if output.name == name then
             return output
         end
     end
     return nil
+end
+
+local function findOutput(name)
+    return findOutputIn(state.snapshot, name)
+end
+
+local function activeWorkspaceIn(output)
+    if output == nil then
+        return nil
+    end
+    for _, workspace in ipairs(output.workspaces or {}) do
+        if workspace.active then
+            return workspace
+        end
+    end
+    return nil
+end
+
+local function activeWorkspaceIdOn(snapshot, outputName)
+    local workspace = activeWorkspaceIn(findOutputIn(snapshot, outputName))
+    return workspace and workspace.id or nil
+end
+
+-- Mirrors step_index() in the daemon, which both cycle policies use.
+local function stepIndex(current, delta, count, wrap)
+    if count == 0 then
+        return 0
+    end
+    if wrap then
+        return ((current + delta) % count + count) % count
+    end
+    local nextIndex = current + delta
+    if nextIndex < 0 then
+        return 0
+    end
+    if nextIndex > count - 1 then
+        return count - 1
+    end
+    return nextIndex
 end
 
 local function findWorkspaceIn(snapshot, workspaceId)
@@ -147,12 +257,206 @@ local function findWindow(windowId)
     return findWindowIn(state.snapshot, windowId)
 end
 
+local function trim(value)
+    return string.match(tostring(value or ""), "^%s*(.-)%s*$") or ""
+end
+
 local function runAction(arguments, callback)
     local invocation = command(arguments)
     if callback == nil then
-        noctalia.runAsync(invocation)
+        return noctalia.runAsync(invocation)
+    end
+    return noctalia.runAsync(invocation, callback)
+end
+
+local function actionFailed(result)
+    if result == nil or result.exitCode ~= 0 then
+        return true
+    end
+    return string.match(trim(tostring(result.stdout or result.stderr or "")), "^error:") ~= nil
+end
+
+nextIntentToken = function()
+    state.intentSeq = state.intentSeq + 1
+    return state.intentSeq
+end
+
+-- Record what the authoritative snapshot must show before an action is
+-- considered settled. These intents never render: Niri state stays canonical
+-- and the next snapshot wins, while the intent only bounds the transitional
+-- period and lets a contradictory snapshot clear it early.
+beginFocusIntent = function(kind, id)
+    if state.snapshot == nil then
+        return nil
+    end
+    local now = noctalia.nowMs()
+    local baselineWindowId = nil
+    local baselineWorkspaceId = nil
+    local outputName = nil
+    if kind == "window" then
+        local _, _, _, window = findWindowIn(state.snapshot, id)
+        if window == nil or state.snapshot.focused_window == id then
+            return nil
+        end
+        baselineWindowId = state.snapshot.focused_window
     else
-        noctalia.runAsync(invocation, callback)
+        local output, workspace = findWorkspaceIn(state.snapshot, id)
+        if workspace == nil or workspace.active then
+            return nil
+        end
+        outputName = output and output.name or nil
+        baselineWorkspaceId = activeWorkspaceIdOn(state.snapshot, outputName)
+    end
+    local token = nextIntentToken()
+    state.pendingFocus = {
+        token = token,
+        kind = kind,
+        windowId = kind == "window" and id or nil,
+        workspaceId = kind == "workspace" and id or nil,
+        output = outputName,
+        baselineWindowId = baselineWindowId,
+        baselineWorkspaceId = baselineWorkspaceId,
+        submittedAt = now,
+        deadline = now + FOCUS_INTENT_TIMEOUT_MS,
+    }
+    return token
+end
+
+local function captureWorkspaceBaseline()
+    local outputName = targetOutput()
+    local output = findOutputIn(state.snapshot, outputName)
+    if output == nil then
+        return nil
+    end
+    local ids = {}
+    local current = nil
+    for index, workspace in ipairs(output.workspaces or {}) do
+        ids[index] = workspace.id
+        if workspace.active then
+            current = index
+        end
+    end
+    if #ids == 0 then
+        return nil
+    end
+    current = current or 1
+    return {
+        kind = "workspace",
+        output = outputName,
+        ids = ids,
+        current = current,
+        baselineId = ids[current],
+    }
+end
+
+local function captureWindowBaseline()
+    local outputName = targetOutput()
+    local output = findOutputIn(state.snapshot, outputName)
+    local workspace = activeWorkspaceIn(output)
+    if workspace == nil then
+        return nil
+    end
+    local ids = {}
+    local current = nil
+    for index, window in ipairs(workspace.windows or {}) do
+        ids[index] = window.id
+        if state.snapshot.focused_window == window.id then
+            current = index
+        end
+    end
+    if current == nil then
+        for index, window in ipairs(workspace.windows or {}) do
+            if workspace.active_window == window.id then
+                current = index
+            end
+        end
+    end
+    if #ids == 0 then
+        return nil
+    end
+    current = current or 1
+    return {
+        kind = "window",
+        output = outputName,
+        ids = ids,
+        current = current,
+        baselineId = ids[current],
+    }
+end
+
+-- The daemon honours bar.scroll_wrap, which the plugin cannot read. Keep both
+-- the wrapping and clamping result as acceptable outcomes.
+local function cycleExpectation(baseline, totalDelta)
+    local count = #baseline.ids
+    if count == 0 then
+        return nil
+    end
+    local wrapIndex = stepIndex(baseline.current - 1, totalDelta, count, true) + 1
+    local clampIndex = stepIndex(baseline.current - 1, totalDelta, count, false) + 1
+    local expected = {}
+    if wrapIndex ~= baseline.current then
+        expected[baseline.ids[wrapIndex]] = true
+    end
+    if clampIndex ~= baseline.current then
+        expected[baseline.ids[clampIndex]] = true
+    end
+    if next(expected) == nil then
+        return nil
+    end
+    return expected
+end
+
+beginCycleIntent = function(kind, delta)
+    if state.snapshot == nil or delta == 0 then
+        return nil
+    end
+    local now = noctalia.nowMs()
+    local intent = state.pendingCycle[kind]
+    if intent ~= nil and now < intent.deadline then
+        -- A queued wheel burst keeps extending the target it already sent.
+        intent.totalDelta = intent.totalDelta + delta
+        intent.expected = cycleExpectation(intent.baseline, intent.totalDelta)
+        intent.token = nextIntentToken()
+        intent.deadline = math.min(intent.submittedAt + CYCLE_INTENT_MAX_MS, now + CYCLE_INTENT_TIMEOUT_MS)
+        if intent.expected == nil then
+            state.pendingCycle[kind] = nil
+            return nil
+        end
+        return intent.token
+    end
+    local baseline = kind == "workspace" and captureWorkspaceBaseline() or captureWindowBaseline()
+    if baseline == nil then
+        return nil
+    end
+    local expected = cycleExpectation(baseline, delta)
+    if expected == nil then
+        return nil
+    end
+    intent = {
+        token = nextIntentToken(),
+        kind = kind,
+        baseline = baseline,
+        totalDelta = delta,
+        expected = expected,
+        submittedAt = now,
+        deadline = now + CYCLE_INTENT_TIMEOUT_MS,
+    }
+    state.pendingCycle[kind] = intent
+    return intent.token
+end
+
+local function clearFocusIntent(token)
+    local intent = state.pendingFocus
+    if intent ~= nil and intent.token == token then
+        state.pendingFocus = nil
+    end
+end
+
+local function reportActionFailure(label, detail, token)
+    logOnce("action:" .. label, "niri-xmb " .. label .. " failed: " .. detail)
+    if token ~= nil then
+        clearFocusIntent(token)
+        poll(true)
     end
 end
 
@@ -162,7 +466,15 @@ local function focusWindow(windowId)
         noctalia.log("niri-xmb: rejected invalid window ID")
         return
     end
-    runAction({ "focus-window", "--window-id", idString(validatedId) })
+    local token = beginFocusIntent("window", validatedId)
+    local started = runAction({ "focus-window", "--window-id", idString(validatedId) }, function(result)
+        if actionFailed(result) then
+            reportActionFailure("window focus", trim(tostring(result and (result.stdout or result.stderr) or "")), token)
+        end
+    end)
+    if not started then
+        reportActionFailure("window focus", "runAsync rejected the command", token)
+    end
 end
 
 local function focusWorkspace(workspaceId)
@@ -171,11 +483,15 @@ local function focusWorkspace(workspaceId)
         noctalia.log("niri-xmb: rejected invalid workspace ID")
         return
     end
-    runAction({ "focus-workspace", "--workspace-id", idString(validatedId) })
-end
-
-local function trim(value)
-    return string.match(tostring(value or ""), "^%s*(.-)%s*$") or ""
+    local token = beginFocusIntent("workspace", validatedId)
+    local started = runAction({ "focus-workspace", "--workspace-id", idString(validatedId) }, function(result)
+        if actionFailed(result) then
+            reportActionFailure("workspace focus", trim(tostring(result and (result.stdout or result.stderr) or "")), token)
+        end
+    end)
+    if not started then
+        reportActionFailure("workspace focus", "runAsync rejected the command", token)
+    end
 end
 
 local function addIconCandidate(candidates, seen, value)
@@ -336,6 +652,7 @@ local function applyOptimisticDrop(sourceWindowId, workspaceId, targetWindowId, 
     -- the daemon answers for this drop or this deadline passes; whichever
     -- comes first restores canonical state.
     state.pendingDrop = {
+        token = nextIntentToken(),
         sourceWindowId = sourceWindowId,
         workspaceId = workspaceId,
         targetWindowId = targetWindowId,
@@ -343,8 +660,10 @@ local function applyOptimisticDrop(sourceWindowId, workspaceId, targetWindowId, 
         submittedAt = noctalia.nowMs(),
         deadline = noctalia.nowMs() + 3000,
     }
-    state.lastGeneration = -1
-    state.lastContentRevision = -1
+    -- The local preview is not a frame. Drop any queued pre-drop state so the
+    -- next authoritative frame is judged against the preview, not the past.
+    state.pendingFrame = nil
+    state.lastFrame = nil
     render()
     return true
 end
@@ -376,7 +695,8 @@ local function onDrop(payload, value, sceneX, sceneY)
         return
     end
 
-    applyOptimisticDrop(sourceWindowId, workspaceId, targetWindowId, fraction)
+    local previewed = applyOptimisticDrop(sourceWindowId, workspaceId, targetWindowId, fraction)
+    local token = previewed and state.pendingDrop.token or nil
 
     local arguments = {
         "drop",
@@ -407,41 +727,48 @@ local function onDrop(payload, value, sceneX, sceneY)
         end
     end
 
-    local function commitDrop()
-        runAction(arguments, function(result)
-            local response = trim(tostring(result.stdout or result.stderr or ""))
-            -- The daemon answers only after the move is confirmed, the action
-            -- fails, or confirmation times out. Either way this reply ends the
-            -- optimistic preview and pulls canonical state immediately.
-            local pending = state.pendingDrop
-            local pendingAge = nil
-            if pending ~= nil and finiteNumber(pending.submittedAt) ~= nil then
-                pendingAge = math.max(0, math.floor(noctalia.nowMs() - pending.submittedAt))
-            end
-            state.pendingDrop = nil
-            state.lastGeneration = -1
-            state.lastContentRevision = -1
-            if result.exitCode ~= 0 or string.match(response, "^error:") ~= nil then
-                -- One line carries every field needed to reproduce the
-                -- rejection against daemon logs: ids and numbers only.
-                noctalia.log(string.format(
-                    "niri-xmb drop failed: source=%s workspace=%s target=%s fraction=%s generation=%s pendingAgeMs=%s response=%s",
-                    idString(sourceWindowId),
-                    idString(workspaceId),
-                    idString(targetWindowId),
-                    tostring(fraction),
-                    idString(state.snapshot ~= nil and state.snapshot.generation or nil),
-                    pendingAge ~= nil and tostring(pendingAge) or "unknown",
-                    response ~= "" and response or "(empty)"
-                ))
-                state.dropErrorUntil = noctalia.nowMs() + 2500
-                render()
-            end
-            poll(true)
-        end)
+    local function finishDrop(dropToken, result)
+        local pending = state.pendingDrop
+        if pending ~= nil and dropToken ~= pending.token then
+            -- A newer drag owns the preview now. Its reply is the one that
+            -- gets to clear or roll back canonical state.
+            return
+        end
+        local response = trim(tostring(result and (result.stdout or result.stderr) or ""))
+        -- The daemon answers only after the move is confirmed, the action
+        -- fails, or confirmation times out. Either way this reply ends the
+        -- optimistic preview and pulls canonical state immediately.
+        local pendingAge = nil
+        if pending ~= nil and finiteNumber(pending.submittedAt) ~= nil then
+            pendingAge = math.max(0, math.floor(noctalia.nowMs() - pending.submittedAt))
+        end
+        state.pendingDrop = nil
+        state.pendingFrame = nil
+        state.lastFrame = nil
+        if actionFailed(result) then
+            -- One line carries every field needed to reproduce the
+            -- rejection against daemon logs: ids and numbers only.
+            noctalia.log(string.format(
+                "niri-xmb drop failed: source=%s workspace=%s target=%s fraction=%s generation=%s pendingAgeMs=%s response=%s",
+                idString(sourceWindowId),
+                idString(workspaceId),
+                idString(targetWindowId),
+                tostring(fraction),
+                idString(state.snapshot ~= nil and state.snapshot.generation or nil),
+                pendingAge ~= nil and tostring(pendingAge) or "unknown",
+                response ~= "" and response or "(empty)"
+            ))
+            state.dropErrorUntil = noctalia.nowMs() + 2500
+            render()
+        end
+        poll(true)
     end
 
-    commitDrop()
+    if not runAction(arguments, function(result)
+        finishDrop(token, result)
+    end) then
+        finishDrop(token, nil)
+    end
 end
 
 local function onSourceDrop(payload, value, _, _)
@@ -755,10 +1082,361 @@ render = function()
     }, children))
 end
 
--- Everything that happens once a snapshot has been decoded, whether it
--- came from the mirror file or from a `snapshot` process.
-local function applySnapshot(decoded, force)
-    state.lastError = nil
+-- Frame identity -----------------------------------------------------------
+
+-- Stream frames from one daemon run are ordered by generation and then by
+-- content_revision, because a title-only change keeps the generation and
+-- moves the revision. Poll frames have no instance, so they are deduplicated
+-- by the tuple alone; a poll that started before a newer stream frame is
+-- discarded by request time in poll().
+local function frameIsNewer(frame, reference)
+    if reference == nil then
+        return true
+    end
+    if frame.instance ~= nil and reference.instance ~= nil then
+        if frame.instance ~= reference.instance then
+            return true
+        end
+        if frame.generation ~= reference.generation then
+            return frame.generation > reference.generation
+        end
+        return frame.contentRevision > reference.contentRevision
+    end
+    if frame.instance ~= nil or reference.instance ~= nil then
+        return true
+    end
+    return frame.generation ~= reference.generation
+        or frame.contentRevision ~= reference.contentRevision
+end
+
+local function queueFrame(frame)
+    local reference = state.pendingFrame or state.lastFrame
+    if not frameIsNewer(frame, reference) then
+        return false
+    end
+    state.pendingFrame = frame
+    return true
+end
+
+local function snapshotFromPoll(decoded)
+    if type(decoded) ~= "table" then
+        return nil, "not an object"
+    end
+    local generation = nonNegativeInteger(decoded.generation)
+    if generation == nil then
+        return nil, "missing generation"
+    end
+    return {
+        instance = nil,
+        generation = generation,
+        contentRevision = nonNegativeInteger(decoded.content_revision) or 0,
+        snapshot = decoded,
+        source = "poll",
+    }
+end
+
+-- Native stream transport --------------------------------------------------
+
+local STREAM_END_FRAME = '{"type":"stream_end"}'
+
+local function streamCommand()
+    -- runStream has no exit callback in this API level. The trailing printf
+    -- runs only if the subscribe client itself exits, which turns an
+    -- otherwise silent death into one parsable line.
+    return command({ "subscribe" }) .. "; printf '%s\\n' " .. shellQuote(STREAM_END_FRAME)
+end
+
+local function streamRetryDelay()
+    local exponent = math.max(0, state.streamLaunches - 1)
+    local delay = STREAM_RETRY_MIN_MS * (2 ^ exponent)
+    if delay > STREAM_RETRY_MAX_MS then
+        delay = STREAM_RETRY_MAX_MS
+    end
+    return delay
+end
+
+local function markStreamHealthy(now)
+    state.streamMode = "healthy"
+    state.streamNextAttemptAt = nil
+    state.streamFrameDeadline = nil
+    state.streamResyncAt = now + STREAM_RESYNC_MS
+    state.nextPollAt = nil
+end
+
+local function handleStreamLine(line)
+    if type(line) ~= "string" then
+        return
+    end
+    local stripped = trim(line)
+    if stripped == "" then
+        return
+    end
+    local ok, decoded = pcall(noctalia.json.decode, stripped)
+    if not ok or type(decoded) ~= "table" then
+        state.streamMode = "unavailable"
+        state.nextPollAt = noctalia.nowMs()
+        logOnce("stream-protocol", "niri-xmb: stream emitted a non-JSON line; using snapshot polling")
+        return
+    end
+
+    local now = noctalia.nowMs()
+    local kind = decoded.type
+
+    if kind == "hello" then
+        local protocol = nonNegativeInteger(decoded.protocol)
+        local schema = nonNegativeInteger(decoded.schema)
+        local instance = decoded.instance
+        if protocol ~= STREAM_PROTOCOL or schema ~= STREAM_SCHEMA
+            or type(instance) ~= "string" or instance == "" then
+            state.streamMode = "unavailable"
+            state.nextPollAt = now
+            logOnce("stream-hello", string.format(
+                "niri-xmb: unsupported stream hello (protocol=%s schema=%s); using snapshot polling",
+                tostring(decoded.protocol),
+                tostring(decoded.schema)
+            ))
+            return
+        end
+        if state.streamInstance ~= nil and state.streamInstance ~= instance
+            and state.pendingFrame ~= nil and state.pendingFrame.instance ~= nil
+            and state.pendingFrame.instance ~= instance then
+            -- A queued frame from the replaced daemon must not be applied
+            -- after the new instance's hello.
+            state.pendingFrame = nil
+        end
+        state.streamInstance = instance
+        state.streamMode = "awaiting"
+        state.streamFrameDeadline = now + STREAM_SNAPSHOT_TIMEOUT_MS
+        return
+    end
+
+    if kind == "snapshot" then
+        local protocol = nonNegativeInteger(decoded.protocol)
+        local schema = nonNegativeInteger(decoded.schema)
+        local instance = decoded.instance
+        local generation = nonNegativeInteger(decoded.generation)
+        local body = decoded.snapshot
+        if protocol ~= STREAM_PROTOCOL or schema ~= STREAM_SCHEMA
+            or type(instance) ~= "string" or instance == ""
+            or generation == nil or type(body) ~= "table" then
+            logOnce("stream-frame", "niri-xmb: rejected malformed stream snapshot frame")
+            return
+        end
+        if state.streamInstance ~= nil and instance ~= state.streamInstance then
+            -- A replaced daemon's buffered frame must not overwrite the new
+            -- instance's state.
+            return
+        end
+        if nonNegativeInteger(body.generation) ~= generation then
+            logOnce("stream-generation", "niri-xmb: rejected stream frame with a mismatched snapshot generation")
+            return
+        end
+        state.streamInstance = instance
+        state.streamLastFrameAt = now
+        markStreamHealthy(now)
+        queueFrame({
+            instance = instance,
+            generation = generation,
+            contentRevision = nonNegativeInteger(body.content_revision) or 0,
+            snapshot = body,
+            source = "stream",
+        })
+        return
+    end
+
+    if kind == "connection" then
+        state.streamMode = "reconnecting"
+        state.streamFrameDeadline = nil
+        state.nextPollAt = now
+        logOnce(
+            "stream-connection",
+            "niri-xmb: state stream disconnected (" .. tostring(decoded.reason or "daemon socket closed")
+                .. "); polling fallback active"
+        )
+        return
+    end
+
+    if kind == "error" then
+        local code = tostring(decoded.code or "unknown")
+        local message = tostring(decoded.message or "")
+        if decoded.retryable == true then
+            -- The subscribe client owns reconnecting for this connection.
+            state.streamMode = "reconnecting"
+            state.nextPollAt = now
+            logOnce("stream-error:" .. code, "niri-xmb: stream busy (" .. code .. "); polling fallback active")
+        else
+            state.streamMode = "unavailable"
+            state.streamFrameDeadline = nil
+            state.nextPollAt = now
+            logOnce(
+                "stream-error:" .. code,
+                "niri-xmb: stream unavailable (" .. code .. ": " .. message .. "); polling fallback active"
+            )
+        end
+        return
+    end
+
+    if kind == "stream_end" then
+        state.streamInstance = nil
+        state.streamMode = "retrying"
+        state.streamFrameDeadline = nil
+        state.nextPollAt = now
+        state.streamNextAttemptAt = now + streamRetryDelay()
+        logOnce("stream-end", "niri-xmb: state stream process ended; polling fallback active")
+        return
+    end
+    -- Unknown frame types are ignored so a newer daemon can add fields.
+end
+
+local function startStream()
+    if type(noctalia.runStream) ~= "function" then
+        state.streamMode = "unavailable"
+        logOnce("stream-api", "niri-xmb: Noctalia has no runStream; using snapshot polling")
+        return false
+    end
+    if state.streamLaunches >= STREAM_MAX_LAUNCHES then
+        state.streamMode = "unavailable"
+        logOnce("stream-launch-limit", "niri-xmb: stream launch limit reached; using snapshot polling")
+        return false
+    end
+    if state.streamMode == "healthy" or state.streamMode == "connecting" or state.streamMode == "awaiting" then
+        return false
+    end
+
+    local now = noctalia.nowMs()
+    state.streamLaunches = state.streamLaunches + 1
+    state.streamGeneration = state.streamGeneration + 1
+    local generation = state.streamGeneration
+    state.streamBackend = backend()
+    state.streamInstance = nil
+    state.streamMode = "connecting"
+    state.streamNextAttemptAt = nil
+    state.streamFrameDeadline = now + STREAM_START_TIMEOUT_MS
+    state.nextPollAt = now
+
+    local started = noctalia.runStream(streamCommand(), function(line)
+        if state.streamGeneration ~= generation then
+            return
+        end
+        local ok, err = pcall(handleStreamLine, line)
+        if not ok then
+            logOnce("stream-callback", "niri-xmb: stream callback failed: " .. tostring(err))
+        end
+    end)
+
+    if started then
+        logOnce("stream-start", "niri-xmb: subscribed to the daemon state stream")
+        return true
+    end
+    state.streamMode = "retrying"
+    state.streamNextAttemptAt = now + streamRetryDelay()
+    logOnce("stream-start-failed", "niri-xmb: runStream rejected the subscription; using snapshot polling")
+    return false
+end
+
+-- Pending input intents ----------------------------------------------------
+
+local function resolveFocusIntent(snapshot, now)
+    local intent = state.pendingFocus
+    if intent == nil then
+        return
+    end
+    if intent.kind == "window" then
+        if snapshot.focused_window == intent.windowId then
+            state.pendingFocus = nil
+            return
+        end
+        local _, _, _, window = findWindowIn(snapshot, intent.windowId)
+        if window == nil then
+            state.pendingFocus = nil
+            return
+        end
+        if snapshot.focused_window ~= nil and snapshot.focused_window ~= intent.baselineWindowId then
+            state.pendingFocus = nil
+            return
+        end
+    else
+        local _, workspace = findWorkspaceIn(snapshot, intent.workspaceId)
+        if workspace == nil then
+            state.pendingFocus = nil
+            return
+        end
+        if workspace.active then
+            state.pendingFocus = nil
+            return
+        end
+        local active = activeWorkspaceIdOn(snapshot, intent.output)
+        if active ~= nil and active ~= intent.baselineWorkspaceId then
+            state.pendingFocus = nil
+            return
+        end
+    end
+    if now >= intent.deadline then
+        state.pendingFocus = nil
+        logOnce("focus-timeout", "niri-xmb: focus was not confirmed; refreshing state")
+        poll(true)
+    end
+end
+
+local function resolveCycleIntent(kind, snapshot, now)
+    local intent = state.pendingCycle[kind]
+    if intent == nil then
+        return
+    end
+    local actual
+    if intent.baseline.kind == "workspace" then
+        actual = activeWorkspaceIdOn(snapshot, intent.baseline.output)
+    else
+        actual = snapshot.focused_window
+    end
+    if actual ~= nil and intent.expected[actual] then
+        state.pendingCycle[kind] = nil
+        return
+    end
+    if actual ~= nil and actual ~= intent.baseline.baselineId then
+        -- Authoritative state moved somewhere the queued target did not
+        -- predict, so waiting for the prediction would only delay the truth.
+        state.pendingCycle[kind] = nil
+        return
+    end
+    if now >= intent.deadline then
+        state.pendingCycle[kind] = nil
+        logOnce("cycle-timeout:" .. kind, "niri-xmb: " .. kind .. " cycle was not confirmed; refreshing state")
+        poll(true)
+    end
+end
+
+local function expireIntents(now)
+    local drop = state.pendingDrop
+    if drop ~= nil and now >= drop.deadline then
+        state.pendingDrop = nil
+        state.lastFrame = nil
+        state.renderPending = true
+        logOnce("drop-timeout", "niri-xmb: drop preview expired before confirmation; refreshing state")
+        poll(true)
+    end
+    local focus = state.pendingFocus
+    if focus ~= nil and now >= focus.deadline then
+        state.pendingFocus = nil
+        logOnce("focus-timeout", "niri-xmb: focus was not confirmed; refreshing state")
+        poll(true)
+    end
+    for _, kind in ipairs({ "workspace", "window" }) do
+        local intent = state.pendingCycle[kind]
+        if intent ~= nil and now >= intent.deadline then
+            state.pendingCycle[kind] = nil
+            logOnce("cycle-timeout:" .. kind, "niri-xmb: " .. kind .. " cycle was not confirmed; refreshing state")
+            poll(true)
+        end
+    end
+end
+
+-- Applying state -----------------------------------------------------------
+
+-- Everything that happens once a snapshot has been decoded, whether it came
+-- from the stream or from the polling fallback.
+local function applySnapshot(frame)
+    local decoded = frame.snapshot
     if state.pendingDrop ~= nil then
         local now = noctalia.nowMs()
         if now >= state.pendingDrop.deadline then
@@ -766,51 +1444,75 @@ local function applySnapshot(decoded, force)
         elseif pendingDropMatches(decoded, state.pendingDrop) then
             state.pendingDrop = nil
         else
-            return
+            return false
         end
     end
     state.snapshot = decoded
-    local dropErrorExpired = state.dropErrorUntil ~= nil
-        and noctalia.nowMs() >= state.dropErrorUntil
-    if dropErrorExpired then
+    local now = noctalia.nowMs()
+    resolveFocusIntent(decoded, now)
+    resolveCycleIntent("workspace", decoded, now)
+    resolveCycleIntent("window", decoded, now)
+    if state.dropErrorUntil ~= nil and now >= state.dropErrorUntil then
         state.dropErrorUntil = nil
     end
-    local contentRevision = decoded.content_revision or 0
-    if force
-        or dropErrorExpired
-        or decoded.generation ~= state.lastGeneration
-        or contentRevision ~= state.lastContentRevision
-    then
-        state.lastGeneration = decoded.generation
-        state.lastContentRevision = contentRevision
-        render()
-    end
+    state.renderPending = true
+    return true
 end
+
+local function applyPendingFrame()
+    local frame = state.pendingFrame
+    if frame == nil then
+        return false
+    end
+    state.pendingFrame = nil
+    if not applySnapshot(frame) then
+        return false
+    end
+    state.lastFrame = {
+        instance = frame.instance,
+        generation = frame.generation,
+        contentRevision = frame.contentRevision,
+    }
+    return true
+end
+
+-- Polling fallback ---------------------------------------------------------
 
 -- One `status` call teaches the widget where the snapshot mirror lives.
 -- After that every tick is a file read: no process, no socket.
-local function learnMirrorPath()
+local function learnMirrorPath(now)
     if state.mirrorPath ~= nil or state.learningMirror then
+        return
+    end
+    if state.nextMirrorLearnAt ~= nil and now < state.nextMirrorLearnAt then
         return
     end
     state.learningMirror = true
     local started = noctalia.runAsync(command({ "status" }), function(result)
         state.learningMirror = false
         if result.exitCode ~= 0 then
+            state.nextMirrorLearnAt = noctalia.nowMs() + 10000
             return
         end
         local decoded = noctalia.json.decode(result.stdout or "")
         if type(decoded) == "table" and type(decoded.snapshot_mirror) == "string" then
             state.mirrorPath = decoded.snapshot_mirror
+            state.nextMirrorLearnAt = nil
+        else
+            state.nextMirrorLearnAt = noctalia.nowMs() + 10000
         end
     end)
     if not started then
         state.learningMirror = false
+        state.nextMirrorLearnAt = now + 10000
     end
 end
 
 poll = function(force)
     local now = noctalia.nowMs()
+    if not force and state.streamMode == "healthy" then
+        return
+    end
     if state.polling then
         if state.pollDeadline ~= nil and now >= state.pollDeadline then
             state.polling = false
@@ -820,9 +1522,13 @@ poll = function(force)
         end
     end
 
-    learnMirrorPath()
+    local interval = pollInterval()
+    if not force and state.nextPollAt ~= nil and now < state.nextPollAt then
+        return
+    end
+    state.nextPollAt = now + interval
+    learnMirrorPath(now)
 
-    local interval = finiteNumber(config("poll_interval_ms", 250)) or 250
     local function beginPoll()
         state.polling = true
         state.pollDeadline = now + math.max(interval * 4, 1000)
@@ -830,29 +1536,46 @@ poll = function(force)
     local function endPoll()
         state.polling = false
         state.pollDeadline = nil
+        state.nextPollAt = noctalia.nowMs() + interval
     end
 
     local function handleDecoded(decoded, errorMessage)
-        if decoded == nil then
-            state.lastError = tostring(errorMessage or "invalid JSON")
-            noctalia.log("niri-xmb snapshot JSON failed: " .. state.lastError)
-            render()
+        local frame, reason = snapshotFromPoll(decoded)
+        if frame == nil then
+            logOnce("poll-json", "niri-xmb snapshot JSON failed: " .. tostring(errorMessage or reason or "invalid JSON"))
             return
         end
-        applySnapshot(decoded, force)
+        queueFrame(frame)
+    end
+
+    local requestedAt = now
+    state.pollSeq = state.pollSeq + 1
+    local sequence = state.pollSeq
+
+    local function acceptPoll()
+        if sequence < state.lastPollResultSeq then
+            return false
+        end
+        state.lastPollResultSeq = sequence
+        if state.streamMode == "healthy" and requestedAt < (state.streamLastFrameAt or 0) then
+            -- A stream frame arrived while this read was outstanding.
+            return false
+        end
+        return true
     end
 
     local function pollByProcess()
         beginPoll()
         local started = noctalia.runAsync(command({ "snapshot" }), function(result)
             endPoll()
+            if not acceptPoll() then
+                return
+            end
             if result.exitCode ~= 0 then
-                local message = tostring(result.stderr or result.stdout or "snapshot failed")
-                if state.lastError ~= message then
-                    state.lastError = message
-                    noctalia.log("niri-xmb snapshot failed: " .. message)
-                end
-                render()
+                logOnce(
+                    "poll-process",
+                    "niri-xmb snapshot failed: " .. tostring(result.stderr or result.stdout or "snapshot failed")
+                )
                 return
             end
             local decoded, errorMessage = noctalia.json.decode(result.stdout or "")
@@ -869,7 +1592,11 @@ poll = function(force)
             endPoll()
             if err ~= nil or contents == nil then
                 state.mirrorPath = nil
+                state.nextMirrorLearnAt = noctalia.nowMs() + 10000
                 pollByProcess()
+                return
+            end
+            if not acceptPoll() then
                 return
             end
             local decoded, errorMessage = noctalia.json.decode(contents)
@@ -884,6 +1611,95 @@ poll = function(force)
     pollByProcess()
 end
 
+local function desiredTickInterval()
+    local mode = state.streamMode
+    if mode == "healthy" or mode == "connecting" or mode == "awaiting" then
+        return STREAM_TICK_MS
+    end
+    return pollInterval()
+end
+
+local function applyTickInterval()
+    local desired = desiredTickInterval()
+    if state.tickIntervalMs == desired then
+        return
+    end
+    state.tickIntervalMs = desired
+    noctalia.setUpdateInterval(desired)
+end
+
+local function manageStream(now)
+    local mode = state.streamMode
+    if mode == "connecting" then
+        if state.streamFrameDeadline ~= nil and now >= state.streamFrameDeadline then
+            state.streamMode = "retrying"
+            state.streamFrameDeadline = nil
+            state.streamNextAttemptAt = now + streamRetryDelay()
+            logOnce("stream-silent", "niri-xmb: stream produced no frames; retrying with backoff")
+        end
+    elseif mode == "awaiting" then
+        if state.streamFrameDeadline ~= nil and now >= state.streamFrameDeadline then
+            state.streamMode = "stalled"
+            state.streamFrameDeadline = nil
+            logOnce("stream-no-snapshot", "niri-xmb: stream connected without a snapshot; polling fallback active")
+        end
+    elseif mode == "retrying" then
+        if state.streamNextAttemptAt == nil or now >= state.streamNextAttemptAt then
+            startStream()
+        end
+    end
+end
+
+-- A runStream line above Noctalia's 64 KiB cap is dropped silently, and the
+-- stream process has no exit callback. A cheap mirror read recovers both
+-- cases without restoring per-tick process polling.
+local function maybeResyncStream(now)
+    if state.streamMode ~= "healthy" then
+        state.streamResyncAt = nil
+        return
+    end
+    if state.streamResyncAt == nil then
+        state.streamResyncAt = now + STREAM_RESYNC_MS
+        return
+    end
+    if now < state.streamResyncAt then
+        return
+    end
+    state.streamResyncAt = now + STREAM_RESYNC_MS
+    if state.mirrorPath ~= nil then
+        poll(true)
+    end
+end
+
+local function dispatchCycle(kind, delta)
+    -- Register the expectation before the process starts, against the state
+    -- the daemon will also see. A failure callback invalidates the queued
+    -- target even if a newer burst has already moved the token.
+    beginCycleIntent(kind, delta)
+    local arguments
+    if kind == "workspace" then
+        arguments = { "cycle-workspace", "--output", targetOutput(), "--delta", idString(delta) }
+    else
+        arguments = { "cycle-window", "--output", targetOutput(), "--delta", idString(delta) }
+    end
+    local started = runAction(arguments, function(result)
+        if actionFailed(result) then
+            state.pendingCycle[kind] = nil
+            logOnce(
+                "cycle-failure:" .. kind,
+                "niri-xmb " .. kind .. " cycle failed: "
+                    .. trim(tostring(result and (result.stdout or result.stderr) or ""))
+            )
+            poll(true)
+        end
+    end)
+    if not started then
+        state.pendingCycle[kind] = nil
+        logOnce("cycle-dispatch:" .. kind, "niri-xmb " .. kind .. " cycle dispatch was rejected")
+        poll(true)
+    end
+end
+
 local function flushScroll()
     if state.scrollFlushAt == nil or noctalia.nowMs() < state.scrollFlushAt then
         return
@@ -894,22 +1710,41 @@ local function flushScroll()
     state.pendingScroll.vertical = 0
     state.pendingScroll.horizontal = 0
     if vertical ~= 0 then
-        runAction({ "cycle-workspace", "--output", targetOutput(), "--delta", idString(vertical) })
+        dispatchCycle("workspace", vertical)
     end
     if horizontal ~= 0 then
-        runAction({ "cycle-window", "--output", targetOutput(), "--delta", idString(horizontal) })
+        dispatchCycle("window", horizontal)
     end
 end
 
 function update()
+    local now = noctalia.nowMs()
     flushScroll()
+    applyTickInterval()
+    manageStream(now)
+    expireIntents(now)
+    poll(false)
+    maybeResyncStream(now)
+    applyPendingFrame()
+
+    -- State frames, icon resolution, and presentation expiry share one render
+    -- per tick. Pointer and keyboard callbacks still render immediately.
+    if state.iconRenderPending then
+        state.iconRenderPending = false
+        state.renderPending = false
+        render()
+        return
+    end
+    if state.renderPending then
+        state.renderPending = false
+        render()
+        return
+    end
+    resolveNextQueuedIcon()
     if state.iconRenderPending then
         state.iconRenderPending = false
         render()
-    else
-        resolveNextQueuedIcon()
     end
-    poll(false)
 end
 
 function onScroll(axis, steps, startsGesture)
@@ -943,12 +1778,32 @@ function onConfigChanged()
     state.iconQueued = {}
     state.iconQueueHead = 1
     state.iconRenderPending = false
-    state.lastGeneration = -1
-    state.lastContentRevision = -1
-    noctalia.setUpdateInterval(config("poll_interval_ms", 250))
+    state.lastFrame = nil
+    state.pendingFrame = nil
+    state.pendingFocus = nil
+    state.pendingCycle.workspace = nil
+    state.pendingCycle.window = nil
+    state.nextPollAt = nil
+
+    -- The stream command captured the old backend. There is no stop handle in
+    -- this API level, so detach the old callback and let the bounded launch
+    -- path establish a new subscription.
+    if state.streamBackend ~= nil and state.streamBackend ~= backend() then
+        state.streamGeneration = state.streamGeneration + 1
+        state.streamMode = "idle"
+        state.streamInstance = nil
+        state.streamLaunches = 0
+        state.streamNextAttemptAt = nil
+        startStream()
+    end
+
+    applyTickInterval()
+    render()
     poll(true)
 end
 
-noctalia.setUpdateInterval(config("poll_interval_ms", 250))
+applyTickInterval()
 render()
 poll(true)
+startStream()
+applyTickInterval()
