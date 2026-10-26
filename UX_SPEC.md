@@ -142,6 +142,10 @@ High-resolution packets must accumulate across frames and preserve every complet
 step in a packet, including multiple steps from one burst. Vertical and
 horizontal axes must keep independent remainders. A packet that includes both
 deprecated discrete data and value120 data must produce one logical report.
+Touchpad and continuous sources accumulate 15 axis units per workspace step and
+emit at most one step per frame. A direction change or axis stop clears that
+partial accumulation. The high-resolution wheel remainder survives axis stop so
+a detent split across frames still completes exactly once.
 
 A configured middle-click command must replace native window close.
 An omitted or empty command must keep native window close.
