@@ -1375,8 +1375,9 @@ mod tests {
     fn shipped_themes_parse_and_merge() {
         let dank = include_str!("../../../themes/dank.toml");
         let noctalia = include_str!("../../../themes/noctalia.toml");
+        let material = include_str!("../../../themes/material-3-expressive.toml");
 
-        for theme_source in [dank, noctalia] {
+        for theme_source in [dank, noctalia, material] {
             let mut base = toml::Value::try_from(StyleConfig::default()).unwrap();
             let theme_value: toml::Value = toml::from_str(theme_source).unwrap();
             let theme_style = theme_value.get("style").expect("theme has [style] table");

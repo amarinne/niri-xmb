@@ -1,6 +1,6 @@
 # Merge a theme file's [style] table over the one below, key by key. A theme
 # must contain only [style]. Unknown style keys cause an error. See
-# themes/dank.toml and themes/noctalia.toml for examples.
+# themes/dank.toml, themes/noctalia.toml, and themes/material-3-expressive.toml for examples.
 # theme = "~/.config/niri-xmb/themes/dank.toml"
 
 bars_enabled = true # false runs only the popup/peek daemon

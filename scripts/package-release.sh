@@ -16,6 +16,7 @@ install -Dm644 config/niri-xmb.toml.example \
     "$stage/config/niri-xmb.toml.example"
 install -Dm644 themes/dank.toml "$stage/themes/dank.toml"
 install -Dm644 themes/noctalia.toml "$stage/themes/noctalia.toml"
+install -Dm644 themes/material-3-expressive.toml "$stage/themes/material-3-expressive.toml"
 install -Dm644 niri-xmb.service "$stage/niri-xmb.service"
 install -Dm644 LICENSE "$stage/LICENSE"
 

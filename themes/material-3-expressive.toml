@@ -1,0 +1,17 @@
+# Derived from the Material 3 "expressive" colour scheme: a dark purple-tinted
+# base with a saturated lavender primary accent. Only colours are set here;
+# layout and sizing are left to the built-in defaults.
+[style]
+background = "#f2141218"       # surface dim, dark purple-gray
+background_end = "#f20a090d"   # deepest surface
+surface = "#662b2930"          # container, distinct from background
+surface_hover = "#40d0bcff"    # primary at a light hover alpha
+border = "#5cd0bcff"           # primary at low alpha
+border_soft = "#2ad0bcff"      # primary fainter still
+accent = "#ffd0bcff"           # expressive primary (lavender)
+selection_border = "#90d0bcff" # primary at a stronger alpha
+text = "#ffe6e1e5"             # on-surface
+muted = "#ffb9b2ba"            # on-surface-variant
+urgent = "#ffffb4ab"           # error red
+shadow = "#4e000000"
+floating_backing = "#be0f0d12"  # near-black tinted toward the background
