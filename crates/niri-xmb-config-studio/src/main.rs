@@ -644,6 +644,7 @@ struct StudioApp {
     confirm: Option<Confirm>,
     sim_lt: f32,
     sim_rt: f32,
+    sim_last_left: bool,
     selected_point: Option<usize>,
     live: Arc<Mutex<LiveState>>,
     live_stop: Arc<AtomicBool>,
@@ -672,6 +673,7 @@ impl StudioApp {
             confirm: None,
             sim_lt: 0.0,
             sim_rt: 0.0,
+            sim_last_left: true,
             selected_point: None,
             live: Arc::new(Mutex::new(LiveState::default())),
             live_stop: Arc::new(AtomicBool::new(false)),
@@ -2084,6 +2086,21 @@ impl StudioApp {
             .size(10.0)
             .color(TEXT_DIM),
         );
+        let socd = get_path(&self.model, "gamepad.navi.pointer.trigger_socd")
+            .and_then(Value::as_str)
+            .unwrap_or("multiply");
+        ui.label(
+            RichText::new(format!(
+                "LT+RT: {}",
+                if socd == "last" {
+                    "last pressed wins"
+                } else {
+                    "multiply brake × gas"
+                }
+            ))
+            .size(10.0)
+            .color(TEXT_DIM),
+        );
         self.trigger_presets(ui);
         ui.add_space(6.0);
         let pointer_cap = get_path(&self.model, "gamepad.navi.pointer.accel.boost_cap")
@@ -2608,10 +2625,13 @@ impl StudioApp {
                 if ui.small_button("Reset").clicked() {
                     self.sim_lt = 0.0;
                     self.sim_rt = 0.0;
+                    self.sim_last_left = true;
                 }
             });
         });
         ui.add_space(4.0);
+        let before_lt = self.sim_lt;
+        let before_rt = self.sim_rt;
         ui.columns(2, |cols| {
             pedal_control(
                 &mut cols[0],
@@ -2628,16 +2648,41 @@ impl StudioApp {
                 deadzone,
             );
         });
-        ui.add_space(4.0);
+        if (self.sim_lt - before_lt).abs() > 1e-6 {
+            self.sim_last_left = true;
+        }
+        if (self.sim_rt - before_rt).abs() > 1e-6 {
+            self.sim_last_left = false;
+        }
+        let socd = get_path(&self.model, "gamepad.navi.pointer.trigger_socd")
+            .and_then(Value::as_str)
+            .unwrap_or("multiply");
+        let lt_active = self.sim_lt > deadzone;
+        let rt_active = self.sim_rt > deadzone;
+        let (effective_lt, effective_rt) = if socd == "last" {
+            let selected_left = match (lt_active, rt_active) {
+                (true, true) => self.sim_last_left,
+                (true, false) => true,
+                (false, true) => false,
+                (false, false) => true,
+            };
+            if selected_left {
+                (self.sim_lt, 0.0)
+            } else {
+                (0.0, self.sim_rt)
+            }
+        } else {
+            (self.sim_lt, self.sim_rt)
+        };
         let points = self.trigger_points();
-        let lt_shape = trigger_shape(self.sim_lt, deadzone, curve, &points);
-        let rt_shape = trigger_shape(self.sim_rt, deadzone, curve, &points);
+        let lt_shape = trigger_shape(effective_lt, deadzone, curve, &points);
+        let rt_shape = trigger_shape(effective_rt, deadzone, curve, &points);
         let pointer_multiplier = if pointer_enabled {
             trigger_multiplier(
                 pointer_floor,
                 pointer_cap,
-                self.sim_lt,
-                self.sim_rt,
+                effective_lt,
+                effective_rt,
                 deadzone,
                 curve,
                 &points,
@@ -2649,8 +2694,8 @@ impl StudioApp {
             trigger_multiplier(
                 scroll_floor,
                 scroll_cap,
-                self.sim_lt,
-                self.sim_rt,
+                effective_lt,
+                effective_rt,
                 deadzone,
                 curve,
                 &points,
@@ -2659,9 +2704,11 @@ impl StudioApp {
             1.0
         };
         ui.label(
-            RichText::new("Target speed vs baseline (no smoothing)")
-                .size(9.5)
-                .color(TEXT_DIM),
+            RichText::new(format!(
+                "Target speed vs baseline (no smoothing · LT+RT {socd})"
+            ))
+            .size(9.5)
+            .color(TEXT_DIM),
         );
         multiplier_row(ui, "Pointer", pointer_multiplier, pointer_enabled);
         multiplier_row(ui, "Scroll", scroll_multiplier, scroll_enabled);
@@ -2725,6 +2772,12 @@ impl StudioApp {
                     5.0,
                     0.05,
                 );
+                self.combo_field(
+                    &mut cols[0],
+                    &format!("{pointer}.trigger_socd"),
+                    "LT+RT",
+                    &["multiply", "last"],
+                );
                 self.f32_field(
                     &mut cols[0],
                     &format!("{pointer}.trigger_threshold"),
@@ -2754,6 +2807,12 @@ impl StudioApp {
                 0.05,
                 5.0,
                 0.05,
+            );
+            self.combo_field(
+                ui,
+                &format!("{pointer}.trigger_socd"),
+                "LT+RT",
+                &["multiply", "last"],
             );
             self.f32_field(
                 ui,

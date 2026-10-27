@@ -1233,6 +1233,16 @@ pub struct GamepadTriggerPoint {
     pub output: f32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TriggerSocd {
+    /// LT and RT multiply, preserving the original behavior.
+    #[default]
+    Multiply,
+    /// The most recently pressed trigger wins while both are held.
+    Last,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GamepadPointerConfig {
@@ -1259,6 +1269,8 @@ pub struct GamepadPointerConfig {
     /// Optional bounded piecewise-linear response points. Empty uses
     /// `trigger_curve` exactly as before.
     pub trigger_points: Vec<GamepadTriggerPoint>,
+    /// Simultaneous LT/RT resolution: `multiply` or `last`.
+    pub trigger_socd: TriggerSocd,
     pub accel: GamepadPointerAccelConfig,
     pub scroll_accel: GamepadPointerAccelConfig,
 }
@@ -1280,6 +1292,7 @@ impl Default for GamepadPointerConfig {
             trigger_deadzone: 0.08,
             trigger_curve: 1.35,
             trigger_points: Vec::new(),
+            trigger_socd: TriggerSocd::Multiply,
             accel: GamepadPointerAccelConfig::default(),
             scroll_accel: GamepadPointerAccelConfig {
                 decel_floor: 0.35,
@@ -2332,6 +2345,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("deadzone"), "{error:#}");
+    }
+
+    #[test]
+    fn gamepad_trigger_socd_parses() {
+        let config = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            preset = "auto"
+            [gamepad.navi.pointer]
+            trigger_socd = "last"
+            "#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.gamepad.navi.pointer.trigger_socd, TriggerSocd::Last);
+        assert_eq!(
+            GamepadPointerConfig::default().trigger_socd,
+            TriggerSocd::Multiply
+        );
     }
 
     #[test]

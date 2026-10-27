@@ -10,7 +10,7 @@
 use crate::config::{
     GamepadAction, GamepadConfig, GamepadMode, GamepadNaviConfig, GamepadPointerAccelConfig,
     GamepadPointerStick, GamepadPreset, GamepadTriggerPoint, NaviAction, PointerButton,
-    gamepad_axis_code, gamepad_button_code, parse_navi_action,
+    TriggerSocd, gamepad_axis_code, gamepad_button_code, parse_navi_action,
 };
 use crate::wayland::WakeHandle;
 use anyhow::{Context, Result};
@@ -61,6 +61,12 @@ pub enum GamepadEvent {
     ModeChanged(GamepadMode),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerSide {
+    Left,
+    Right,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AccelRuntime {
     enabled: bool,
@@ -95,6 +101,7 @@ struct PointerRuntime {
     trigger_deadzone: f32,
     trigger_curve: f32,
     trigger_points: Vec<GamepadTriggerPoint>,
+    trigger_socd: TriggerSocd,
     accel: AccelRuntime,
     scroll_accel: AccelRuntime,
 }
@@ -140,6 +147,7 @@ impl NaviRuntime {
                 trigger_deadzone: pointer.trigger_deadzone,
                 trigger_curve: pointer.trigger_curve,
                 trigger_points: pointer.trigger_points.clone(),
+                trigger_socd: pointer.trigger_socd,
                 accel: AccelRuntime::from_config(&pointer.accel),
                 scroll_accel: AccelRuntime::from_config(&pointer.scroll_accel),
             },
@@ -776,6 +784,7 @@ struct NaviTracker {
     hat_y: i32,
     hat_active: [bool; 4],
     key_down: [bool; 4],
+    last_trigger: Option<TriggerSide>,
     last_tick: Instant,
     scroll_remainder: f32,
     pointer_accel: TriggerAccel,
@@ -800,6 +809,7 @@ impl NaviTracker {
             hat_y: 0,
             hat_active: [false; 4],
             key_down: [false; 4],
+            last_trigger: None,
             last_tick: Instant::now(),
             scroll_remainder: 0.0,
             pointer_accel,
@@ -819,6 +829,7 @@ impl NaviTracker {
         self.scroll_remainder = 0.0;
         self.pointer_accel.reset();
         self.scroll_accel.reset();
+        self.last_trigger = None;
     }
 
     fn update(&mut self, event: &InputEvent) -> Vec<GamepadEvent> {
@@ -880,7 +891,17 @@ impl NaviTracker {
             self.hat_event(HatAxis::Y, value, events);
         } else if code == AbsoluteAxisCode::ABS_Z.0 || code == AbsoluteAxisCode::ABS_RZ.0 {
             let (min, max) = self.ranges.get(&code).copied().unwrap_or((0, 255));
-            self.axes.insert(code, normalize_unsigned(value, min, max));
+            let normalized = normalize_unsigned(value, min, max);
+            let deadzone = self.navi.pointer.trigger_deadzone;
+            let previous = self.axes.get(&code).copied().unwrap_or(0.0);
+            if normalized > deadzone && previous <= deadzone {
+                self.last_trigger = Some(if code == AbsoluteAxisCode::ABS_Z.0 {
+                    TriggerSide::Left
+                } else {
+                    TriggerSide::Right
+                });
+            }
+            self.axes.insert(code, normalized);
         } else if code == AbsoluteAxisCode::ABS_X.0
             || code == AbsoluteAxisCode::ABS_Y.0
             || code == AbsoluteAxisCode::ABS_RX.0
@@ -994,6 +1015,44 @@ impl NaviTracker {
         })
     }
 
+    fn socd_inputs(&mut self, lt: f32, rt: f32) -> (f32, f32) {
+        if self.navi.pointer.trigger_socd == TriggerSocd::Multiply {
+            return (lt, rt);
+        }
+        let deadzone = self.navi.pointer.trigger_deadzone;
+        let lt_active = lt > deadzone;
+        let rt_active = rt > deadzone;
+        let selected = match (lt_active, rt_active) {
+            (false, false) => None,
+            (true, false) => Some(TriggerSide::Left),
+            (false, true) => Some(TriggerSide::Right),
+            (true, true) => self
+                .last_trigger
+                .filter(|side| match side {
+                    TriggerSide::Left => lt_active,
+                    TriggerSide::Right => rt_active,
+                })
+                .or(Some(if lt >= rt {
+                    TriggerSide::Left
+                } else {
+                    TriggerSide::Right
+                })),
+        };
+        self.last_trigger = selected;
+        (
+            if selected == Some(TriggerSide::Left) {
+                lt
+            } else {
+                0.0
+            },
+            if selected == Some(TriggerSide::Right) {
+                rt
+            } else {
+                0.0
+            },
+        )
+    }
+
     fn tick(&mut self) -> Vec<GamepadEvent> {
         let now = Instant::now();
         let dt = now
@@ -1021,6 +1080,7 @@ impl NaviTracker {
             .unwrap_or(0.0);
         let trigger_deadzone = self.navi.pointer.trigger_deadzone;
         let trigger_curve = self.navi.pointer.trigger_curve;
+        let (lt, rt) = self.socd_inputs(lt, rt);
         let pointer_multiplier =
             self.pointer_accel
                 .step(lt, rt, trigger_deadzone, trigger_curve, dt);
@@ -1627,6 +1687,15 @@ mod tests {
         )
     }
 
+    fn navi_tracker_with_socd(trigger_socd: TriggerSocd) -> NaviTracker {
+        let mut config = GamepadConfig::default();
+        config.navi.pointer.trigger_socd = trigger_socd;
+        NaviTracker::new(
+            Arc::new(NaviRuntime::from_config(&config).unwrap()),
+            HashMap::new(),
+        )
+    }
+
     fn abs(axis: AbsoluteAxisCode, value: i32) -> InputEvent {
         InputEvent::new(EventType::ABSOLUTE.0, axis.0, value)
     }
@@ -2094,6 +2163,23 @@ mod tests {
         assert!((accel.step(0.0, 1.0, 0.08, 1.0, 0.008) - 2.50).abs() < 1e-5);
         assert!((accel.step(1.0, 1.0, 0.08, 1.0, 0.008) - 0.75).abs() < 1e-5);
         assert!((accel.step(0.08, 0.0, 0.08, 1.0, 0.008) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn trigger_socd_last_and_multiply() {
+        let mut multiply = navi_tracker_with_socd(TriggerSocd::Multiply);
+        assert_eq!(multiply.socd_inputs(0.8, 0.6), (0.8, 0.6));
+
+        let mut last = navi_tracker_with_socd(TriggerSocd::Last);
+        last.update(&abs(AbsoluteAxisCode::ABS_Z, 255));
+        assert_eq!(last.socd_inputs(1.0, 0.7), (1.0, 0.0));
+
+        last.update(&abs(AbsoluteAxisCode::ABS_RZ, 255));
+        assert_eq!(last.socd_inputs(1.0, 1.0), (0.0, 1.0));
+
+        last.update(&abs(AbsoluteAxisCode::ABS_RZ, 0));
+        assert_eq!(last.socd_inputs(1.0, 0.0), (1.0, 0.0));
+        assert_eq!(last.socd_inputs(0.0, 0.0), (0.0, 0.0));
     }
 
     #[test]

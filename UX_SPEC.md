@@ -133,7 +133,9 @@ speed. LT is a precision/deceleration control and RT is a boost. Trigger depth i
 deadzoned and shaped, then combined multiplicatively with separate deceleration
 floors, boost caps, and smoothing for pointer and scroll. The shape is either
 the legacy power curve or an optional ordered list of up to five piecewise-linear
-`trigger_points`; empty points preserve the legacy behavior. The speed multiplier
+`trigger_points`; empty points preserve the legacy behavior. `trigger_socd`
+controls simultaneous LT/RT: `multiply` applies both endpoint factors, while
+`last` gives the most recently pressed trigger exclusive control. The speed multiplier
 is smoothed, not the stick position, so trigger ADC noise does not step the
 pointer. Both triggers also participate in the monitor layer's hold_axes; layer
 actions take precedence when the D-pad is used.
