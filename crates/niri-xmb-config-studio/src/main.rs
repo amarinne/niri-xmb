@@ -79,6 +79,58 @@ const ACTIONS: &[&str] = &[
     "niri.move-window-monitor-next",
     "niri.toggle-overview",
     "niri.close-window",
+    "key.esc",
+    "key.enter",
+    "key.space",
+    "key.tab",
+    "key.leftctrl",
+    "key.leftshift",
+    "key.leftalt",
+    "key.leftmeta",
+    "key.backspace",
+    "key.delete",
+    "key.up",
+    "key.down",
+    "key.left",
+    "key.right",
+    "key.f1",
+    "key.f2",
+    "key.f3",
+    "key.f4",
+    "key.f5",
+    "key.f6",
+    "key.f7",
+    "key.f8",
+    "key.f9",
+    "key.f10",
+    "key.f11",
+    "key.f12",
+    "key.a",
+    "key.b",
+    "key.c",
+    "key.d",
+    "key.e",
+    "key.f",
+    "key.g",
+    "key.h",
+    "key.i",
+    "key.j",
+    "key.k",
+    "key.l",
+    "key.m",
+    "key.n",
+    "key.o",
+    "key.p",
+    "key.q",
+    "key.r",
+    "key.s",
+    "key.t",
+    "key.u",
+    "key.v",
+    "key.w",
+    "key.x",
+    "key.y",
+    "key.z",
 ];
 const XMB_ACTIONS: &[&str] = &[
     "up", "down", "left", "right", "tab", "back", "confirm", "close", "open",
@@ -2098,16 +2150,7 @@ impl StudioApp {
     fn controller_section(&mut self, ui: &mut Ui) {
         self.section_header(ui);
         self.controller_unified_card(ui);
-        if ui.available_width() >= 900.0 {
-            ui.columns(2, |cols| {
-                section_card(&mut cols[0], "Device", |ui| self.device_fields(ui));
-                section_card(&mut cols[1], "Pointer", |ui| self.pointer_fields(ui));
-            });
-        } else {
-            section_card(ui, "Device", |ui| self.device_fields(ui));
-            section_card(ui, "Pointer", |ui| self.pointer_fields(ui));
-        }
-        section_card(ui, "Layers", |ui| self.layers_ui(ui));
+        section_card(ui, "Device", |ui| self.device_fields(ui));
     }
 
     /// Keep live diagnostics in their own disclosure card so the mapping
@@ -2395,12 +2438,34 @@ impl StudioApp {
             if let (Some(from), Some(to)) = (hotspot, row) {
                 paint_binding_link(ui, from, to);
             }
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
+            mini_heading(ui, "Pointer from analog sticks");
+            self.pointer_fields(ui);
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+            mini_heading(ui, "Hold layers and chords");
+            ui.label(
+                RichText::new("Hold one or more buttons, then bind another button to an action such as key.enter or niri.focus-workspace-next.")
+                    .size(10.5)
+                    .color(TEXT_MUTED),
+            );
+            ui.add_space(4.0);
+            self.layers_ui(ui);
         } else {
             self.controller_map_body(ui, live);
             ui.separator();
             self.inspector_body(ui);
             ui.separator();
             self.merged_bindings(ui);
+            ui.separator();
+            mini_heading(ui, "Pointer from analog sticks");
+            self.pointer_fields(ui);
+            ui.separator();
+            mini_heading(ui, "Hold layers and chords");
+            self.layers_ui(ui);
         }
     }
 
@@ -5536,19 +5601,38 @@ impl StudioApp {
         {
             layers.remove(&name);
         }
-        if tt(ui.button("Add layer"), "ui.action.add_layer").clicked() {
-            let mut name = "layer".to_string();
-            let mut suffix = 1;
-            while self.model["gamepad"]["navi"]["layers"]
-                .as_object()
-                .is_some_and(|layers| layers.contains_key(&name))
-            {
-                name = format!("layer{suffix}");
-                suffix += 1;
+        ui.horizontal(|ui| {
+            if tt(ui.button("Add layer"), "ui.action.add_layer").clicked() {
+                let mut name = "layer".to_string();
+                let mut suffix = 1;
+                while self.model["gamepad"]["navi"]["layers"]
+                    .as_object()
+                    .is_some_and(|layers| layers.contains_key(&name))
+                {
+                    name = format!("layer{suffix}");
+                    suffix += 1;
+                }
+                let layers = ensure_object_path(&mut self.model, "gamepad.navi.layers");
+                layers.insert(name, validation::default_layer());
             }
-            let layers = ensure_object_path(&mut self.model, "gamepad.navi.layers");
-            layers.insert(name, validation::default_layer());
-        }
+            if ui
+                .button("Add chord (Start + …)")
+                .on_hover_text("Create a valid layer holding Start, then bind another button")
+                .clicked()
+            {
+                let mut name = "chord".to_string();
+                let mut suffix = 1;
+                while self.model["gamepad"]["navi"]["layers"]
+                    .as_object()
+                    .is_some_and(|layers| layers.contains_key(&name))
+                {
+                    name = format!("chord{suffix}");
+                    suffix += 1;
+                }
+                let layers = ensure_object_path(&mut self.model, "gamepad.navi.layers");
+                layers.insert(name, validation::default_chord_layer());
+            }
+        });
     }
 
     fn placements_ui(&mut self, ui: &mut Ui) {

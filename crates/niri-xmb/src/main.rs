@@ -28,7 +28,7 @@ use crossbeam_channel::unbounded;
 use drop_plan::{DropPoint, DropPolicy, DropRequest, DropTarget, plan_drop};
 use drop_transaction::DropTransactionState;
 use focus::{FOCUS_SETTLE, FocusVerdict, FocusWatcher};
-use gamepad::{GamepadEvent, GamepadStatus};
+use gamepad::{GamepadEvent, GamepadStatus, KeyboardEmitter};
 use ipc::{ControlCommand, ControlRequest};
 use model::Snapshot;
 use niri::{NiriCommand, NiriHealth, NiriRequest, spawn as spawn_niri};
@@ -907,6 +907,13 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
         wake.handle(),
         Some(Arc::clone(&subscriptions)),
     );
+    let mut keyboard_emitter = match KeyboardEmitter::new(&config.gamepad) {
+        Ok(emitter) => emitter,
+        Err(error) => {
+            tracing::warn!(%error, "gamepad keyboard bindings unavailable");
+            None
+        }
+    };
     if gamepad.is_none() {
         // No readers will ever notify; subscribers still deserve one
         // (disabled/empty) gamepad frame instead of silence.
@@ -1364,6 +1371,9 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                             &mut surfaces,
                             &mut gamepad_pointer_buttons,
                         );
+                        if let Some(emitter) = keyboard_emitter.as_mut() {
+                            let _ = emitter.release_all();
+                        }
                     }
                     mode = next;
                     dirty = true;
@@ -1381,6 +1391,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                     &mut selection,
                     &mut peek_suppressed_until,
                     &mut gamepad_pointer_buttons,
+                    &mut keyboard_emitter,
                 )?;
             }
         }
@@ -2009,6 +2020,7 @@ fn handle_gamepad_event(
     selection: &mut Selection,
     suppress_peek: &mut Instant,
     pointer_buttons: &mut HashSet<u16>,
+    keyboard_emitter: &mut Option<KeyboardEmitter>,
 ) -> Result<bool> {
     match event {
         GamepadEvent::ModeChanged(_) => Ok(false),
@@ -2065,6 +2077,7 @@ fn handle_gamepad_event(
                     Ok(false)
                 }
                 NaviAction::Pointer(_) => Ok(false),
+                NaviAction::Key(_) => Ok(false),
             }
         }
         GamepadEvent::PointerMotion { dx, dy } => {
@@ -2094,6 +2107,14 @@ fn handle_gamepad_event(
         GamepadEvent::PointerScroll { steps } => {
             if mode == GamepadMode::Navi && panel.mode() != PopupMode::Manual {
                 surfaces.pointer_scroll(f64::from(steps));
+            }
+            Ok(false)
+        }
+        GamepadEvent::Keyboard { code, pressed } => {
+            if mode == GamepadMode::Navi
+                && let Some(emitter) = keyboard_emitter.as_mut()
+            {
+                emitter.emit(code, pressed)?;
             }
             Ok(false)
         }

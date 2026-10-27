@@ -216,6 +216,9 @@ BTN_EAST = "pointer.right"          # B / Circle
 BTN_WEST = "pointer.middle"         # X / Square
 BTN_NORTH = "xmb.open"              # Y / Triangle
 BTN_START = "niri.toggle-overview"
+# Keyboard output uses Linux evdev names through the daemon's virtual keyboard.
+# Examples: key.esc, key.leftctrl, key.enter, key.space, key.a, key.f12.
+# BTN_BACK = "key.esc"
 
 # Hold layers. D-pad actions call Niri directly, so they are immediate.
 [gamepad.navi.layers.workspace]
@@ -225,6 +228,14 @@ BTN_DPAD_LEFT = "niri.focus-workspace-prev"
 BTN_DPAD_RIGHT = "niri.focus-workspace-next"
 BTN_DPAD_UP = "niri.focus-window-prev"
 BTN_DPAD_DOWN = "niri.focus-window-next"
+
+# Button chords are hold layers: hold Start, then press another button.
+# [gamepad.navi.layers.start_workspace]
+# hold = ["BTN_START"]
+# [gamepad.navi.layers.start_workspace.bindings]
+# BTN_DPAD_UP = "niri.focus-workspace-next"
+# BTN_DPAD_RIGHT = "niri.move-column-right"
+# BTN_TR = "niri.focus-monitor-next"
 
 [gamepad.navi.layers.window]
 hold = ["BTN_TR"]

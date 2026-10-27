@@ -15,7 +15,8 @@ use crate::config::{
 use crate::wayland::WakeHandle;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
-use evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, KeyCode};
+use evdev::uinput::VirtualDevice;
+use evdev::{AbsoluteAxisCode, AttributeSet, Device, EventType, InputEvent, KeyCode};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -60,6 +61,10 @@ pub enum GamepadEvent {
     },
     PointerScroll {
         steps: f32,
+    },
+    Keyboard {
+        code: u16,
+        pressed: bool,
     },
     ModeChanged(GamepadMode),
 }
@@ -527,6 +532,81 @@ pub struct GamepadDeviceLive {
     /// Absolute axis code to a normalized value: -1..1 for sticks and hats,
     /// 0..1 for triggers.
     pub axes: BTreeMap<u16, f32>,
+}
+
+/// Optional virtual keyboard used by `key.*` navi bindings.
+///
+/// The device is created only when the loaded config contains keyboard
+/// actions. Missing `/dev/uinput` access disables those actions gracefully;
+/// controller discovery and pointer navigation continue to work.
+pub struct KeyboardEmitter {
+    device: VirtualDevice,
+    held: HashSet<u16>,
+}
+
+impl KeyboardEmitter {
+    pub fn new(config: &GamepadConfig) -> Result<Option<Self>> {
+        let mut codes = BTreeSet::new();
+        for action in config.navi.bindings.values().chain(
+            config
+                .navi
+                .layers
+                .values()
+                .flat_map(|layer| layer.bindings.values()),
+        ) {
+            if let NaviAction::Key(code) = parse_navi_action(action)? {
+                codes.insert(code);
+            }
+        }
+        if codes.is_empty() {
+            return Ok(None);
+        }
+        let mut keys = AttributeSet::<KeyCode>::new();
+        for code in codes {
+            keys.insert(KeyCode(code));
+        }
+        let device = VirtualDevice::builder()
+            .context("open /dev/uinput for gamepad keyboard bindings")?
+            .name("niri-xmb gamepad keyboard")
+            .with_keys(&keys)
+            .context("configure niri-xmb gamepad keyboard keys")?
+            .build()
+            .context("create niri-xmb gamepad keyboard")?;
+        Ok(Some(Self {
+            device,
+            held: HashSet::new(),
+        }))
+    }
+
+    pub fn emit(&mut self, code: u16, pressed: bool) -> Result<()> {
+        if pressed {
+            if !self.held.insert(code) {
+                return Ok(());
+            }
+        } else if !self.held.remove(&code) {
+            return Ok(());
+        }
+        let value = i32::from(pressed);
+        self.device
+            .emit(&[
+                InputEvent::new(EventType::KEY.0, code, value),
+                InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0),
+            ])
+            .context("emit gamepad keyboard event")
+    }
+
+    pub fn release_all(&mut self) -> Result<()> {
+        let held = std::mem::take(&mut self.held);
+        for code in held {
+            self.device
+                .emit(&[
+                    InputEvent::new(EventType::KEY.0, code, 0),
+                    InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0),
+                ])
+                .context("release gamepad keyboard key")?;
+        }
+        Ok(())
+    }
 }
 
 struct ActiveReader {
@@ -1259,6 +1339,7 @@ struct NaviTracker {
     ranges: HashMap<u16, (i32, i32)>,
     pressed: HashSet<u16>,
     pointer_hold: HashMap<u16, PointerButton>,
+    keyboard_hold: HashMap<u16, u16>,
     axes: HashMap<u16, f32>,
     hat_x: i32,
     hat_y: i32,
@@ -1285,6 +1366,7 @@ impl NaviTracker {
             ranges,
             pressed: HashSet::new(),
             pointer_hold: HashMap::new(),
+            keyboard_hold: HashMap::new(),
             axes: HashMap::new(),
             hat_x: 0,
             hat_y: 0,
@@ -1299,7 +1381,15 @@ impl NaviTracker {
         }
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> Vec<GamepadEvent> {
+        let released = self
+            .keyboard_hold
+            .drain()
+            .map(|(_, code)| GamepadEvent::Keyboard {
+                code,
+                pressed: false,
+            })
+            .collect();
         self.pressed.clear();
         self.pointer_hold.clear();
         self.hat_x = 0;
@@ -1313,6 +1403,7 @@ impl NaviTracker {
         self.scroll_accel.reset();
         self.last_speed_side = None;
         self.first_speed_side = None;
+        released
     }
 
     fn update(&mut self, event: &InputEvent) -> Vec<GamepadEvent> {
@@ -1359,6 +1450,12 @@ impl NaviTracker {
                 if let Some(button) = self.pointer_hold.remove(&code) {
                     events.push(GamepadEvent::PointerButton {
                         button: button.code(),
+                        pressed: false,
+                    });
+                }
+                if let Some(key) = self.keyboard_hold.remove(&code) {
+                    events.push(GamepadEvent::Keyboard {
+                        code: key,
                         pressed: false,
                     });
                 }
@@ -1452,6 +1549,13 @@ impl NaviTracker {
                 }),
                 NaviAction::Niri(action) => Some(GamepadEvent::Navi(NaviAction::Niri(action))),
                 NaviAction::XmbOpen => Some(GamepadEvent::Navi(NaviAction::XmbOpen)),
+                NaviAction::Key(key_code) => {
+                    self.keyboard_hold.insert(code, key_code);
+                    Some(GamepadEvent::Keyboard {
+                        code: key_code,
+                        pressed: true,
+                    })
+                }
             }
         } else {
             self.pressed.remove(&code);
@@ -1460,6 +1564,14 @@ impl NaviTracker {
                 .map(|button| GamepadEvent::PointerButton {
                     button: button.code(),
                     pressed: false,
+                })
+                .or_else(|| {
+                    self.keyboard_hold
+                        .remove(&code)
+                        .map(|key| GamepadEvent::Keyboard {
+                            code: key,
+                            pressed: false,
+                        })
                 })
         }
     }
@@ -1479,6 +1591,13 @@ impl NaviTracker {
             }),
             NaviAction::Niri(action) => Some(GamepadEvent::Navi(NaviAction::Niri(action))),
             NaviAction::XmbOpen => Some(GamepadEvent::Navi(NaviAction::XmbOpen)),
+            NaviAction::Key(key) => {
+                self.keyboard_hold.insert(code, key);
+                Some(GamepadEvent::Keyboard {
+                    code: key,
+                    pressed: true,
+                })
+            }
         }
     }
 
@@ -2380,7 +2499,7 @@ fn reader_loop(
         let observed_mode = mode_from_u8(mode.load(Ordering::Relaxed));
         if observed_mode != last_mode {
             apply_mode_grab(&mut device, observed_mode, navi.grab_in_navi, &path);
-            navi_tracker.reset();
+            let _ = navi_tracker.reset();
             last_mode = observed_mode;
             if let Ok(mut live) = live.lock()
                 && let Some(state) = live.get_mut(&live_key)
@@ -2451,7 +2570,7 @@ fn reader_loop(
             {
                 let next = toggle_mode(&mode);
                 apply_mode_grab(&mut device, next, navi.grab_in_navi, &path);
-                navi_tracker.reset();
+                let _ = navi_tracker.reset();
                 last_mode = next;
                 if let Ok(mut live) = live.lock()
                     && let Some(state) = live.get_mut(&live_key)

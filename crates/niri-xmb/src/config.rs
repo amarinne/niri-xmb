@@ -1158,11 +1158,19 @@ pub enum NaviAction {
     Scroll(i8),
     Niri(NaviNiriAction),
     XmbOpen,
+    /// Emit a Linux input key through the daemon's virtual keyboard device.
+    Key(u16),
 }
 
 /// Parse a navi action string from the config.
 pub(crate) fn parse_navi_action(value: &str) -> Result<NaviAction> {
     let value = value.trim().to_ascii_lowercase();
+    if let Some(name) = value
+        .strip_prefix("key.")
+        .or_else(|| value.strip_prefix("keyboard."))
+    {
+        return Ok(NaviAction::Key(keyboard_key_code(name)?));
+    }
     let action = match value.as_str() {
         "pointer.left" => NaviAction::Pointer(PointerButton::Left),
         "pointer.right" => NaviAction::Pointer(PointerButton::Right),
@@ -1189,10 +1197,41 @@ pub(crate) fn parse_navi_action(value: &str) -> Result<NaviAction> {
         "niri.toggle-overview" => NaviAction::Niri(NaviNiriAction::ToggleOverview),
         "niri.close-window" => NaviAction::Niri(NaviNiriAction::CloseWindow),
         _ => anyhow::bail!(
-            "unknown gamepad navi action {value:?}; expected a pointer, xmb, or niri action"
+            "unknown gamepad navi action {value:?}; expected a pointer, keyboard, xmb, or niri action"
         ),
     };
     Ok(action)
+}
+
+/// Parse a compact keyboard action name such as `key.esc`, `key.enter`, or
+/// `key.leftctrl`. Full evdev names (`key.KEY_ESC`) are accepted as well.
+fn keyboard_key_code(name: &str) -> Result<u16> {
+    let name = name.trim().to_ascii_uppercase();
+    let alias = match name.as_str() {
+        "ESC" | "ESCAPE" => "ESC",
+        "RETURN" => "ENTER",
+        "CTRL" => "LEFTCTRL",
+        "SHIFT" => "LEFTSHIFT",
+        "ALT" => "LEFTALT",
+        "SUPER" | "META" | "WIN" => "LEFTMETA",
+        "DEL" => "DELETE",
+        "BACKSPACE" => "BACKSPACE",
+        "SPACE" => "SPACE",
+        "TAB" => "TAB",
+        "UP" => "UP",
+        "DOWN" => "DOWN",
+        "LEFT" => "LEFT",
+        "RIGHT" => "RIGHT",
+        _ => name.as_str(),
+    };
+    let code_name = if alias.starts_with("KEY_") {
+        alias.to_string()
+    } else {
+        format!("KEY_{alias}")
+    };
+    KeyCode::from_str(&code_name)
+        .map(|code| code.code())
+        .with_context(|| format!("unknown keyboard key {name:?}; use key.<name> or key.KEY_<name>"))
 }
 
 /// Parse an absolute axis name or 16-bit decimal/hex code.
@@ -2496,6 +2535,22 @@ mod tests {
         assert_eq!(
             config.gamepad.navi.bindings.get("BTN_SOUTH"),
             Some(&"pointer.left".to_string())
+        );
+    }
+
+    #[test]
+    fn gamepad_navi_keyboard_actions_parse() {
+        assert_eq!(
+            parse_navi_action("key.esc").unwrap(),
+            NaviAction::Key(KeyCode::KEY_ESC.0)
+        );
+        assert_eq!(
+            parse_navi_action("keyboard.enter").unwrap(),
+            NaviAction::Key(KeyCode::KEY_ENTER.0)
+        );
+        assert_eq!(
+            parse_navi_action("key.leftctrl").unwrap(),
+            NaviAction::Key(KeyCode::KEY_LEFTCTRL.0)
         );
     }
 

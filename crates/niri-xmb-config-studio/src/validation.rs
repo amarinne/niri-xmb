@@ -453,6 +453,11 @@ pub fn default_layer() -> Value {
     json!({"hold": [], "hold_axes": [{"axis": "ABS_Z", "threshold": 0.35}], "bindings": {}})
 }
 
+/// A button chord starts valid and is ready for a second-button binding.
+pub fn default_chord_layer() -> Value {
+    json!({"hold": ["BTN_START"], "hold_axes": [], "bindings": {}})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
