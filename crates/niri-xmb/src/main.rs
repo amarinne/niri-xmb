@@ -722,10 +722,17 @@ fn status_response(
         "mode": popup_mode_name(popup_mode),
         "gamepad": {
             "enabled": gamepad.is_some(),
-            "mode": gamepad.map(|status| gamepad_mode_name(status.mode)),
-            "preset": gamepad.map(|status| status.preset),
-            "open_combo": gamepad.is_some_and(|status| status.open_combo),
-            "devices": gamepad.map_or(0, |status| status.devices),
+            "mode": gamepad.as_ref().map(|status| gamepad_mode_name(status.mode)),
+            "preset": gamepad.as_ref().map(|status| status.preset),
+            "open_combo": gamepad.as_ref().is_some_and(|status| status.open_combo),
+            "devices": gamepad.as_ref().map_or(0, |status| status.devices),
+            "connected": gamepad.as_ref().map(|status| {
+                status.connected.iter().map(|device| serde_json::json!({
+                    "path": device.path,
+                    "name": device.name,
+                    "preset": device.preset,
+                })).collect::<Vec<_>>()
+            }).unwrap_or_default(),
         },
         "selection": selection.map(|visual| {
             serde_json::json!({
@@ -2825,6 +2832,11 @@ mod tests {
                 preset: crate::config::GamepadPreset::Auto,
                 open_combo: true,
                 devices: 1,
+                connected: vec![gamepad::GamepadDeviceStatus {
+                    path: "/dev/input/event10".into(),
+                    name: "Flydigi VADER4".into(),
+                    preset: crate::config::GamepadPreset::Xbox,
+                }],
             }),
             0,
         ))
@@ -2835,6 +2847,7 @@ mod tests {
         assert_eq!(value["gamepad"]["preset"], "auto");
         assert_eq!(value["gamepad"]["open_combo"], true);
         assert_eq!(value["gamepad"]["devices"], 1);
+        assert_eq!(value["gamepad"]["connected"][0]["name"], "Flydigi VADER4");
     }
 
     #[test]

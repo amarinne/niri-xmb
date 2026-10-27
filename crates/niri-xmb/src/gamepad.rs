@@ -19,8 +19,8 @@ use evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, KeyCode};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -187,21 +187,33 @@ pub struct GamepadService {
     preset: GamepadPreset,
     open_combo: bool,
     devices: Arc<AtomicUsize>,
+    connected: Arc<Mutex<Vec<GamepadDeviceStatus>>>,
     supervisor: Option<JoinHandle<()>>,
 }
 
+/// One controller currently owned by a reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GamepadDeviceStatus {
+    pub path: String,
+    pub name: String,
+    pub preset: GamepadPreset,
+}
+
 /// Read-only gamepad state exposed by the daemon status response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GamepadStatus {
     pub mode: GamepadMode,
     pub preset: GamepadPreset,
     pub open_combo: bool,
     pub devices: usize,
+    pub connected: Vec<GamepadDeviceStatus>,
 }
 
 struct ActiveReader {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
+    name: String,
+    preset: GamepadPreset,
 }
 
 impl GamepadService {
@@ -232,6 +244,7 @@ impl GamepadService {
         let stop = Arc::new(AtomicBool::new(false));
         let mode = Arc::new(AtomicU8::new(mode_to_u8(navi.default_mode)));
         let devices = Arc::new(AtomicUsize::new(0));
+        let connected = Arc::new(Mutex::new(Vec::new()));
         let preset = config.preset;
         let open_combo = !combo_codes.is_empty();
         let config = Arc::new(config.clone());
@@ -245,10 +258,21 @@ impl GamepadService {
             let navi = Arc::clone(&navi);
             let mode = Arc::clone(&mode);
             let devices = Arc::clone(&devices);
+            let connected = Arc::clone(&connected);
             thread::Builder::new()
                 .name("niri-xmb-gamepad-hotplug".into())
                 .spawn(move || {
-                    supervisor_loop(config, combo_codes, navi, mode, devices, tx, wake, stop)
+                    supervisor_loop(
+                        config,
+                        combo_codes,
+                        navi,
+                        mode,
+                        devices,
+                        connected,
+                        tx,
+                        wake,
+                        stop,
+                    )
                 })
         };
         match supervisor {
@@ -259,6 +283,7 @@ impl GamepadService {
                 preset,
                 open_combo,
                 devices,
+                connected,
                 supervisor: Some(handle),
             }),
             Err(error) => {
@@ -283,6 +308,11 @@ impl GamepadService {
             preset: self.preset,
             open_combo: self.open_combo,
             devices: self.devices.load(Ordering::Relaxed),
+            connected: self
+                .connected
+                .lock()
+                .map(|devices| devices.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -1189,6 +1219,7 @@ fn supervisor_loop(
     navi: Arc<NaviRuntime>,
     mode: Arc<AtomicU8>,
     devices: Arc<AtomicUsize>,
+    connected: Arc<Mutex<Vec<GamepadDeviceStatus>>>,
     tx: Sender<GamepadEvent>,
     wake: WakeHandle,
     stop: Arc<AtomicBool>,
@@ -1274,6 +1305,17 @@ fn supervisor_loop(
         }
 
         devices.store(active.len(), Ordering::Relaxed);
+        if let Ok(mut connected) = connected.lock() {
+            *connected = active
+                .iter()
+                .map(|(path, reader)| GamepadDeviceStatus {
+                    path: path.display().to_string(),
+                    name: reader.name.clone(),
+                    preset: reader.preset,
+                })
+                .collect();
+            connected.sort_by(|a, b| a.path.cmp(&b.path));
+        }
 
         if had_active
             && active.is_empty()
@@ -1298,6 +1340,9 @@ fn supervisor_loop(
         tracing::debug!(path = %path.display(), "gamepad reader stopped");
     }
     devices.store(0, Ordering::Relaxed);
+    if let Ok(mut connected) = connected.lock() {
+        connected.clear();
+    }
     tracing::info!("gamepad hotplug watcher stopped");
 }
 
@@ -1369,6 +1414,8 @@ fn start_reader(
     Ok(Some(ActiveReader {
         stop: reader_stop,
         handle,
+        name,
+        preset,
     }))
 }
 

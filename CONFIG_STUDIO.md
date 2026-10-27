@@ -35,7 +35,12 @@ entry appears as **niri-xmb Config**.
 - Preview tab: controller-adjacent XMB and bar previews drawn from the same
   model. This is a geometry/style preview, not a renderer pixel match.
 - Controller hotspots select a control; the inspector edits the active Navi
-  base, XMB, or layer binding.
+  base, XMB, or layer binding. A **Detected controller** card shows the daemon's
+  live mode, preset, and connected device names/paths. Both controller templates
+  use the same display box.
+- **Preview** uses the daemon's live status/snapshot, not a static mock. It draws
+  current workspaces/windows and selection; clicking a window sends the existing
+  `focus-window` command. The pane is toggleable and collapsed by default.
 - Trigger Lab contains the shared piecewise-linear response curve: add/drag/
   delete up to five points, edit exact pull/shape values, choose a preset or
   convert the legacy curve, and inspect the resulting LT/RT multiplier and

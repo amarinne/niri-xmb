@@ -19,6 +19,10 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 const DEFAULT_CONFIG: &str = "~/.config/niri-xmb/config.toml";
 const XBOX_IMAGE: &[u8] = include_bytes!("../../../assets/controller-render.png");
@@ -574,6 +578,55 @@ enum Confirm {
     Restart,
 }
 
+#[derive(Clone, Default)]
+struct LiveState {
+    status: Value,
+    snapshot: Value,
+    error: String,
+}
+
+fn spawn_live(
+    niri_xmb: PathBuf,
+    live: Arc<Mutex<LiveState>>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name("niri-xmb-studio-live".into())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let status = run_niri(&niri_xmb, &["status"])
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+                let snapshot = run_niri(&niri_xmb, &["snapshot"])
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+                if let Ok(mut state) = live.lock() {
+                    if let Some(status) = status {
+                        state.status = status;
+                        state.error.clear();
+                    }
+                    if let Some(snapshot) = snapshot {
+                        state.snapshot = snapshot;
+                    }
+                    if state.status.is_null() && state.snapshot.is_null() {
+                        state.error = "daemon status unavailable".to_string();
+                    }
+                }
+                thread::sleep(Duration::from_millis(750));
+            }
+        })
+        .expect("spawn live studio poller")
+}
+
+impl Drop for StudioApp {
+    fn drop(&mut self) {
+        self.live_stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.live_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 struct StudioApp {
     niri_xmb: PathBuf,
     config_path: String,
@@ -592,6 +645,9 @@ struct StudioApp {
     sim_lt: f32,
     sim_rt: f32,
     selected_point: Option<usize>,
+    live: Arc<Mutex<LiveState>>,
+    live_stop: Arc<AtomicBool>,
+    live_thread: Option<JoinHandle<()>>,
     xbox_texture: Option<TextureHandle>,
     ds4_texture: Option<TextureHandle>,
 }
@@ -600,7 +656,7 @@ impl StudioApp {
     fn new(cc: &eframe::CreationContext<'_>, config: PathBuf, niri_xmb: PathBuf) -> Self {
         configure(&cc.egui_ctx);
         let mut app = Self {
-            niri_xmb,
+            niri_xmb: niri_xmb.clone(),
             config_path: config.display().to_string(),
             model: Value::Null,
             loaded: Value::Null,
@@ -617,9 +673,17 @@ impl StudioApp {
             sim_lt: 0.0,
             sim_rt: 0.0,
             selected_point: None,
+            live: Arc::new(Mutex::new(LiveState::default())),
+            live_stop: Arc::new(AtomicBool::new(false)),
+            live_thread: None,
             xbox_texture: None,
             ds4_texture: None,
         };
+        app.live_thread = Some(spawn_live(
+            niri_xmb,
+            Arc::clone(&app.live),
+            Arc::clone(&app.live_stop),
+        ));
         app.load();
         app
     }
@@ -917,7 +981,7 @@ impl StudioApp {
                             });
                         });
                         ui.label(
-                            RichText::new("Model preview; renderer authoritative")
+                            RichText::new("Live from niri-xmb snapshot")
                                 .size(10.0)
                                 .color(TEXT_DIM),
                         );
@@ -944,7 +1008,7 @@ impl StudioApp {
                                 });
                             });
                             ui.add_space(4.0);
-                            self.xmb_preview(ui, ui.available_width());
+                            self.live_xmb_preview(ui, ui.available_width());
                             ui.add_space(4.0);
                             ui.label(
                                 RichText::new(format!(
@@ -1105,6 +1169,7 @@ impl StudioApp {
 
     fn controller_section(&mut self, ui: &mut Ui) {
         self.section_header(ui);
+        self.detected_controller_card(ui);
         if ui.available_width() >= 700.0 {
             ui.columns(2, |cols| {
                 self.controls_card(&mut cols[0]);
@@ -1128,6 +1193,98 @@ impl StudioApp {
         section_card(ui, "Layers", |ui| {
             self.layers_ui(ui);
         });
+    }
+
+    fn detected_controller_card(&self, ui: &mut Ui) {
+        let live = self
+            .live
+            .lock()
+            .map(|live| live.clone())
+            .unwrap_or_default();
+        let status = &live.status;
+        let gamepad = &status["gamepad"];
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Detected controller").size(12.0).strong());
+                let dot = if gamepad["devices"].as_u64().unwrap_or(0) > 0 {
+                    OK
+                } else {
+                    WARN
+                };
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.0, dot);
+                ui.label(
+                    RichText::new(if gamepad["devices"].as_u64().unwrap_or(0) > 0 {
+                        "connected"
+                    } else {
+                        "not detected"
+                    })
+                    .size(10.0)
+                    .color(dot),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if let Some(error) = status["error"].as_str() {
+                        ui.label(RichText::new(error).size(9.5).color(ERROR));
+                    } else if !live.error.is_empty() {
+                        ui.label(RichText::new(&live.error).size(9.5).color(ERROR));
+                    }
+                });
+            });
+            ui.add_space(3.0);
+            ui.horizontal_wrapped(|ui| {
+                for (label, value) in [
+                    ("mode", gamepad["mode"].as_str().unwrap_or("-")),
+                    ("preset", gamepad["preset"].as_str().unwrap_or("-")),
+                ] {
+                    ui.label(
+                        RichText::new(format!("{label} {value}"))
+                            .monospace()
+                            .size(10.0)
+                            .color(TEXT_MUTED),
+                    );
+                }
+                if gamepad["open_combo"].as_bool().unwrap_or(false) {
+                    ui.label(
+                        RichText::new("open combo on")
+                            .monospace()
+                            .size(10.0)
+                            .color(TEXT_MUTED),
+                    );
+                }
+            });
+            let connected = gamepad["connected"].as_array().cloned().unwrap_or_default();
+            if connected.is_empty() {
+                ui.label(
+                    RichText::new("No controller connected")
+                        .size(11.0)
+                        .color(TEXT_MUTED),
+                );
+            } else {
+                ui.add_space(3.0);
+                for device in connected {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(device["name"].as_str().unwrap_or("controller"))
+                                .size(11.0)
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            RichText::new(device["preset"].as_str().unwrap_or(""))
+                                .monospace()
+                                .size(9.5)
+                                .color(TEXT_DIM),
+                        );
+                        ui.label(
+                            RichText::new(device["path"].as_str().unwrap_or(""))
+                                .monospace()
+                                .size(9.0)
+                                .color(TEXT_DIM),
+                        );
+                    });
+                }
+            }
+        });
+        ui.add_space(8.0);
     }
 
     fn trigger_section(&mut self, ui: &mut Ui) {
@@ -1155,24 +1312,27 @@ impl StudioApp {
                         self.switch_template(template);
                     }
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new("Visual only").size(9.5).color(TEXT_DIM));
-                });
             });
             ui.add_space(6.0);
             let template = self.template;
-            let width = ui.available_width();
-            let height = width * template.aspect();
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+            let width = ui.available_width().min(560.0);
+            let height = (width * 0.56).clamp(210.0, 330.0);
+            let (box_rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
             if let Some(backdrop) = template.backdrop() {
-                ui.painter().rect_filled(rect, 10.0, backdrop);
+                ui.painter().rect_filled(box_rect, 10.0, backdrop);
                 ui.painter().rect_stroke(
-                    rect,
+                    box_rect,
                     10.0,
                     Stroke::new(1.0_f32, BORDER),
                     StrokeKind::Inside,
                 );
             }
+            let image_size = if width * template.aspect() <= height {
+                Vec2::new(width, width * template.aspect())
+            } else {
+                Vec2::new(height / template.aspect(), height)
+            };
+            let rect = Rect::from_center_size(box_rect.center(), image_size);
             let texture_id = match template {
                 Template::Xbox => self.xbox_texture.as_ref(),
                 Template::Ds4 => self.ds4_texture.as_ref(),
@@ -3011,7 +3171,7 @@ impl StudioApp {
                 });
             });
             ui.add_space(6.0);
-            self.xmb_preview(ui, ui.available_width());
+            self.live_xmb_preview(ui, ui.available_width());
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(
@@ -3643,147 +3803,188 @@ impl StudioApp {
         }
     }
 
-    fn xmb_preview(&self, ui: &mut Ui, max_width: f32) {
-        let requested_width =
-            resolve_length(self.model["popup"]["width"].clone(), 920.0).clamp(240.0, 920.0);
-        let width = requested_width.min(max_width.max(180.0)).floor();
-        let scale = (width / 920.0).clamp(0.28, 1.0);
-        let requested_height =
-            resolve_length(self.model["popup"]["height"].clone(), 250.0).clamp(120.0, 420.0);
-        let height = (requested_height * (width / requested_width))
-            .clamp(110.0, requested_height)
-            .floor();
+    fn live_xmb_preview(&self, ui: &mut Ui, max_width: f32) {
+        let live = self
+            .live
+            .lock()
+            .map(|live| live.clone())
+            .unwrap_or_default();
+        let snapshot = &live.snapshot;
+        let Some(outputs) = snapshot["outputs"].as_array() else {
+            ui.label(
+                RichText::new("Waiting for niri-xmb live snapshot")
+                    .size(10.0)
+                    .color(TEXT_DIM),
+            );
+            return;
+        };
+        if outputs.is_empty() {
+            ui.label(
+                RichText::new("No outputs in live snapshot")
+                    .size(10.0)
+                    .color(TEXT_DIM),
+            );
+            return;
+        }
+        let width = max_width.clamp(240.0, 720.0);
+        let height = 220.0;
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
         let painter = ui.painter();
         let style = &self.model["style"];
         let background = style_color(style["background"].as_str().unwrap_or(""));
-        let background_end = style_color(style["background_end"].as_str().unwrap_or(""));
         let border = style_color(style["border"].as_str().unwrap_or(""));
         let surface = style_color(style["surface"].as_str().unwrap_or(""));
-        let surface_hover = style_color(style["surface_hover"].as_str().unwrap_or(""));
-        let selection = style_color(style["selection_border"].as_str().unwrap_or(""));
         let accent = style_color(style["accent"].as_str().unwrap_or(""));
-        let text = style_color(style["text"].as_str().unwrap_or(""));
-        let shadow = style_color(style["shadow"].as_str().unwrap_or("#55000000"));
-        let radius = style["panel_radius"].as_f64().unwrap_or(20.0) as f32 * scale;
-        let border_width = (style["border_width"].as_f64().unwrap_or(1.0) as f32 * scale).max(0.5);
-        let shadow_offset =
-            (style["shadow_offset"].as_f64().unwrap_or(6.0) as f32 * scale).max(0.0);
-        let shadow_spread =
-            (style["shadow_spread"].as_f64().unwrap_or(4.0) as f32 * scale).max(0.0);
-        painter.rect_filled(
-            rect.translate(Vec2::new(0.0, shadow_offset))
-                .expand(shadow_spread),
-            radius,
-            shadow,
+        painter.rect_filled(rect, 10.0, background);
+        painter.rect_stroke(rect, 10.0, Stroke::new(1.0_f32, border), StrokeKind::Inside);
+        painter.text(
+            Pos2::new(rect.min.x + 10.0, rect.min.y + 7.0),
+            Align2::LEFT_TOP,
+            "LIVE",
+            FontId::monospace(9.0),
+            accent,
         );
-        for index in 0..12 {
-            let t = index as f32 / 11.0;
-            let color = lerp_color(background, background_end, t);
-            let band = Rect::from_min_max(
-                Pos2::new(rect.min.x, rect.min.y + rect.height() * t),
-                Pos2::new(
-                    rect.max.x,
-                    rect.min.y + rect.height() * (t + 1.0 / 11.0).min(1.0),
-                ),
-            );
-            painter.rect_filled(band, 0.0, color);
-        }
-        painter.rect_stroke(
-            rect,
-            radius,
-            Stroke::new(border_width, border),
-            StrokeKind::Inside,
+        let mode = live.status["mode"].as_str().unwrap_or("daemon");
+        painter.text(
+            Pos2::new(rect.max.x - 10.0, rect.min.y + 7.0),
+            Align2::RIGHT_TOP,
+            mode,
+            FontId::monospace(9.0),
+            TEXT_DIM,
         );
-        let padding =
-            (style["panel_padding"].as_f64().unwrap_or(14.0) as f32 * scale).clamp(4.0, 40.0);
-        let inner = rect.shrink(padding);
-        let canvas_gap =
-            (style["canvas_gap"].as_f64().unwrap_or(12.0) as f32 * scale).clamp(2.0, 30.0);
-        let canvas_width = ((inner.width() - canvas_gap) / 2.0).max(20.0);
-        let footer = 30.0 * scale;
-        let canvas_height = (inner.height() - footer).max(30.0);
-        let font = FontId::monospace((8.0 * scale).max(6.0));
-        for index in 0..2 {
-            let canvas = Rect::from_min_size(
+        let inner = Rect::from_min_max(
+            Pos2::new(rect.min.x + 10.0, rect.min.y + 22.0),
+            Pos2::new(rect.max.x - 10.0, rect.max.y - 8.0),
+        );
+        let selected_window = live.status["selection"]["window_id"]
+            .as_u64()
+            .or_else(|| snapshot["focused_window"].as_u64());
+        let visible = outputs.iter().take(2).collect::<Vec<_>>();
+        let gap = 8.0;
+        let col_width = (inner.width() - gap * (visible.len().saturating_sub(1) as f32))
+            / visible.len().max(1) as f32;
+        let mut focus_window = None;
+        for (output_index, output) in visible.iter().enumerate() {
+            let col = Rect::from_min_size(
                 Pos2::new(
-                    inner.min.x + index as f32 * (canvas_width + canvas_gap),
+                    inner.min.x + output_index as f32 * (col_width + gap),
                     inner.min.y,
                 ),
-                Vec2::new(canvas_width, canvas_height),
+                Vec2::new(col_width, inner.height()),
             );
-            painter.rect_stroke(
-                canvas,
-                (5.0 * scale).max(2.0),
-                Stroke::new(border_width.min(1.0), border),
-                StrokeKind::Inside,
+            painter.rect_filled(col, 6.0, surface);
+            painter.text(
+                Pos2::new(col.min.x + 7.0, col.min.y + 5.0),
+                Align2::LEFT_TOP,
+                output["name"].as_str().unwrap_or("output"),
+                FontId::monospace(9.0),
+                TEXT_MUTED,
             );
-            let configured_icon = if index == 0 {
-                style["icon_size_focused"].as_f64().unwrap_or(40.0) as f32
-            } else {
-                style["icon_size"].as_f64().unwrap_or(28.0) as f32
-            };
-            let icon_gap = (8.0 * scale).max(2.0);
-            let left = (16.0 * scale).max(4.0);
-            let icon_limit = ((canvas.width() - left - icon_gap * 2.0) / 3.0)
-                .min(canvas.height() - 4.0)
-                .max(4.0);
-            let icon_size = (configured_icon * scale).clamp(4.0, icon_limit);
-            for item in 0..3 {
-                let icon = Rect::from_center_size(
+            let workspaces = output["workspaces"].as_array().cloned().unwrap_or_default();
+            let row_height = ((col.height() - 22.0) / workspaces.len().max(1) as f32).max(24.0);
+            for (workspace_index, workspace) in workspaces.iter().take(4).enumerate() {
+                let row = Rect::from_min_size(
                     Pos2::new(
-                        canvas.min.x
-                            + left
-                            + icon_size / 2.0
-                            + item as f32 * (icon_size + icon_gap),
-                        canvas.min.y + canvas.height() / 2.0,
+                        col.min.x + 5.0,
+                        col.min.y + 21.0 + workspace_index as f32 * row_height,
                     ),
-                    Vec2::splat(icon_size),
+                    Vec2::new(col.width() - 10.0, row_height - 3.0),
                 );
-                let selected = index == 0 && item == 1;
-                painter.rect_filled(
-                    icon,
-                    4.0 * scale,
-                    if selected { surface_hover } else { surface },
-                );
-                painter.rect_stroke(
-                    icon,
-                    4.0 * scale,
-                    Stroke::new(
-                        border_width.min(1.0),
-                        if selected { selection } else { border },
-                    ),
-                    StrokeKind::Inside,
-                );
-            }
-            if self.model["popup"]["show_labels"]
-                .as_bool()
-                .unwrap_or(false)
-            {
+                let active = workspace["active"].as_bool().unwrap_or(false)
+                    || workspace["focused"].as_bool().unwrap_or(false);
+                if active {
+                    painter.rect_stroke(row, 4.0, Stroke::new(1.0_f32, accent), StrokeKind::Inside);
+                }
+                let label = workspace["name"]
+                    .as_str()
+                    .or_else(|| workspace["label"].as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("#{}", workspace["index"].as_u64().unwrap_or(0)));
                 painter.text(
-                    Pos2::new(canvas.min.x + 4.0 * scale, canvas.min.y + 3.0 * scale),
-                    Align2::LEFT_TOP,
-                    format!("WS {}", index + 1),
-                    font.clone(),
-                    text,
+                    Pos2::new(row.min.x + 4.0, row.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    FontId::monospace(8.0),
+                    if active { accent } else { TEXT_DIM },
                 );
+                let windows = workspace["windows"].as_array().cloned().unwrap_or_default();
+                for (window_index, window) in windows.iter().take(6).enumerate() {
+                    let tile = Rect::from_min_size(
+                        Pos2::new(
+                            row.min.x + 34.0 + window_index as f32 * 28.0,
+                            row.center().y - 10.0,
+                        ),
+                        Vec2::splat(20.0),
+                    );
+                    if tile.max.x > row.max.x {
+                        break;
+                    }
+                    let focused = selected_window == window["id"].as_u64();
+                    let urgent = window["urgent"].as_bool().unwrap_or(false);
+                    let color = app_color(window["app_id"].as_str().unwrap_or("?"));
+                    painter.rect_filled(tile, 4.0, color);
+                    painter.rect_stroke(
+                        tile,
+                        4.0,
+                        Stroke::new(
+                            if focused { 2.0_f32 } else { 1.0_f32 },
+                            if focused {
+                                Color32::WHITE
+                            } else if urgent {
+                                ERROR
+                            } else {
+                                border
+                            },
+                        ),
+                        StrokeKind::Inside,
+                    );
+                    painter.text(
+                        tile.center(),
+                        Align2::CENTER_CENTER,
+                        window["app_id"]
+                            .as_str()
+                            .unwrap_or("?")
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or("?")
+                            .chars()
+                            .next()
+                            .unwrap_or('?')
+                            .to_ascii_uppercase()
+                            .to_string(),
+                        FontId::monospace(8.0),
+                        Color32::WHITE,
+                    );
+                    let response = ui.interact(
+                        tile,
+                        ui.id()
+                            .with(("live-window", output_index, workspace_index, window_index)),
+                        Sense::click(),
+                    );
+                    if response.clicked() {
+                        focus_window = window["id"].as_u64();
+                    }
+                    if let Some(title) = window["title"].as_str() {
+                        response.on_hover_text(title);
+                    }
+                }
             }
         }
+        if let Some(window_id) = focus_window {
+            let _ = Command::new(&self.niri_xmb)
+                .args(["focus-window", "--window-id", &window_id.to_string()])
+                .spawn();
+        }
         painter.text(
-            Pos2::new(inner.min.x, inner.max.y - 10.0 * scale),
+            Pos2::new(rect.min.x + 10.0, rect.max.y - 7.0),
             Align2::LEFT_BOTTOM,
-            format!(
-                "{} / {}",
-                self.model["popup"]["position"].as_str().unwrap_or(""),
-                self.model["popup"]["surface_mode"].as_str().unwrap_or("")
-            ),
-            font,
-            text,
-        );
-        painter.circle_filled(
-            Pos2::new(inner.max.x - 8.0 * scale, inner.max.y - 8.0 * scale),
-            (3.0 * scale).max(1.5),
-            accent,
+            if snapshot["focused_window"].is_u64() {
+                "click a window to focus"
+            } else {
+                "live snapshot"
+            },
+            FontId::monospace(8.0),
+            TEXT_DIM,
         );
     }
 
@@ -4358,18 +4559,6 @@ fn default_bar() -> Value {
     })
 }
 
-fn resolve_length(value: Value, total: f32) -> f32 {
-    match value {
-        Value::Number(value) => value.as_f64().unwrap_or(total as f64) as f32,
-        Value::String(value) if value.ends_with('%') => value
-            .trim_end_matches('%')
-            .parse::<f32>()
-            .map_or(total, |percent| total * percent / 100.0),
-        Value::String(value) => value.parse::<f32>().unwrap_or(total),
-        _ => total,
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CurvePoint {
     pull: f32,
@@ -4413,6 +4602,21 @@ fn trigger_multiplier(
         * boost_cap.powf(trigger_shape(rt, deadzone, curve, points))
 }
 
+fn app_color(app_id: &str) -> Color32 {
+    const PALETTE: [Color32; 6] = [
+        Color32::from_rgb(72, 104, 168),
+        Color32::from_rgb(132, 78, 148),
+        Color32::from_rgb(58, 128, 104),
+        Color32::from_rgb(164, 104, 62),
+        Color32::from_rgb(90, 112, 150),
+        Color32::from_rgb(132, 76, 92),
+    ];
+    let hash = app_id.bytes().fold(2166136261_u32, |hash, byte| {
+        hash.wrapping_mul(16777619) ^ u32::from(byte)
+    });
+    PALETTE[hash as usize % PALETTE.len()]
+}
+
 fn style_color(value: &str) -> Color32 {
     let digits = value.strip_prefix('#').unwrap_or("");
     let parse = |at: usize| u8::from_str_radix(&digits[at..at + 2], 16).unwrap_or(0);
@@ -4425,16 +4629,6 @@ fn style_color(value: &str) -> Color32 {
 
 fn parse_color(value: &str) -> Color32 {
     style_color(value)
-}
-
-fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
-    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
-    Color32::from_rgba_unmultiplied(
-        mix(a.r(), b.r()),
-        mix(a.g(), b.g()),
-        mix(a.b(), b.b()),
-        mix(a.a(), b.a()),
-    )
 }
 
 fn main() -> Result<()> {
