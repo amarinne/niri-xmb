@@ -42,6 +42,17 @@ impl PopupConfig {
 }
 
 impl Config {
+    /// Validate a referenced theme with the same parser and semantic checks
+    /// used while loading the daemon configuration.
+    pub fn validate_theme_reference(theme: &str, config_path: &Path) -> Result<()> {
+        if theme.trim().is_empty() {
+            anyhow::bail!("theme must not be empty");
+        }
+        let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+        let (resolved, value) = load_theme(theme, config_dir)?;
+        validate_theme(&value, &resolved)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             let config = Self::default();
@@ -62,11 +73,7 @@ impl Config {
                 anyhow::bail!("theme must not be empty");
             }
             let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-            let resolved = resolve_theme_path(&theme, config_dir);
-            let theme_source = std::fs::read_to_string(&resolved)
-                .with_context(|| format!("failed to read theme {}", resolved.display()))?;
-            let theme_value: toml::Value = toml::from_str(&theme_source)
-                .with_context(|| format!("failed to parse theme {}", resolved.display()))?;
+            let (resolved, theme_value) = load_theme(&theme, config_dir)?;
 
             validate_theme(&theme_value, &resolved)?;
 
@@ -360,6 +367,15 @@ fn resolve_theme_path(theme: &str, config_dir: &Path) -> PathBuf {
     } else {
         config_dir.join(candidate)
     }
+}
+
+fn load_theme(theme: &str, config_dir: &Path) -> Result<(PathBuf, toml::Value)> {
+    let resolved = resolve_theme_path(theme, config_dir);
+    let source = std::fs::read_to_string(&resolved)
+        .with_context(|| format!("failed to read theme {}", resolved.display()))?;
+    let value: toml::Value = toml::from_str(&source)
+        .with_context(|| format!("failed to parse theme {}", resolved.display()))?;
+    Ok((resolved, value))
 }
 
 /// Merge a theme's `[style]` table into the base config's `[style]` table,

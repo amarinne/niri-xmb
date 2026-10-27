@@ -12,6 +12,7 @@ use niri_xmb::config::Config;
 use niri_xmb::draw::StyleColor;
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldError {
@@ -130,9 +131,10 @@ pub fn field_errors(model: &Value) -> Vec<FieldError> {
         return errors;
     }
 
-    // Output names: bars and popup placements.
-    for (list_path, daemon_list) in [("bars", "bars"), ("popup.placements", "popup.placements")] {
-        let mut seen: HashSet<&str> = HashSet::new();
+    // Output names are parsed as free text here so one malformed name does
+    // not hide unrelated errors when the model cannot deserialize as Config.
+    // Duplicate detection stays in Config::validate_all.
+    for list_path in ["bars", "popup.placements"] {
         if let Some(items) = get(model, list_path).and_then(Value::as_array) {
             for (index, item) in items.iter().enumerate() {
                 let path = format!("{list_path}.{index}.output");
@@ -142,15 +144,7 @@ pub fn field_errors(model: &Value) -> Vec<FieldError> {
                         &mut errors,
                         FieldError::new(
                             path.clone(),
-                            format!("{daemon_list}[{index}].output {reason}"),
-                        ),
-                    );
-                } else if !seen.insert(output) {
-                    push_unique(
-                        &mut errors,
-                        FieldError::new(
-                            path,
-                            format!("{daemon_list}[{index}].output duplicates output {output:?}"),
+                            format!("{list_path}[{index}].output {reason}"),
                         ),
                     );
                 }
@@ -422,34 +416,11 @@ pub fn output_seed(used: &[String], live_outputs: &[String]) -> String {
     }
 }
 
-/// A referenced theme that cannot be read fails daemon load, so flag it on
-/// the Theme field instead of at save time. Mirrors the daemon's path
-/// resolution: `~/` expands to `$HOME`, relative paths resolve against the
-/// config file's directory.
+/// Validate a referenced theme with the daemon parser and semantic checks.
 pub fn theme_error(theme: &str, config_path: &str) -> Option<String> {
-    if theme.trim().is_empty() {
-        return Some("theme must not be empty".to_string());
-    }
-    let resolved = if let Some(rest) = theme.strip_prefix("~/") {
-        std::env::var_os("HOME")
-            .map(|home| std::path::PathBuf::from(home).join(rest))
-            .unwrap_or_else(|| std::path::PathBuf::from(theme))
-    } else {
-        let candidate = std::path::PathBuf::from(theme);
-        if candidate.is_absolute() {
-            candidate
-        } else {
-            std::path::Path::new(config_path)
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(candidate)
-        }
-    };
-    if resolved.exists() {
-        None
-    } else {
-        Some(format!("theme file not found: {}", resolved.display()))
-    }
+    Config::validate_theme_reference(theme, Path::new(config_path))
+        .err()
+        .map(|error| format!("theme: {error:#}"))
 }
 
 pub fn default_bar(output: String) -> Value {
@@ -592,12 +563,27 @@ mod tests {
     }
 
     #[test]
-    fn missing_theme_file_is_flagged() {
+    fn invalid_theme_files_are_flagged() {
         assert!(
             theme_error("does-not-exist.toml", "/tmp/niri-xmb-test/config.toml")
-                .is_some_and(|message| message.contains("not found"))
+                .is_some_and(|message| message.contains("failed to read theme"))
         );
         assert!(theme_error("", "/tmp/config.toml").is_some());
+
+        let dir = std::env::temp_dir().join(format!("niri-xmb-theme-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let malformed = dir.join("malformed.toml");
+        std::fs::write(&malformed, "not = [valid").unwrap();
+        assert!(theme_error("malformed.toml", config_path.to_str().unwrap()).is_some());
+        std::fs::write(&malformed, "title = \"missing style\"\n").unwrap();
+        assert!(theme_error("malformed.toml", config_path.to_str().unwrap()).is_some());
+        std::fs::write(&malformed, "[style]\nbackground = \"red\"\n").unwrap();
+        assert!(theme_error("malformed.toml", config_path.to_str().unwrap()).is_some());
+        std::fs::write(&malformed, "[style]\nunknown = 1\n").unwrap();
+        assert!(theme_error("malformed.toml", config_path.to_str().unwrap()).is_some());
+        assert!(theme_error(".", config_path.to_str().unwrap()).is_some());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
