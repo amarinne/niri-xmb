@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 const DEFAULT_CONFIG: &str = "~/.config/niri-xmb/config.toml";
 const XBOX_IMAGE: &[u8] = include_bytes!("../../../assets/controller-render.png");
 const DS4_IMAGE: &[u8] = include_bytes!("../../../assets/dualshock4-render.png");
+const CONTROLLER_XBOX_SVG: &str = include_str!("../../../assets/controller-xbox.svg");
 const XBOX_ASPECT: f32 = 403.0 / 441.0;
 const DS4_ASPECT: f32 = 403.0 / 441.0;
 
@@ -272,7 +273,7 @@ const XBOX_HOTSPOTS: &[Hotspot] = &[
         w: 0.0635,
         h: 0.0499,
         shape: HotspotShape::DpadUp,
-        label: true,
+        label: false,
     },
     Hotspot {
         control: "D-pad down",
@@ -282,7 +283,7 @@ const XBOX_HOTSPOTS: &[Hotspot] = &[
         w: 0.0635,
         h: 0.0499,
         shape: HotspotShape::DpadDown,
-        label: true,
+        label: false,
     },
     Hotspot {
         control: "D-pad left",
@@ -292,7 +293,7 @@ const XBOX_HOTSPOTS: &[Hotspot] = &[
         w: 0.0499,
         h: 0.0635,
         shape: HotspotShape::DpadLeft,
-        label: true,
+        label: false,
     },
     Hotspot {
         control: "D-pad right",
@@ -302,7 +303,7 @@ const XBOX_HOTSPOTS: &[Hotspot] = &[
         w: 0.0499,
         h: 0.0635,
         shape: HotspotShape::DpadRight,
-        label: true,
+        label: false,
     },
     Hotspot {
         control: "Y",
@@ -475,7 +476,7 @@ const DS4_HOTSPOTS: &[Hotspot] = &[
         w: 0.0635,
         h: 0.0499,
         shape: HotspotShape::DpadUp,
-        label: true,
+        label: false,
     },
     Hotspot {
         control: "D-pad down",
@@ -485,7 +486,7 @@ const DS4_HOTSPOTS: &[Hotspot] = &[
         w: 0.0635,
         h: 0.0499,
         shape: HotspotShape::DpadDown,
-        label: true,
+        label: false,
     },
     Hotspot {
         control: "D-pad left",
@@ -495,7 +496,7 @@ const DS4_HOTSPOTS: &[Hotspot] = &[
         w: 0.0499,
         h: 0.0635,
         shape: HotspotShape::DpadLeft,
-        label: true,
+        label: false,
     },
     Hotspot {
         control: "D-pad right",
@@ -505,7 +506,7 @@ const DS4_HOTSPOTS: &[Hotspot] = &[
         w: 0.0499,
         h: 0.0635,
         shape: HotspotShape::DpadRight,
-        label: true,
+        label: false,
     },
     Hotspot {
         control: "L3",
@@ -1000,6 +1001,326 @@ struct StudioApp {
     field_errors: Vec<validation::FieldError>,
     validated_model: Value,
     validated_path: String,
+}
+
+#[derive(Clone, Debug)]
+struct DpadVectorArtwork {
+    up_polygon: Vec<Pos2>,
+    up_arrow: [Pos2; 3],
+    right_polygon: Vec<Pos2>,
+    right_arrow: [Pos2; 3],
+    down_polygon: Vec<Pos2>,
+    down_arrow: [Pos2; 3],
+    left_polygon: Vec<Pos2>,
+    left_arrow: [Pos2; 3],
+    stroke_color: Color32,
+    stroke_width: f32,
+    fill_color: Color32,
+    arrow_color: Color32,
+}
+
+static DPAD_ARTWORK: std::sync::LazyLock<DpadVectorArtwork> =
+    std::sync::LazyLock::new(|| DpadVectorArtwork::parse(CONTROLLER_XBOX_SVG));
+
+impl DpadVectorArtwork {
+    fn global() -> &'static Self {
+        &DPAD_ARTWORK
+    }
+
+    fn parse(svg: &str) -> Self {
+        let (stroke_color, stroke_width, fill_color, arrow_color) = Self::parse_style(svg);
+        let (up_polygon, up_arrow) = Self::parse_direction(svg, "up");
+        let (right_polygon, right_arrow) = Self::parse_direction(svg, "right");
+        let (down_polygon, down_arrow) = Self::parse_direction(svg, "down");
+        let (left_polygon, left_arrow) = Self::parse_direction(svg, "left");
+
+        Self {
+            up_polygon,
+            up_arrow,
+            right_polygon,
+            right_arrow,
+            down_polygon,
+            down_arrow,
+            left_polygon,
+            left_arrow,
+            stroke_color,
+            stroke_width,
+            fill_color,
+            arrow_color,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn palette() -> (Color32, Color32, f32) {
+        let art = Self::global();
+        (art.stroke_color, art.fill_color, art.stroke_width)
+    }
+
+    fn polygon_for(
+        &self,
+        template: Template,
+        rect: Rect,
+        shape: HotspotShape,
+    ) -> Option<Vec<Pos2>> {
+        let (raw_pts, _) = self.raw_direction(shape)?;
+        let (offset_x, offset_y) = match template {
+            Template::Xbox => (0.0, 0.0),
+            Template::Ds4 => (-53.0, -78.0),
+        };
+        let scale_x = rect.width() / 441.0;
+        let scale_y = rect.height() / 403.0;
+        Some(
+            raw_pts
+                .iter()
+                .map(|p| {
+                    Pos2::new(
+                        rect.min.x + (p.x + offset_x) * scale_x,
+                        rect.min.y + (p.y + offset_y) * scale_y,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn arrow_for(&self, template: Template, rect: Rect, shape: HotspotShape) -> Option<[Pos2; 3]> {
+        let (_, raw_arrow) = self.raw_direction(shape)?;
+        let (offset_x, offset_y) = match template {
+            Template::Xbox => (0.0, 0.0),
+            Template::Ds4 => (-53.0, -78.0),
+        };
+        let scale_x = rect.width() / 441.0;
+        let scale_y = rect.height() / 403.0;
+        let map_pt = |p: &Pos2| {
+            Pos2::new(
+                rect.min.x + (p.x + offset_x) * scale_x,
+                rect.min.y + (p.y + offset_y) * scale_y,
+            )
+        };
+        Some([
+            map_pt(&raw_arrow[0]),
+            map_pt(&raw_arrow[1]),
+            map_pt(&raw_arrow[2]),
+        ])
+    }
+
+    fn raw_direction(&self, shape: HotspotShape) -> Option<(&[Pos2], &[Pos2; 3])> {
+        match shape {
+            HotspotShape::DpadUp => Some((&self.up_polygon, &self.up_arrow)),
+            HotspotShape::DpadRight => Some((&self.right_polygon, &self.right_arrow)),
+            HotspotShape::DpadDown => Some((&self.down_polygon, &self.down_arrow)),
+            HotspotShape::DpadLeft => Some((&self.left_polygon, &self.left_arrow)),
+            _ => None,
+        }
+    }
+
+    fn extract_css_block<'a>(svg: &'a str, selector: &str) -> Option<&'a str> {
+        let start = svg.find(selector)?;
+        let open = svg[start..].find('{')?;
+        let close = svg[start + open..].find('}')?;
+        Some(&svg[start + open + 1..start + open + close])
+    }
+
+    fn parse_style(svg: &str) -> (Color32, f32, Color32, Color32) {
+        let mut stroke_color = Color32::from_rgb(193, 215, 238);
+        let mut stroke_width = 2.0_f32;
+        let mut fill_color = Color32::from_rgba_unmultiplied(193, 215, 238, 46);
+        let mut arrow_color = Color32::from_rgb(193, 215, 238);
+
+        if let Some(body) = Self::extract_css_block(svg, ".button") {
+            for decl in body.split(';') {
+                let parts: Vec<&str> = decl.split(':').map(str::trim).collect();
+                if parts.len() == 2 {
+                    match parts[0] {
+                        "stroke" => {
+                            stroke_color = Self::parse_hex_color(parts[1]).unwrap_or(stroke_color);
+                        }
+                        "stroke-width" => {
+                            stroke_width = parts[1].parse::<f32>().unwrap_or(stroke_width);
+                        }
+                        "fill" => {
+                            fill_color = Self::parse_rgba_color(parts[1]).unwrap_or(fill_color);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if let Some(body) = Self::extract_css_block(svg, ".arrow") {
+            for decl in body.split(';') {
+                let parts: Vec<&str> = decl.split(':').map(str::trim).collect();
+                if parts.len() == 2 && parts[0] == "fill" {
+                    arrow_color = Self::parse_hex_color(parts[1]).unwrap_or(arrow_color);
+                }
+            }
+        }
+
+        (stroke_color, stroke_width, fill_color, arrow_color)
+    }
+
+    fn parse_direction(svg: &str, dir_id: &str) -> (Vec<Pos2>, [Pos2; 3]) {
+        let id_needle = format!("id=\"dpad-{dir_id}\"");
+        let start = svg.find(&id_needle).expect("dpad direction id in SVG");
+        let path_slice = &svg[start..];
+
+        let d_start = path_slice.find(" d=\"").expect("path d attribute") + 4;
+        let d_end = path_slice[d_start..]
+            .find('"')
+            .expect("path d closing quote")
+            + d_start;
+        let d_str = &path_slice[d_start..d_end];
+        let polygon = Self::sample_svg_path(d_str, 8);
+
+        let arrow_start = path_slice
+            .find("points=\"")
+            .expect("arrow points attribute")
+            + 8;
+        let arrow_end = path_slice[arrow_start..]
+            .find('"')
+            .expect("arrow points closing quote")
+            + arrow_start;
+        let points_str = &path_slice[arrow_start..arrow_end];
+        let arrow = Self::parse_arrow_points(points_str);
+
+        (polygon, arrow)
+    }
+
+    fn sample_svg_path(d: &str, steps: usize) -> Vec<Pos2> {
+        let tokens = Self::tokenize_svg_path(d);
+        let mut points = Vec::new();
+        let mut current = Pos2::ZERO;
+        let mut idx = 0;
+
+        while idx < tokens.len() {
+            let cmd = &tokens[idx];
+            idx += 1;
+            match cmd.as_str() {
+                "M" | "L" => {
+                    if idx + 1 < tokens.len() {
+                        let x = tokens[idx].parse::<f32>().unwrap_or(0.0);
+                        let y = tokens[idx + 1].parse::<f32>().unwrap_or(0.0);
+                        idx += 2;
+                        current = Pos2::new(x, y);
+                        points.push(current);
+                    }
+                }
+                "C" => {
+                    while idx + 5 < tokens.len()
+                        && !tokens[idx].starts_with(|c: char| c.is_ascii_alphabetic())
+                    {
+                        let x1 = tokens[idx].parse::<f32>().unwrap_or(0.0);
+                        let y1 = tokens[idx + 1].parse::<f32>().unwrap_or(0.0);
+                        let x2 = tokens[idx + 2].parse::<f32>().unwrap_or(0.0);
+                        let y2 = tokens[idx + 3].parse::<f32>().unwrap_or(0.0);
+                        let x = tokens[idx + 4].parse::<f32>().unwrap_or(0.0);
+                        let y = tokens[idx + 5].parse::<f32>().unwrap_or(0.0);
+                        idx += 6;
+
+                        let p0 = current;
+                        let p1 = Pos2::new(x1, y1);
+                        let p2 = Pos2::new(x2, y2);
+                        let p3 = Pos2::new(x, y);
+
+                        for step in 1..=steps {
+                            let t = step as f32 / steps as f32;
+                            let inv_t = 1.0 - t;
+                            let bx = inv_t.powi(3) * p0.x
+                                + 3.0 * inv_t.powi(2) * t * p1.x
+                                + 3.0 * inv_t * t.powi(2) * p2.x
+                                + t.powi(3) * p3.x;
+                            let by = inv_t.powi(3) * p0.y
+                                + 3.0 * inv_t.powi(2) * t * p1.y
+                                + 3.0 * inv_t * t.powi(2) * p2.y
+                                + t.powi(3) * p3.y;
+                            points.push(Pos2::new(bx, by));
+                        }
+                        current = p3;
+                    }
+                }
+                "Z" | "z" => {}
+                _ => {}
+            }
+        }
+        points
+    }
+
+    fn parse_arrow_points(points_str: &str) -> [Pos2; 3] {
+        let mut coords = Vec::new();
+        for item in points_str.split_whitespace() {
+            let pair: Vec<&str> = item.split(',').collect();
+            if pair.len() == 2 {
+                let parsed_x = pair[0].parse::<f32>();
+                let parsed_y = pair[1].parse::<f32>();
+                if let (Ok(x), Ok(y)) = (parsed_x, parsed_y) {
+                    coords.push(Pos2::new(x, y));
+                }
+            }
+        }
+        if coords.len() == 3 {
+            [coords[0], coords[1], coords[2]]
+        } else {
+            [Pos2::ZERO, Pos2::ZERO, Pos2::ZERO]
+        }
+    }
+
+    fn tokenize_svg_path(d: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        for ch in d.chars() {
+            if ch.is_ascii_alphabetic() {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                tokens.push(ch.to_string());
+            } else if ch.is_ascii_whitespace() || ch == ',' {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            } else if ch == '-' || ch == '+' {
+                if !current.is_empty() && !current.ends_with('e') && !current.ends_with('E') {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                current.push(ch);
+            } else {
+                current.push(ch);
+            }
+        }
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+        tokens
+    }
+
+    fn parse_hex_color(hex: &str) -> Option<Color32> {
+        let hex = hex.trim().strip_prefix('#')?;
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            Some(Color32::from_rgb(r, g, b))
+        } else {
+            None
+        }
+    }
+
+    fn parse_rgba_color(s: &str) -> Option<Color32> {
+        let inner = s.trim().strip_prefix("rgba(")?.strip_suffix(')')?;
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        if parts.len() == 4 {
+            let r: u8 = parts[0].parse().ok()?;
+            let g: u8 = parts[1].parse().ok()?;
+            let b: u8 = parts[2].parse().ok()?;
+            let a: f32 = parts[3].parse().ok()?;
+            Some(Color32::from_rgba_unmultiplied(
+                r,
+                g,
+                b,
+                (a * 255.0).round() as u8,
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 impl StudioApp {
@@ -2056,37 +2377,12 @@ impl StudioApp {
         }
     }
 
-    fn dpad_polygon(center: Pos2, hit: Rect, shape: HotspotShape) -> Option<Vec<Pos2>> {
-        let hw = hit.width() * 0.5;
-        let hh = hit.height() * 0.5;
-        let pts = match shape {
-            HotspotShape::DpadUp => vec![
-                Pos2::new(center.x - hw * 0.85, center.y - hh),
-                Pos2::new(center.x + hw * 0.85, center.y - hh),
-                Pos2::new(center.x + hw * 0.40, center.y + hh),
-                Pos2::new(center.x - hw * 0.40, center.y + hh),
-            ],
-            HotspotShape::DpadDown => vec![
-                Pos2::new(center.x - hw * 0.40, center.y - hh),
-                Pos2::new(center.x + hw * 0.40, center.y - hh),
-                Pos2::new(center.x + hw * 0.85, center.y + hh),
-                Pos2::new(center.x - hw * 0.85, center.y + hh),
-            ],
-            HotspotShape::DpadLeft => vec![
-                Pos2::new(center.x - hw, center.y - hh * 0.85),
-                Pos2::new(center.x + hw, center.y - hh * 0.40),
-                Pos2::new(center.x + hw, center.y + hh * 0.40),
-                Pos2::new(center.x - hw, center.y + hh * 0.85),
-            ],
-            HotspotShape::DpadRight => vec![
-                Pos2::new(center.x - hw, center.y - hh * 0.40),
-                Pos2::new(center.x + hw, center.y - hh * 0.85),
-                Pos2::new(center.x + hw, center.y + hh * 0.85),
-                Pos2::new(center.x - hw, center.y + hh * 0.40),
-            ],
-            _ => return None,
-        };
-        Some(pts)
+    fn dpad_polygon(template: Template, rect: Rect, shape: HotspotShape) -> Option<Vec<Pos2>> {
+        DpadVectorArtwork::global().polygon_for(template, rect, shape)
+    }
+
+    fn dpad_arrow(template: Template, rect: Rect, shape: HotspotShape) -> Option<[Pos2; 3]> {
+        DpadVectorArtwork::global().arrow_for(template, rect, shape)
     }
 
     fn controller_map_body(&mut self, ui: &mut Ui, live: &GamepadLiveView) -> Option<Rect> {
@@ -2122,7 +2418,6 @@ impl StudioApp {
                 Color32::WHITE,
             );
         }
-        let label_size = (rect.width() * 0.016).clamp(7.0, 10.0);
         let mut selected_rect = None;
         for hotspot in template.hotspots() {
             let center = Pos2::new(
@@ -2194,22 +2489,26 @@ impl StudioApp {
                 | HotspotShape::DpadDown
                 | HotspotShape::DpadLeft
                 | HotspotShape::DpadRight => {
-                    if let Some(pts) = Self::dpad_polygon(center, hit, hotspot.shape) {
+                    if let Some(pts) = Self::dpad_polygon(template, rect, hotspot.shape) {
+                        let scale = rect.width() / 441.0;
+                        let art = DpadVectorArtwork::global();
                         let fill = if is_pressed {
                             Color32::from_rgba_unmultiplied(116, 162, 255, 72)
                         } else if selected {
                             Color32::from_rgba_unmultiplied(116, 162, 255, 30)
+                        } else if response.hovered() {
+                            Color32::from_rgba_unmultiplied(116, 162, 255, 20)
                         } else {
-                            Color32::from_rgba_unmultiplied(193, 215, 238, 46)
+                            art.fill_color
                         };
                         let shape_stroke = if is_pressed {
-                            Stroke::new(1.8_f32, Color32::WHITE)
+                            Stroke::new((1.8 * scale).max(1.5), Color32::WHITE)
                         } else if selected {
-                            Stroke::new(2.0_f32, ACCENT)
+                            Stroke::new((2.0 * scale).max(1.5), ACCENT)
                         } else if response.hovered() {
-                            Stroke::new(1.5_f32, Color32::from_rgb(220, 230, 245))
+                            Stroke::new((1.5 * scale).max(1.2), Color32::from_rgb(220, 230, 245))
                         } else {
-                            Stroke::new(2.0_f32, Color32::from_rgb(193, 215, 238))
+                            Stroke::new((art.stroke_width * scale).max(1.0), art.stroke_color)
                         };
                         ui.painter()
                             .add(egui::Shape::convex_polygon(pts, fill, shape_stroke));
@@ -2217,14 +2516,7 @@ impl StudioApp {
                 }
             }
 
-            let dpad_arrow = match hotspot.shape {
-                HotspotShape::DpadUp => Some("▲"),
-                HotspotShape::DpadDown => Some("▼"),
-                HotspotShape::DpadLeft => Some("◀"),
-                HotspotShape::DpadRight => Some("▶"),
-                _ => None,
-            };
-            if let Some(arrow) = dpad_arrow {
+            if let Some(arrow_pts) = Self::dpad_arrow(template, rect, hotspot.shape) {
                 let arrow_color = if is_pressed {
                     Color32::WHITE
                 } else if selected {
@@ -2232,15 +2524,13 @@ impl StudioApp {
                 } else if response.hovered() {
                     Color32::from_rgb(230, 240, 255)
                 } else {
-                    Color32::from_rgb(193, 215, 238)
+                    DpadVectorArtwork::global().arrow_color
                 };
-                ui.painter().text(
-                    center,
-                    Align2::CENTER_CENTER,
-                    arrow,
-                    FontId::monospace((label_size * 1.1).clamp(8.0, 11.0)),
+                ui.painter().add(egui::Shape::convex_polygon(
+                    arrow_pts.to_vec(),
                     arrow_color,
-                );
+                    Stroke::NONE,
+                ));
             } else if hotspot.label {
                 let well_radius = rect.height() * (37.5 / 403.0);
                 let pos = Pos2::new(center.x, center.y + well_radius + 4.0);
@@ -8667,44 +8957,141 @@ unknown_gamepad_field = 7
     }
 
     #[test]
-    fn dpad_polygon_tapers_inward_to_center() {
-        let center = Pos2::new(100.0, 100.0);
-        let hit = Rect::from_center_size(center, Vec2::new(40.0, 40.0));
-        let up = StudioApp::dpad_polygon(center, hit, HotspotShape::DpadUp).unwrap();
-        assert_eq!(up.len(), 4);
-        let outer_width = (up[1].x - up[0].x).abs();
-        let inner_width = (up[2].x - up[3].x).abs();
-        assert!(
-            outer_width > inner_width,
-            "DpadUp must taper inward toward center"
+    fn dpad_polygon_matches_vector_artwork_geometry_and_palette() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(441.0, 403.0));
+
+        let (stroke, fill, stroke_width) = DpadVectorArtwork::palette();
+        assert_eq!(stroke, Color32::from_rgb(193, 215, 238));
+        assert_eq!(fill, Color32::from_rgba_unmultiplied(193, 215, 238, 46));
+        assert!((stroke_width - 2.0).abs() < 1e-4);
+        assert_eq!(
+            DpadVectorArtwork::global().arrow_color,
+            Color32::from_rgb(193, 215, 238)
         );
 
-        let down = StudioApp::dpad_polygon(center, hit, HotspotShape::DpadDown).unwrap();
-        assert_eq!(down.len(), 4);
-        let inner_width_down = (down[1].x - down[0].x).abs();
-        let outer_width_down = (down[2].x - down[3].x).abs();
+        for shape in [
+            HotspotShape::DpadUp,
+            HotspotShape::DpadDown,
+            HotspotShape::DpadLeft,
+            HotspotShape::DpadRight,
+        ] {
+            let pts = StudioApp::dpad_polygon(Template::Xbox, rect, shape).unwrap();
+            assert!(
+                pts.len() > 20,
+                "{shape:?} must have smooth curved boundary points"
+            );
+            let arrow = StudioApp::dpad_arrow(Template::Xbox, rect, shape).unwrap();
+            assert_eq!(
+                arrow.len(),
+                3,
+                "{shape:?} arrow must have 3 triangle vertices"
+            );
+        }
+
+        // Inward tapering toward D-pad center (166, 238)
+        let up = StudioApp::dpad_polygon(Template::Xbox, rect, HotspotShape::DpadUp).unwrap();
+        let up_outer: Vec<_> = up.iter().filter(|p| p.y < 215.0).collect();
+        let up_inner: Vec<_> = up.iter().filter(|p| p.y > 225.0).collect();
+        let up_outer_width = up_outer
+            .iter()
+            .map(|p| p.x)
+            .fold(f32::NEG_INFINITY, f32::max)
+            - up_outer.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+        let up_inner_width = up_inner
+            .iter()
+            .map(|p| p.x)
+            .fold(f32::NEG_INFINITY, f32::max)
+            - up_inner.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
         assert!(
-            outer_width_down > inner_width_down,
-            "DpadDown must taper inward toward center"
+            up_outer_width > up_inner_width,
+            "DpadUp must taper inward toward center: outer={up_outer_width}, inner={up_inner_width}"
         );
 
-        let left = StudioApp::dpad_polygon(center, hit, HotspotShape::DpadLeft).unwrap();
-        assert_eq!(left.len(), 4);
-        let outer_height_left = (left[3].y - left[0].y).abs();
-        let inner_height_left = (left[2].y - left[1].y).abs();
+        let down = StudioApp::dpad_polygon(Template::Xbox, rect, HotspotShape::DpadDown).unwrap();
+        let down_outer: Vec<_> = down.iter().filter(|p| p.y > 260.0).collect();
+        let down_inner: Vec<_> = down.iter().filter(|p| p.y < 250.0).collect();
+        let down_outer_width = down_outer
+            .iter()
+            .map(|p| p.x)
+            .fold(f32::NEG_INFINITY, f32::max)
+            - down_outer.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+        let down_inner_width = down_inner
+            .iter()
+            .map(|p| p.x)
+            .fold(f32::NEG_INFINITY, f32::max)
+            - down_inner.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
         assert!(
-            outer_height_left > inner_height_left,
-            "DpadLeft must taper inward toward center"
+            down_outer_width > down_inner_width,
+            "DpadDown must taper inward toward center: outer={down_outer_width}, inner={down_inner_width}"
         );
 
-        let right = StudioApp::dpad_polygon(center, hit, HotspotShape::DpadRight).unwrap();
-        assert_eq!(right.len(), 4);
-        let inner_height_right = (right[3].y - right[0].y).abs();
-        let outer_height_right = (right[2].y - right[1].y).abs();
+        let left = StudioApp::dpad_polygon(Template::Xbox, rect, HotspotShape::DpadLeft).unwrap();
+        let left_outer: Vec<_> = left.iter().filter(|p| p.x < 142.0).collect();
+        let left_inner: Vec<_> = left.iter().filter(|p| p.x > 152.0).collect();
+        let left_outer_height = left_outer
+            .iter()
+            .map(|p| p.y)
+            .fold(f32::NEG_INFINITY, f32::max)
+            - left_outer.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        let left_inner_height = left_inner
+            .iter()
+            .map(|p| p.y)
+            .fold(f32::NEG_INFINITY, f32::max)
+            - left_inner.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
         assert!(
-            outer_height_right > inner_height_right,
-            "DpadRight must taper inward toward center"
+            left_outer_height > left_inner_height,
+            "DpadLeft must taper inward toward center: outer={left_outer_height}, inner={left_inner_height}"
         );
+
+        let right = StudioApp::dpad_polygon(Template::Xbox, rect, HotspotShape::DpadRight).unwrap();
+        let right_outer: Vec<_> = right.iter().filter(|p| p.x > 190.0).collect();
+        let right_inner: Vec<_> = right.iter().filter(|p| p.x < 180.0).collect();
+        let right_outer_height = right_outer
+            .iter()
+            .map(|p| p.y)
+            .fold(f32::NEG_INFINITY, f32::max)
+            - right_outer
+                .iter()
+                .map(|p| p.y)
+                .fold(f32::INFINITY, f32::min);
+        let right_inner_height = right_inner
+            .iter()
+            .map(|p| p.y)
+            .fold(f32::NEG_INFINITY, f32::max)
+            - right_inner
+                .iter()
+                .map(|p| p.y)
+                .fold(f32::INFINITY, f32::min);
+        assert!(
+            right_outer_height > right_inner_height,
+            "DpadRight must taper inward toward center: outer={right_outer_height}, inner={right_inner_height}"
+        );
+
+        // Invariant: DS4 geometry is translated by (-53, -78) relative to Xbox geometry
+        for shape in [
+            HotspotShape::DpadUp,
+            HotspotShape::DpadDown,
+            HotspotShape::DpadLeft,
+            HotspotShape::DpadRight,
+        ] {
+            let xbox_pts = StudioApp::dpad_polygon(Template::Xbox, rect, shape).unwrap();
+            let ds4_pts = StudioApp::dpad_polygon(Template::Ds4, rect, shape).unwrap();
+            assert_eq!(xbox_pts.len(), ds4_pts.len());
+            for (p_xbox, p_ds4) in xbox_pts.iter().zip(ds4_pts.iter()) {
+                assert!(
+                    (p_xbox.x - 53.0 - p_ds4.x).abs() < 1e-3,
+                    "DS4 x mismatch for {shape:?}: xbox={}, ds4={}",
+                    p_xbox.x,
+                    p_ds4.x
+                );
+                assert!(
+                    (p_xbox.y - 78.0 - p_ds4.y).abs() < 1e-3,
+                    "DS4 y mismatch for {shape:?}: xbox={}, ds4={}",
+                    p_xbox.y,
+                    p_ds4.y
+                );
+            }
+        }
     }
 
     #[test]
