@@ -4659,10 +4659,10 @@ impl StudioApp {
                 }
                 ui.add_space(2.0);
                 let list_w = ui.available_width();
-                let label_w = 96.0_f32.min(list_w * 0.28);
-                let remaining_w = (list_w - label_w - 22.0).max(160.0);
-                let layer_w = remaining_w * 0.26;
-                let binding_w = remaining_w - layer_w;
+                let columns = controller_columns(list_w);
+                let label_w = columns.label;
+                let binding_w = columns.binding;
+                let layer_w = columns.layers;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     ui.add_space(17.0);
@@ -5057,13 +5057,8 @@ impl StudioApp {
         query: &str,
     ) -> Option<&'static str> {
         let avail = ui.available_size();
-        // Rows are 60 layout units wide, so 15 standard key widths fit across.
-        // Size each key from that width and make the row height match it, which
-        // keeps caps square instead of stretching them into bars.
-        let legend_h = if avail.y >= 150.0 { 18.0 } else { 0.0 };
-        let cell = ((avail.x - 12.0) / 15.0)
-            .min((avail.y - legend_h - 12.0) / 6.0)
-            .clamp(9.0, 40.0);
+        let legend_h = keyboard_legend_height(avail);
+        let cell = keyboard_cell(avail);
         let unit = cell / 4.0;
         let gap = (unit * 0.18).clamp(1.0, 2.8);
         let board_w = 15.0 * cell + 10.0;
@@ -5223,6 +5218,45 @@ fn keymap_matches(bind: &keymap::NiriBind, query: &str) -> bool {
             .title
             .as_deref()
             .is_some_and(|title| title.to_ascii_lowercase().contains(query))
+}
+
+/// Largest 1u key edge. Without the cap a wide dock stretches one key across
+/// the panel and the board stops reading as a keyboard.
+const KEYBOARD_MAX_KEY: f32 = 40.0;
+/// Smallest 1u key edge that still reads as a keyboard in a short dock.
+const KEYBOARD_MIN_KEY: f32 = 9.0;
+
+/// Legend row kept under the board when the dock is tall enough to hold it.
+fn keyboard_legend_height(available: Vec2) -> f32 {
+    if available.y >= 150.0 { 18.0 } else { 0.0 }
+}
+
+/// Fit the 15x6 unit board into the dock, bounded by both dimensions so keys
+/// stay square however the splitter is dragged.
+fn keyboard_cell(available: Vec2) -> f32 {
+    ((available.x - 12.0) / 15.0)
+        .min((available.y - keyboard_legend_height(available) - 12.0) / 6.0)
+        .clamp(KEYBOARD_MIN_KEY, KEYBOARD_MAX_KEY)
+}
+
+#[derive(Clone, Copy)]
+struct ControllerColumns {
+    label: f32,
+    binding: f32,
+    layers: f32,
+}
+
+/// Pin the controller table columns so the trailing trigger gauge cannot clip
+/// at the panel edge when the dock is narrow.
+fn controller_columns(list_w: f32) -> ControllerColumns {
+    let label = 96.0_f32.min(list_w * 0.28);
+    let remaining = (list_w - label - 22.0).max(160.0);
+    let layers = remaining * 0.26;
+    ControllerColumns {
+        label,
+        binding: remaining - layers,
+        layers,
+    }
 }
 
 fn keymap_list(ui: &mut Ui, binds: &[&keymap::NiriBind], height: f32) {
@@ -6847,6 +6881,56 @@ unknown_gamepad_field = 7
                 evdev::KeyCode::from_str(code).is_ok(),
                 "{code} must be a known evdev button"
             );
+        }
+    }
+
+    #[test]
+    fn keyboard_cell_keeps_key_proportions() {
+        // Wide dock: the board must not stretch one key across the panel.
+        let wide = keyboard_cell(Vec2::new(1800.0, 400.0));
+        assert_eq!(wide, KEYBOARD_MAX_KEY);
+
+        // Short dock: height is the binding constraint, so keys shrink with it.
+        let tall = keyboard_cell(Vec2::new(1800.0, 300.0));
+        let short = keyboard_cell(Vec2::new(1800.0, 120.0));
+        assert!(short < tall);
+        assert!(6.0 * short <= 120.0);
+    }
+
+    #[test]
+    fn keyboard_cell_fits_the_dock_budget() {
+        for height in [90.0_f32, 120.0, 215.0, 360.0, 700.0] {
+            let available = Vec2::new(1200.0, height);
+            let cell = keyboard_cell(available);
+            let board = Vec2::new(
+                15.0 * cell + 10.0,
+                6.0 * cell + 10.0 + keyboard_legend_height(available),
+            );
+            assert!(
+                board.x <= available.x,
+                "{height}: board wider than the dock"
+            );
+            assert!(
+                board.y <= available.y,
+                "{height}: board taller than the dock"
+            );
+        }
+        // Width-bound docks still respect the column budget.
+        let narrow = keyboard_cell(Vec2::new(240.0, 400.0));
+        assert!(15.0 * narrow + 10.0 <= 240.0);
+    }
+
+    #[test]
+    fn controller_columns_stay_inside_the_table() {
+        for width in [240.0_f32, 320.0, 480.0, 760.0, 1200.0] {
+            let columns = controller_columns(width);
+            let used = columns.label + columns.binding + columns.layers;
+            assert!(used <= width, "{width}: columns overflow the table");
+            assert!(
+                columns.binding >= 110.0,
+                "{width}: binding column collapsed"
+            );
+            assert!(columns.layers > 0.0 && columns.label > 0.0);
         }
     }
 
