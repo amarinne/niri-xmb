@@ -24,7 +24,8 @@ hold the configured border region, then move the pointer after the normal
 Gamepad input is off by default. The `[gamepad]` table selects a built-in
 `xbox`, `ds4`, or `flydigi` preset (or `auto` detection) and maps evdev button names or
 16-bit codes to manual-popup actions. Explicit bindings override the preset.
-Flydigi VADER4 devices auto-detect as `flydigi`; other xpad-compatible pads use `xbox`, and
+Flydigi VADER4 devices in Xbox/xpad mode auto-detect as `xbox`; choose `flydigi`
+explicitly when you want native paddle bindings. Other xpad-compatible pads also use `xbox`, and
 D-pad hat axes work even when the kernel sends no `BTN_DPAD_*` events.
 
 The controller starts in **game** mode: niri-xmb does not grab it, so games get

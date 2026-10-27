@@ -774,7 +774,10 @@ const XBOX_PRESET: &[(&str, GamepadAction)] = &[
     ("BTN_MODE", GamepadAction::Close),
 ];
 
-/// Flydigi's xpad-compatible face controls plus native M1-M4 paddle events.
+/// Explicit Flydigi profile: Xbox-compatible face controls plus native M1-M4
+/// paddle events. Automatic detection deliberately selects `Xbox` for a
+/// Flydigi pad in Xbox/xpad mode; users who want the paddles can opt into this
+/// profile with `preset = "flydigi"`.
 const FLYDIGI_PRESET: &[(&str, GamepadAction)] = &[
     ("BTN_DPAD_UP", GamepadAction::Up),
     ("BTN_DPAD_DOWN", GamepadAction::Down),
@@ -868,11 +871,10 @@ fn preset_from_identity(
         || identity.contains("microsoft")
         || has_face_buttons
     {
-        return if identity.contains("flydigi") || identity.contains("vader") {
-            GamepadPreset::Flydigi
-        } else {
-            GamepadPreset::Xbox
-        };
+        // Flydigi's xpad interface reports the standard Xbox positional
+        // controls. Keep automatic detection on the Xbox map; the explicit
+        // Flydigi preset remains available for its native paddle buttons.
+        return GamepadPreset::Xbox;
     }
     GamepadPreset::None
 }
@@ -2696,7 +2698,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_detection_maps_flydigi_vader_to_flydigi() {
+    fn auto_detection_maps_flydigi_vader_to_xbox() {
         assert_eq!(
             preset_from_identity(
                 "/dev/input/by-id/usb-Flydigi_Flydigi_VADER4-event-joystick",
@@ -2704,7 +2706,7 @@ mod tests {
                 0x045e,
                 true
             ),
-            GamepadPreset::Flydigi
+            GamepadPreset::Xbox
         );
     }
 
