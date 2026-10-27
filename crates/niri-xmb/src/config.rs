@@ -1225,6 +1225,14 @@ impl Default for GamepadPointerAccelConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GamepadTriggerPoint {
+    /// Absolute trigger pull in 0..1, after the trigger deadzone.
+    pub pull: f32,
+    /// Effective shaped pull in 0..1.
+    pub output: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GamepadPointerConfig {
@@ -1248,6 +1256,9 @@ pub struct GamepadPointerConfig {
     pub trigger_deadzone: f32,
     /// Response exponent for trigger speed modulation.
     pub trigger_curve: f32,
+    /// Optional bounded piecewise-linear response points. Empty uses
+    /// `trigger_curve` exactly as before.
+    pub trigger_points: Vec<GamepadTriggerPoint>,
     pub accel: GamepadPointerAccelConfig,
     pub scroll_accel: GamepadPointerAccelConfig,
 }
@@ -1268,6 +1279,7 @@ impl Default for GamepadPointerConfig {
             trigger_threshold: 0.35,
             trigger_deadzone: 0.08,
             trigger_curve: 1.35,
+            trigger_points: Vec::new(),
             accel: GamepadPointerAccelConfig::default(),
             scroll_accel: GamepadPointerAccelConfig {
                 decel_floor: 0.35,
@@ -1486,6 +1498,30 @@ impl GamepadNaviConfig {
         }
         if !(0.05..=5.0).contains(&pointer.trigger_curve) {
             anyhow::bail!("gamepad.navi.pointer.trigger_curve must be between 0.05 and 5.0");
+        }
+        if pointer.trigger_points.len() > 5 {
+            anyhow::bail!("gamepad.navi.pointer.trigger_points supports at most 5 interior points");
+        }
+        let mut previous_pull = pointer.trigger_deadzone;
+        let mut previous_output = 0.0_f32;
+        for (index, point) in pointer.trigger_points.iter().enumerate() {
+            let label = format!("gamepad.navi.pointer.trigger_points[{index}]");
+            if !point.pull.is_finite() || !point.output.is_finite() {
+                anyhow::bail!("{label} must be finite");
+            }
+            if point.pull <= pointer.trigger_deadzone || point.pull >= 1.0 {
+                anyhow::bail!(
+                    "{label}.pull must be greater than trigger_deadzone and less than 1.0"
+                );
+            }
+            if point.pull - previous_pull < 0.10 {
+                anyhow::bail!("{label}.pull must be at least 0.10 after the previous point");
+            }
+            if !(0.0..=1.0).contains(&point.output) || point.output < previous_output {
+                anyhow::bail!("{label}.output must be non-decreasing and between 0.0 and 1.0");
+            }
+            previous_pull = point.pull;
+            previous_output = point.output;
         }
         for (name, accel) in [
             ("accel", &pointer.accel),
@@ -2296,6 +2332,57 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("deadzone"), "{error:#}");
+    }
+
+    #[test]
+    fn gamepad_trigger_points_validate() {
+        let config = load_source(
+            r#"
+            [gamepad]
+            enabled = true
+            preset = "auto"
+            [gamepad.navi.pointer]
+            trigger_deadzone = 0.08
+            trigger_points = [
+              { pull = 0.25, output = 0.12 },
+              { pull = 0.50, output = 0.35 },
+              { pull = 0.75, output = 0.68 },
+            ]
+            "#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.gamepad.navi.pointer.trigger_points.len(), 3);
+
+        for points in [
+            r#"trigger_points = [{ pull = 0.25, output = 0.12 }, { pull = 0.30, output = 0.20 }]"#,
+            r#"trigger_points = [{ pull = 0.25, output = 0.40 }, { pull = 0.50, output = 0.20 }]"#,
+            r#"trigger_points = [{ pull = 0.05, output = 0.10 }]"#,
+            r#"trigger_points = [
+                { pull = 0.20, output = 0.10 },
+                { pull = 0.30, output = 0.20 },
+                { pull = 0.40, output = 0.30 },
+                { pull = 0.50, output = 0.40 },
+                { pull = 0.60, output = 0.50 },
+                { pull = 0.70, output = 0.60 },
+            ]"#,
+        ] {
+            let error = load_source(
+                &format!(
+                    r#"
+                    [gamepad]
+                    enabled = true
+                    preset = "auto"
+                    [gamepad.navi.pointer]
+                    trigger_deadzone = 0.08
+                    {points}
+                    "#
+                ),
+                None,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("trigger_points"), "{error:#}");
+        }
     }
 
     #[test]

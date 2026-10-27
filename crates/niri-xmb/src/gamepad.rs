@@ -9,8 +9,8 @@
 
 use crate::config::{
     GamepadAction, GamepadConfig, GamepadMode, GamepadNaviConfig, GamepadPointerAccelConfig,
-    GamepadPointerStick, GamepadPreset, NaviAction, PointerButton, gamepad_axis_code,
-    gamepad_button_code, parse_navi_action,
+    GamepadPointerStick, GamepadPreset, GamepadTriggerPoint, NaviAction, PointerButton,
+    gamepad_axis_code, gamepad_button_code, parse_navi_action,
 };
 use crate::wayland::WakeHandle;
 use anyhow::{Context, Result};
@@ -94,6 +94,7 @@ struct PointerRuntime {
     scroll_speed: f32,
     trigger_deadzone: f32,
     trigger_curve: f32,
+    trigger_points: Vec<GamepadTriggerPoint>,
     accel: AccelRuntime,
     scroll_accel: AccelRuntime,
 }
@@ -138,6 +139,7 @@ impl NaviRuntime {
                 scroll_speed: pointer.scroll_speed,
                 trigger_deadzone: pointer.trigger_deadzone,
                 trigger_curve: pointer.trigger_curve,
+                trigger_points: pointer.trigger_points.clone(),
                 accel: AccelRuntime::from_config(&pointer.accel),
                 scroll_accel: AccelRuntime::from_config(&pointer.scroll_accel),
             },
@@ -675,13 +677,15 @@ impl ComboTracker {
 #[derive(Debug, Clone)]
 struct TriggerAccel {
     config: AccelRuntime,
+    points: Vec<GamepadTriggerPoint>,
     multiplier: f32,
 }
 
 impl TriggerAccel {
-    fn new(config: AccelRuntime) -> Self {
+    fn new(config: AccelRuntime, points: Vec<GamepadTriggerPoint>) -> Self {
         Self {
             config,
+            points,
             multiplier: 1.0,
         }
     }
@@ -692,8 +696,8 @@ impl TriggerAccel {
 
     fn step(&mut self, lt: f32, rt: f32, deadzone: f32, curve: f32, dt: f32) -> f32 {
         let target = if self.config.enabled {
-            let lt = shape_trigger(lt, deadzone, curve);
-            let rt = shape_trigger(rt, deadzone, curve);
+            let lt = shape_trigger(lt, deadzone, curve, &self.points);
+            let rt = shape_trigger(rt, deadzone, curve, &self.points);
             self.config.decel_floor.powf(lt) * self.config.boost_cap.powf(rt)
         } else {
             1.0
@@ -708,9 +712,28 @@ impl TriggerAccel {
     }
 }
 
-fn shape_trigger(value: f32, deadzone: f32, curve: f32) -> f32 {
-    let value = ((value.clamp(0.0, 1.0) - deadzone) / (1.0 - deadzone).max(0.001)).clamp(0.0, 1.0);
-    value.powf(curve.max(0.05))
+fn shape_trigger(value: f32, deadzone: f32, curve: f32, points: &[GamepadTriggerPoint]) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    if value <= deadzone {
+        return 0.0;
+    }
+    if points.is_empty() {
+        let normalized = ((value - deadzone) / (1.0 - deadzone).max(0.001)).clamp(0.0, 1.0);
+        return normalized.powf(curve.max(0.05));
+    }
+    let mut previous_pull = deadzone;
+    let mut previous_output = 0.0_f32;
+    for point in points {
+        if value <= point.pull {
+            let span = (point.pull - previous_pull).max(0.001);
+            let t = ((value - previous_pull) / span).clamp(0.0, 1.0);
+            return previous_output + (point.output - previous_output) * t;
+        }
+        previous_pull = point.pull;
+        previous_output = point.output;
+    }
+    let span = (1.0 - previous_pull).max(0.001);
+    previous_output + (1.0 - previous_output) * ((value - previous_pull) / span).clamp(0.0, 1.0)
 }
 
 struct NaviTracker {
@@ -731,8 +754,12 @@ struct NaviTracker {
 
 impl NaviTracker {
     fn new(navi: Arc<NaviRuntime>, ranges: HashMap<u16, (i32, i32)>) -> Self {
-        let pointer_accel = TriggerAccel::new(navi.pointer.accel);
-        let scroll_accel = TriggerAccel::new(navi.pointer.scroll_accel);
+        let pointer_accel =
+            TriggerAccel::new(navi.pointer.accel, navi.pointer.trigger_points.clone());
+        let scroll_accel = TriggerAccel::new(
+            navi.pointer.scroll_accel,
+            navi.pointer.trigger_points.clone(),
+        );
         Self {
             navi,
             ranges,
@@ -2006,12 +2033,15 @@ mod tests {
 
     #[test]
     fn trigger_accel_multiplier_targets_and_deadzone() {
-        let mut accel = TriggerAccel::new(AccelRuntime {
-            enabled: true,
-            decel_floor: 0.30,
-            boost_cap: 2.50,
-            smoothing_secs: 0.0,
-        });
+        let mut accel = TriggerAccel::new(
+            AccelRuntime {
+                enabled: true,
+                decel_floor: 0.30,
+                boost_cap: 2.50,
+                smoothing_secs: 0.0,
+            },
+            Vec::new(),
+        );
         assert!((accel.step(0.0, 0.0, 0.08, 1.0, 0.008) - 1.0).abs() < 1e-5);
         assert!((accel.step(1.0, 0.0, 0.08, 1.0, 0.008) - 0.30).abs() < 1e-5);
         assert!((accel.step(0.0, 1.0, 0.08, 1.0, 0.008) - 2.50).abs() < 1e-5);
@@ -2020,13 +2050,40 @@ mod tests {
     }
 
     #[test]
+    fn trigger_points_interpolate_and_fall_back() {
+        let points = [
+            GamepadTriggerPoint {
+                pull: 0.25,
+                output: 0.10,
+            },
+            GamepadTriggerPoint {
+                pull: 0.50,
+                output: 0.30,
+            },
+            GamepadTriggerPoint {
+                pull: 0.75,
+                output: 0.70,
+            },
+        ];
+        assert!((shape_trigger(0.08, 0.08, 1.0, &points) - 0.0).abs() < 1e-6);
+        assert!((shape_trigger(0.25, 0.08, 1.0, &points) - 0.10).abs() < 1e-6);
+        assert!((shape_trigger(0.50, 0.08, 1.0, &points) - 0.30).abs() < 1e-6);
+        assert!((shape_trigger(0.75, 0.08, 1.0, &points) - 0.70).abs() < 1e-6);
+        assert!((shape_trigger(1.0, 0.08, 1.0, &points) - 1.0).abs() < 1e-6);
+        assert!((shape_trigger(0.50, 0.08, 3.0, &[]) - (0.42_f32 / 0.92).powf(3.0)).abs() < 1e-6);
+    }
+
+    #[test]
     fn trigger_accel_smoothing_converges() {
-        let mut accel = TriggerAccel::new(AccelRuntime {
-            enabled: true,
-            decel_floor: 0.30,
-            boost_cap: 2.50,
-            smoothing_secs: 0.09,
-        });
+        let mut accel = TriggerAccel::new(
+            AccelRuntime {
+                enabled: true,
+                decel_floor: 0.30,
+                boost_cap: 2.50,
+                smoothing_secs: 0.09,
+            },
+            Vec::new(),
+        );
         let first = accel.step(0.0, 1.0, 0.08, 1.0, 0.09);
         assert!(first > 1.0 && first < 2.5);
         for _ in 0..20 {
@@ -2038,12 +2095,15 @@ mod tests {
     #[test]
     fn navi_pointer_tick_uses_trigger_accel() {
         let mut tracker = navi_tracker();
-        tracker.pointer_accel = TriggerAccel::new(AccelRuntime {
-            enabled: true,
-            decel_floor: 0.30,
-            boost_cap: 2.50,
-            smoothing_secs: 0.0,
-        });
+        tracker.pointer_accel = TriggerAccel::new(
+            AccelRuntime {
+                enabled: true,
+                decel_floor: 0.30,
+                boost_cap: 2.50,
+                smoothing_secs: 0.0,
+            },
+            Vec::new(),
+        );
         tracker.update(&abs(AbsoluteAxisCode::ABS_X, 32767));
 
         tracker.last_tick = Instant::now() - Duration::from_millis(8);

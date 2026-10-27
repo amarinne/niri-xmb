@@ -130,8 +130,10 @@ immediate rather than deferred.
 
 Analog triggers modulate pointer and scroll speed around the configured baseline
 speed. LT is a precision/deceleration control and RT is a boost. Trigger depth is
-deadzoned and curved, then combined multiplicatively with separate deceleration
-floors, boost caps, and smoothing for pointer and scroll. The speed multiplier
+deadzoned and shaped, then combined multiplicatively with separate deceleration
+floors, boost caps, and smoothing for pointer and scroll. The shape is either
+the legacy power curve or an optional ordered list of up to five piecewise-linear
+`trigger_points`; empty points preserve the legacy behavior. The speed multiplier
 is smoothed, not the stick position, so trigger ADC noise does not step the
 pointer. Both triggers also participate in the monitor layer's hold_axes; layer
 actions take precedence when the D-pad is used.

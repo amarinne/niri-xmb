@@ -36,6 +36,11 @@ entry appears as **niri-xmb Config**.
   model. This is a geometry/style preview, not a renderer pixel match.
 - Controller hotspots select a control; the inspector edits the active Navi
   base, XMB, or layer binding.
+- Trigger Lab contains the shared piecewise-linear response curve: add/drag/
+  delete up to five points, edit exact pull/shape values, choose a preset or
+  convert the legacy curve, and inspect the resulting LT/RT multiplier and
+  percent. The compact pedals use the same points; they are simulation, not
+  live controller input.
 
 ## Save
 

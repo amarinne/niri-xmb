@@ -183,7 +183,16 @@ scroll_deadzone = 0.20
 scroll_speed = 6.0
 trigger_threshold = 0.35  # layer hold_axes only
 trigger_deadzone = 0.08   # analog trigger speed curve
-trigger_curve = 1.35
+trigger_curve = 1.35      # fallback when trigger_points is empty
+
+# Optional bounded response curve. Pull is absolute 0-1 trigger travel;
+# output is the shaped 0-1 result. Points must be ordered, at least 0.10
+# apart, non-decreasing in output, and no more than five.
+# trigger_points = [
+#   { pull = 0.25, output = 0.12 },
+#   { pull = 0.50, output = 0.35 },
+#   { pull = 0.75, output = 0.68 },
+# ]
 
 # LT slows/precises the pointer; RT accelerates. The multiplier is
 # decel_floor^LT * boost_cap^RT, smoothed over smoothing_ms.

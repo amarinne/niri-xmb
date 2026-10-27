@@ -524,6 +524,7 @@ impl Template {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
     Controller,
+    Trigger,
     Xmb,
     Style,
     Bars,
@@ -532,8 +533,9 @@ enum Section {
 }
 
 impl Section {
-    const ALL: [(Section, &'static str, &'static str); 6] = [
-        (Self::Controller, "Controller", "Map, triggers, bindings"),
+    const ALL: [(Section, &'static str, &'static str); 7] = [
+        (Self::Controller, "Controller", "Map, pointer, bindings"),
+        (Self::Trigger, "Trigger Lab", "Curve, pedals, exact values"),
         (Self::Xmb, "XMB", "Panel, behavior, peek"),
         (Self::Style, "Style", "Theme, colors, geometry"),
         (Self::Bars, "Bars", "Status bars"),
@@ -544,6 +546,7 @@ impl Section {
     fn title(self) -> &'static str {
         match self {
             Self::Controller => "Controller",
+            Self::Trigger => "Trigger Lab",
             Self::Xmb => "XMB",
             Self::Style => "Style",
             Self::Bars => "Bars",
@@ -554,7 +557,8 @@ impl Section {
 
     fn hint(self) -> &'static str {
         match self {
-            Self::Controller => "Map, trigger response and bindings",
+            Self::Controller => "Map, pointer and bindings",
+            Self::Trigger => "Response curve, pedals and exact values",
             Self::Xmb => "Panel, behavior and peek",
             Self::Style => "Theme, colors and geometry",
             Self::Bars => "Status bar layout",
@@ -587,6 +591,7 @@ struct StudioApp {
     confirm: Option<Confirm>,
     sim_lt: f32,
     sim_rt: f32,
+    selected_point: Option<usize>,
     xbox_texture: Option<TextureHandle>,
     ds4_texture: Option<TextureHandle>,
 }
@@ -601,7 +606,7 @@ impl StudioApp {
             loaded: Value::Null,
             sha256: String::new(),
             section: Section::Controller,
-            show_preview: true,
+            show_preview: false,
             template: Template::Xbox,
             selected: Template::Xbox.default_control(),
             context: "base".to_string(),
@@ -611,6 +616,7 @@ impl StudioApp {
             confirm: None,
             sim_lt: 0.0,
             sim_rt: 0.0,
+            selected_point: None,
             xbox_texture: None,
             ds4_texture: None,
         };
@@ -808,6 +814,9 @@ impl StudioApp {
                 for (section, label, hint) in Section::ALL {
                     if nav_item(ui, self.section == section, label, hint).clicked() {
                         self.section = section;
+                        if section == Section::Preview {
+                            self.show_preview = true;
+                        }
                     }
                     ui.add_space(2.0);
                 }
@@ -1064,6 +1073,7 @@ impl StudioApp {
                         ui.set_width(ui.available_width());
                         match self.section {
                             Section::Controller => self.controller_section(ui),
+                            Section::Trigger => self.trigger_section(ui),
                             Section::Xmb => self.xmb_section(ui),
                             Section::Style => self.style_section(ui),
                             Section::Bars => self.bars_section(ui),
@@ -1104,15 +1114,6 @@ impl StudioApp {
             self.controls_card(ui);
             self.inspector_card(ui);
         }
-        section_card(ui, "Trigger response", |ui| {
-            self.trigger_response(ui);
-        });
-        section_card(ui, "Pedal simulation", |ui| {
-            self.pedal_simulation(ui);
-        });
-        section_card(ui, "Trigger settings", |ui| {
-            self.accel_fields(ui);
-        });
         section_card(ui, "Device", |ui| {
             self.device_fields(ui);
         });
@@ -1126,6 +1127,18 @@ impl StudioApp {
         });
         section_card(ui, "Layers", |ui| {
             self.layers_ui(ui);
+        });
+    }
+
+    fn trigger_section(&mut self, ui: &mut Ui) {
+        self.section_header(ui);
+        section_card(ui, "Trigger Lab", |ui| {
+            self.trigger_response(ui);
+            ui.add_space(8.0);
+            self.pedal_simulation(ui);
+        });
+        section_card(ui, "Exact values", |ui| {
+            self.accel_fields(ui);
         });
     }
 
@@ -1536,6 +1549,268 @@ impl StudioApp {
         }
     }
 
+    fn trigger_points(&self) -> Vec<CurvePoint> {
+        get_path(&self.model, "gamepad.navi.pointer.trigger_points")
+            .and_then(Value::as_array)
+            .map(|points| {
+                points
+                    .iter()
+                    .filter_map(|point| {
+                        Some(CurvePoint {
+                            pull: point.get("pull")?.as_f64()? as f32,
+                            output: point.get("output")?.as_f64()? as f32,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn set_trigger_points(&mut self, points: &[CurvePoint]) {
+        let mut points = points.to_vec();
+        points.sort_by(|a, b| a.pull.total_cmp(&b.pull));
+        let values = points
+            .iter()
+            .map(|point| json!({"pull": point.pull, "output": point.output}))
+            .collect::<Vec<_>>();
+        set_json_path(
+            &mut self.model,
+            "gamepad.navi.pointer.trigger_points",
+            Value::Array(values),
+        );
+        if self
+            .selected_point
+            .is_some_and(|index| index >= points.len())
+        {
+            self.selected_point = None;
+        }
+    }
+
+    fn add_trigger_point(&mut self) {
+        let points = self.trigger_points();
+        if points.len() >= 5 {
+            return;
+        }
+        let deadzone = get_path(&self.model, "gamepad.navi.pointer.trigger_deadzone")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.08) as f32;
+        let curve = get_path(&self.model, "gamepad.navi.pointer.trigger_curve")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.35) as f32;
+        let Some(pull) = [0.50_f32, 0.60, 0.40, 0.70, 0.30, 0.80]
+            .into_iter()
+            .find(|pull| {
+                *pull > deadzone + 0.10
+                    && points
+                        .iter()
+                        .all(|point| (point.pull - *pull).abs() >= 0.10)
+            })
+        else {
+            return;
+        };
+        let output = trigger_shape(pull, deadzone, curve, &points);
+        let mut next = points;
+        next.push(CurvePoint { pull, output });
+        next.sort_by(|a, b| a.pull.total_cmp(&b.pull));
+        self.selected_point = next.iter().position(|point| point.pull == pull);
+        self.set_trigger_points(&next);
+    }
+
+    fn trigger_presets(&mut self, ui: &mut Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Shape").size(10.0).color(TEXT_DIM));
+            if ui.small_button("+ Point").clicked() {
+                self.add_trigger_point();
+            }
+            if ui.small_button("Linear").clicked() {
+                set_json_path(
+                    &mut self.model,
+                    "gamepad.navi.pointer.trigger_curve",
+                    json!(1.0),
+                );
+                self.set_trigger_points(&[]);
+            }
+            for (label, points) in [
+                (
+                    "Soft start",
+                    vec![
+                        CurvePoint {
+                            pull: 0.35,
+                            output: 0.10,
+                        },
+                        CurvePoint {
+                            pull: 0.65,
+                            output: 0.40,
+                        },
+                    ],
+                ),
+                (
+                    "Precise",
+                    vec![
+                        CurvePoint {
+                            pull: 0.35,
+                            output: 0.08,
+                        },
+                        CurvePoint {
+                            pull: 0.65,
+                            output: 0.30,
+                        },
+                        CurvePoint {
+                            pull: 0.85,
+                            output: 0.65,
+                        },
+                    ],
+                ),
+                (
+                    "Snappy",
+                    vec![
+                        CurvePoint {
+                            pull: 0.35,
+                            output: 0.05,
+                        },
+                        CurvePoint {
+                            pull: 0.65,
+                            output: 0.55,
+                        },
+                        CurvePoint {
+                            pull: 0.85,
+                            output: 0.90,
+                        },
+                    ],
+                ),
+            ] {
+                if ui.small_button(label).clicked() {
+                    self.set_trigger_points(&points);
+                }
+            }
+            if ui.small_button("Convert curve").clicked() {
+                let deadzone = get_path(&self.model, "gamepad.navi.pointer.trigger_deadzone")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.08) as f32;
+                let curve = get_path(&self.model, "gamepad.navi.pointer.trigger_curve")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.35) as f32;
+                let points = [0.25_f32, 0.50, 0.75]
+                    .into_iter()
+                    .map(|pull| CurvePoint {
+                        pull,
+                        output: trigger_shape(pull, deadzone, curve, &[]),
+                    })
+                    .collect::<Vec<_>>();
+                self.set_trigger_points(&points);
+            }
+            if ui.small_button("Clear").clicked() {
+                self.set_trigger_points(&[]);
+            }
+        });
+    }
+
+    fn point_inspector(&mut self, ui: &mut Ui) {
+        let points = self.trigger_points();
+        let Some(index) = self.selected_point.filter(|index| *index < points.len()) else {
+            return;
+        };
+        let point = points[index];
+        let deadzone = get_path(&self.model, "gamepad.navi.pointer.trigger_deadzone")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.08) as f32;
+        let curve = get_path(&self.model, "gamepad.navi.pointer.trigger_curve")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.35) as f32;
+        let shape = trigger_shape(point.pull, deadzone, curve, &points);
+        let pointer_floor = get_path(&self.model, "gamepad.navi.pointer.accel.decel_floor")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.3) as f32;
+        let pointer_cap = get_path(&self.model, "gamepad.navi.pointer.accel.boost_cap")
+            .and_then(Value::as_f64)
+            .unwrap_or(2.5) as f32;
+        let scroll_floor = get_path(&self.model, "gamepad.navi.pointer.scroll_accel.decel_floor")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.35) as f32;
+        let scroll_cap = get_path(&self.model, "gamepad.navi.pointer.scroll_accel.boost_cap")
+            .and_then(Value::as_f64)
+            .unwrap_or(3.0) as f32;
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Point {}", index + 1)).strong());
+            let mut pull = point.pull;
+            let mut output = point.output;
+            let pull_changed = ui
+                .add(
+                    egui::DragValue::new(&mut pull)
+                        .speed(0.005)
+                        .range(deadzone + 0.001..=0.999)
+                        .suffix(" pull"),
+                )
+                .changed();
+            let output_changed = ui
+                .add(
+                    egui::DragValue::new(&mut output)
+                        .speed(0.005)
+                        .range(0.0..=1.0)
+                        .suffix(" shape"),
+                )
+                .changed();
+            if ui.small_button("Delete point").clicked() {
+                let mut next = points.clone();
+                next.remove(index);
+                self.set_trigger_points(&next);
+                self.selected_point = None;
+                return;
+            }
+            if pull_changed || output_changed {
+                let mut next = points.clone();
+                let previous_pull = index
+                    .checked_sub(1)
+                    .map(|previous| next[previous].pull)
+                    .unwrap_or(deadzone + 0.001);
+                let next_pull = next.get(index + 1).map(|next| next.pull).unwrap_or(0.999);
+                let previous_output = index
+                    .checked_sub(1)
+                    .map(|previous| next[previous].output)
+                    .unwrap_or(0.0);
+                let next_output = next.get(index + 1).map(|next| next.output).unwrap_or(1.0);
+                next[index].pull = pull.clamp(previous_pull + 0.10, next_pull - 0.10);
+                next[index].output = output.clamp(previous_output, next_output);
+                self.set_trigger_points(&next);
+            }
+        });
+        ui.label(
+            RichText::new(format!(
+                "Pull {:.0}% → shape {:.0}%",
+                point.pull * 100.0,
+                shape * 100.0
+            ))
+            .monospace()
+            .size(10.0)
+            .color(TEXT_MUTED),
+        );
+        ui.label(
+            RichText::new(format!(
+                "Pointer: LT {:.2}× ({:.0}%) · RT {:.2}× ({:.0}%)",
+                pointer_floor.powf(shape),
+                pointer_floor.powf(shape) * 100.0,
+                pointer_cap.powf(shape),
+                pointer_cap.powf(shape) * 100.0,
+            ))
+            .monospace()
+            .size(10.0)
+            .color(TEXT_MUTED),
+        );
+        ui.label(
+            RichText::new(format!(
+                "Scroll: LT {:.2}× ({:.0}%) · RT {:.2}× ({:.0}%)",
+                scroll_floor.powf(shape),
+                scroll_floor.powf(shape) * 100.0,
+                scroll_cap.powf(shape),
+                scroll_cap.powf(shape) * 100.0,
+            ))
+            .monospace()
+            .size(10.0)
+            .color(TEXT_MUTED),
+        );
+    }
+
     fn trigger_response(&mut self, ui: &mut Ui) {
         ui.label(
             RichText::new("Y = speed multiplier (1.0× = baseline). X = trigger pull.")
@@ -1549,26 +1824,52 @@ impl StudioApp {
             .size(10.0)
             .color(TEXT_DIM),
         );
+        self.trigger_presets(ui);
         ui.add_space(6.0);
+        let pointer_cap = get_path(&self.model, "gamepad.navi.pointer.accel.boost_cap")
+            .and_then(Value::as_f64)
+            .unwrap_or(2.5) as f32;
+        let scroll_cap = get_path(&self.model, "gamepad.navi.pointer.scroll_accel.boost_cap")
+            .and_then(Value::as_f64)
+            .unwrap_or(3.0) as f32;
+        let shared_y_max = (pointer_cap.max(scroll_cap) * 1.15).max(1.5);
         if ui.available_width() >= 620.0 {
             ui.columns(2, |cols| {
-                self.trigger_graph(&mut cols[0], "Pointer", "gamepad.navi.pointer.accel");
-                self.trigger_graph(&mut cols[1], "Scroll", "gamepad.navi.pointer.scroll_accel");
+                self.trigger_graph(
+                    &mut cols[0],
+                    "Pointer",
+                    "gamepad.navi.pointer.accel",
+                    shared_y_max,
+                );
+                self.trigger_graph(
+                    &mut cols[1],
+                    "Scroll",
+                    "gamepad.navi.pointer.scroll_accel",
+                    shared_y_max,
+                );
             });
         } else {
-            self.trigger_graph(ui, "Pointer", "gamepad.navi.pointer.accel");
+            self.trigger_graph(ui, "Pointer", "gamepad.navi.pointer.accel", shared_y_max);
             ui.add_space(6.0);
-            self.trigger_graph(ui, "Scroll", "gamepad.navi.pointer.scroll_accel");
+            self.trigger_graph(
+                ui,
+                "Scroll",
+                "gamepad.navi.pointer.scroll_accel",
+                shared_y_max,
+            );
         }
+        self.point_inspector(ui);
         ui.add_space(4.0);
         ui.label(
-            RichText::new("Drag the LT/RT endpoints and the deadzone/curve handles to edit the real settings.")
-                .size(9.5)
-                .color(TEXT_DIM),
+            RichText::new(
+                "Double-click the graph to add a point; drag points; right-click to delete.",
+            )
+            .size(9.5)
+            .color(TEXT_DIM),
         );
     }
 
-    fn trigger_graph(&mut self, ui: &mut Ui, title: &str, accel_path: &str) {
+    fn trigger_graph(&mut self, ui: &mut Ui, title: &str, accel_path: &str, y_max: f32) {
         let pointer = "gamepad.navi.pointer";
         let deadzone = get_path(&self.model, &format!("{pointer}.trigger_deadzone"))
             .and_then(Value::as_f64)
@@ -1578,6 +1879,7 @@ impl StudioApp {
             .and_then(Value::as_f64)
             .unwrap_or(1.35) as f32;
         let curve = curve.clamp(0.05, 5.0);
+        let points = self.trigger_points();
         let decel_floor = get_path(&self.model, &format!("{accel_path}.decel_floor"))
             .and_then(Value::as_f64)
             .unwrap_or(0.3) as f32;
@@ -1605,7 +1907,6 @@ impl StudioApp {
             Pos2::new(rect.min.x + 34.0, rect.min.y + 6.0),
             Pos2::new(rect.max.x - 8.0, rect.max.y - 20.0),
         );
-        let y_max = (boost_cap * 1.15).max(1.5);
         let to_pos = |pull: f32, multiplier: f32| {
             Pos2::new(
                 plot.min.x + pull.clamp(0.0, 1.0) * plot.width(),
@@ -1691,13 +1992,19 @@ impl StudioApp {
         let lt_points = (0..=64)
             .map(|index| {
                 let pull = index as f32 / 64.0;
-                to_pos(pull, decel_floor.powf(trigger_shape(pull, deadzone, curve)))
+                to_pos(
+                    pull,
+                    decel_floor.powf(trigger_shape(pull, deadzone, curve, &points)),
+                )
             })
             .collect::<Vec<_>>();
         let rt_points = (0..=64)
             .map(|index| {
                 let pull = index as f32 / 64.0;
-                to_pos(pull, boost_cap.powf(trigger_shape(pull, deadzone, curve)))
+                to_pos(
+                    pull,
+                    boost_cap.powf(trigger_shape(pull, deadzone, curve, &points)),
+                )
             })
             .collect::<Vec<_>>();
         painter.add(egui::Shape::line(lt_points, Stroke::new(2.0_f32, lt_color)));
@@ -1840,6 +2147,112 @@ impl StudioApp {
                 .on_hover_text("Initial trigger travel ignored");
         }
 
+        let plot_response = ui.interact(
+            plot,
+            ui.id().with((accel_path, "plot-points")),
+            Sense::click(),
+        );
+        if plot_response.double_clicked()
+            && points.len() < 5
+            && let Some(position) = plot_response.interact_pointer_pos()
+        {
+            let pull = ((position.x - plot.min.x) / plot.width()).clamp(deadzone + 0.10, 0.90);
+            if points.iter().all(|point| (point.pull - pull).abs() >= 0.10) {
+                let output = trigger_shape(pull, deadzone, curve, &points);
+                let mut next = points.clone();
+                next.push(CurvePoint { pull, output });
+                next.sort_by(|a, b| a.pull.total_cmp(&b.pull));
+                self.selected_point = next
+                    .iter()
+                    .position(|point| (point.pull - pull).abs() < 1e-6);
+                self.set_trigger_points(&next);
+            }
+        }
+
+        let mut next_points = points.clone();
+        let mut remove_point = None;
+        let mut select = None;
+        let mut move_point = false;
+        for (index, point) in points.iter().enumerate() {
+            let point_pos = to_pos(point.pull, point.output);
+            let response = ui.interact(
+                Rect::from_center_size(point_pos, Vec2::splat(15.0)),
+                ui.id().with((accel_path, "point", index)),
+                Sense::click_and_drag(),
+            );
+            let selected = self.selected_point == Some(index);
+            painter.circle_filled(
+                point_pos,
+                if selected { 5.5 } else { 4.0 },
+                if selected { Color32::WHITE } else { ACCENT },
+            );
+            painter.circle_stroke(
+                point_pos,
+                if selected { 7.5 } else { 6.0 },
+                Stroke::new(1.0_f32, ACCENT),
+            );
+            painter.text(
+                Pos2::new(point_pos.x + 8.0, point_pos.y - 4.0),
+                Align2::LEFT_BOTTOM,
+                format!("P{}", index + 1),
+                FontId::monospace(8.0),
+                TEXT_DIM,
+            );
+            if response.clicked() {
+                select = Some(index);
+            }
+            if response.secondary_clicked() {
+                remove_point = Some(index);
+            }
+            if response.dragged()
+                && let Some(position) = response.interact_pointer_pos()
+            {
+                let snap = if ui.input(|input| input.modifiers.alt) {
+                    0.001
+                } else {
+                    0.01
+                };
+                let mut pull =
+                    ((position.x - plot.min.x) / plot.width()).clamp(deadzone + 0.001, 0.999);
+                let mut output = ((plot.max.y - position.y) / plot.height()).clamp(0.0, 1.0);
+                pull = (pull / snap).round() * snap;
+                output = (output / snap).round() * snap;
+                let previous_pull = index
+                    .checked_sub(1)
+                    .map(|previous| points[previous].pull)
+                    .unwrap_or(deadzone);
+                let next_pull = points.get(index + 1).map(|next| next.pull).unwrap_or(1.0);
+                let previous_output = index
+                    .checked_sub(1)
+                    .map(|previous| points[previous].output)
+                    .unwrap_or(0.0);
+                let next_output = points.get(index + 1).map(|next| next.output).unwrap_or(1.0);
+                if next_pull - previous_pull >= 0.20 {
+                    next_points[index].pull = pull.clamp(previous_pull + 0.10, next_pull - 0.10);
+                }
+                next_points[index].output = output.clamp(previous_output, next_output);
+                move_point = true;
+            }
+            if response.hovered() {
+                response.on_hover_text(format!(
+                    "P{}: pull {:.0}% → shape {:.0}% (right-click to delete)",
+                    index + 1,
+                    point.pull * 100.0,
+                    point.output * 100.0
+                ));
+            }
+        }
+        if let Some(index) = select {
+            self.selected_point = Some(index);
+        }
+        if let Some(index) = remove_point {
+            next_points.remove(index);
+            self.set_trigger_points(&next_points);
+            self.selected_point = None;
+        } else if move_point {
+            self.set_trigger_points(&next_points);
+        }
+
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(format!(
@@ -1940,8 +2353,9 @@ impl StudioApp {
             );
         });
         ui.add_space(4.0);
-        let lt_shape = trigger_shape(self.sim_lt, deadzone, curve);
-        let rt_shape = trigger_shape(self.sim_rt, deadzone, curve);
+        let points = self.trigger_points();
+        let lt_shape = trigger_shape(self.sim_lt, deadzone, curve, &points);
+        let rt_shape = trigger_shape(self.sim_rt, deadzone, curve, &points);
         let pointer_multiplier = if pointer_enabled {
             trigger_multiplier(
                 pointer_floor,
@@ -1950,6 +2364,7 @@ impl StudioApp {
                 self.sim_rt,
                 deadzone,
                 curve,
+                &points,
             )
         } else {
             1.0
@@ -1962,6 +2377,7 @@ impl StudioApp {
                 self.sim_rt,
                 deadzone,
                 curve,
+                &points,
             )
         } else {
             1.0
@@ -3954,9 +4370,34 @@ fn resolve_length(value: Value, total: f32) -> f32 {
     }
 }
 
-fn trigger_shape(value: f32, deadzone: f32, curve: f32) -> f32 {
-    let value = ((value.clamp(0.0, 1.0) - deadzone) / (1.0 - deadzone).max(0.001)).clamp(0.0, 1.0);
-    value.powf(curve.max(0.05))
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CurvePoint {
+    pull: f32,
+    output: f32,
+}
+
+fn trigger_shape(value: f32, deadzone: f32, curve: f32, points: &[CurvePoint]) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    if value <= deadzone {
+        return 0.0;
+    }
+    if points.is_empty() {
+        let normalized = ((value - deadzone) / (1.0 - deadzone).max(0.001)).clamp(0.0, 1.0);
+        return normalized.powf(curve.max(0.05));
+    }
+    let mut previous_pull = deadzone;
+    let mut previous_output = 0.0_f32;
+    for point in points {
+        if value <= point.pull {
+            let span = (point.pull - previous_pull).max(0.001);
+            let t = ((value - previous_pull) / span).clamp(0.0, 1.0);
+            return previous_output + (point.output - previous_output) * t;
+        }
+        previous_pull = point.pull;
+        previous_output = point.output;
+    }
+    let span = (1.0 - previous_pull).max(0.001);
+    previous_output + (1.0 - previous_output) * ((value - previous_pull) / span).clamp(0.0, 1.0)
 }
 
 fn trigger_multiplier(
@@ -3966,9 +4407,10 @@ fn trigger_multiplier(
     rt: f32,
     deadzone: f32,
     curve: f32,
+    points: &[CurvePoint],
 ) -> f32 {
-    decel_floor.powf(trigger_shape(lt, deadzone, curve))
-        * boost_cap.powf(trigger_shape(rt, deadzone, curve))
+    decel_floor.powf(trigger_shape(lt, deadzone, curve, points))
+        * boost_cap.powf(trigger_shape(rt, deadzone, curve, points))
 }
 
 fn style_color(value: &str) -> Color32 {
@@ -4507,17 +4949,43 @@ unknown_gamepad_field = 7
 
     #[test]
     fn trigger_shape_matches_daemon_math() {
-        assert!(trigger_shape(0.0, 0.08, 1.0).abs() < 1e-6);
-        assert!(trigger_shape(0.08, 0.08, 1.0).abs() < 1e-6);
-        assert!((trigger_shape(1.0, 0.08, 1.0) - 1.0).abs() < 1e-6);
-        assert!((trigger_shape(0.5, 0.0, 1.0) - 0.5).abs() < 1e-6);
-        assert!(trigger_shape(0.5, 0.0, 2.0) < 0.5);
-        assert!((trigger_shape(0.5, 0.0, 0.0) - trigger_shape(0.5, 0.0, 0.05)).abs() < 1e-6);
+        assert!(trigger_shape(0.0, 0.08, 1.0, &[]).abs() < 1e-6);
+        assert!(trigger_shape(0.08, 0.08, 1.0, &[]).abs() < 1e-6);
+        assert!((trigger_shape(1.0, 0.08, 1.0, &[]) - 1.0).abs() < 1e-6);
+        assert!((trigger_shape(0.5, 0.0, 1.0, &[]) - 0.5).abs() < 1e-6);
+        assert!(trigger_shape(0.5, 0.0, 2.0, &[]) < 0.5);
+        assert!(
+            (trigger_shape(0.5, 0.0, 0.0, &[]) - trigger_shape(0.5, 0.0, 0.05, &[])).abs() < 1e-6
+        );
+    }
+
+    #[test]
+    fn trigger_points_interpolate_and_fall_back() {
+        let points = [
+            CurvePoint {
+                pull: 0.25,
+                output: 0.10,
+            },
+            CurvePoint {
+                pull: 0.50,
+                output: 0.30,
+            },
+            CurvePoint {
+                pull: 0.75,
+                output: 0.70,
+            },
+        ];
+        assert!((trigger_shape(0.08, 0.08, 1.0, &points) - 0.0).abs() < 1e-6);
+        assert!((trigger_shape(0.25, 0.08, 1.0, &points) - 0.10).abs() < 1e-6);
+        assert!((trigger_shape(0.50, 0.08, 1.0, &points) - 0.30).abs() < 1e-6);
+        assert!((trigger_shape(0.75, 0.08, 1.0, &points) - 0.70).abs() < 1e-6);
+        assert!((trigger_shape(1.0, 0.08, 1.0, &points) - 1.0).abs() < 1e-6);
+        assert!((trigger_shape(0.50, 0.08, 3.0, &[]) - (0.42_f32 / 0.92).powf(3.0)).abs() < 1e-6);
     }
 
     #[test]
     fn trigger_multiplier_matches_daemon_targets() {
-        let multiplier = |lt, rt| trigger_multiplier(0.3, 2.5, lt, rt, 0.08, 1.0);
+        let multiplier = |lt, rt| trigger_multiplier(0.3, 2.5, lt, rt, 0.08, 1.0, &[]);
         assert!((multiplier(0.0, 0.0) - 1.0).abs() < 1e-5);
         assert!((multiplier(1.0, 0.0) - 0.3).abs() < 1e-5);
         assert!((multiplier(0.0, 1.0) - 2.5).abs() < 1e-5);

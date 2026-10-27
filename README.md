@@ -38,9 +38,10 @@ exposed in `niri-xmb status`; the manual XMB keeps the existing
 
 In navi mode, analog triggers also shape pointer and scroll speed around the
 configured baseline: LT is a precision/deceleration control and RT is a boost.
-`trigger_deadzone`, `trigger_curve`, and the separate
-`[gamepad.navi.pointer.accel]` / `scroll_accel` floors, caps, and smoothing
-values control the response.
+`trigger_deadzone`, `trigger_curve`, optional bounded `trigger_points`, and the
+separate `[gamepad.navi.pointer.accel]` / `scroll_accel` floors, caps, and
+smoothing values control the response. Trigger points are piecewise-linear
+`{ pull, output }` pairs; empty points fall back to the power curve.
 
 `gamepad.open_combo` holds at least two unique buttons together on one
 controller to open the manual popup from hidden or peek in navi mode; it is
