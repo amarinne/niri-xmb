@@ -81,6 +81,14 @@ pub fn proc_cmdline(pid: u32) -> Option<String> {
     )
 }
 
+fn proc_executable_name(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()?
+        .file_name()?
+        .to_str()
+        .map(str::to_owned)
+}
+
 fn is_self(pid: u32) -> bool {
     pid == std::process::id()
 }
@@ -98,7 +106,17 @@ pub fn is_studio_process(pid: u32, expected_starttime: Option<u64>) -> bool {
         Some(cmdline) => cmdline,
         None => return false,
     };
-    if !cmdline.contains(PROCESS_NAME) {
+    // Inspect argv[0] (and the kernel's resolved executable) rather than the
+    // whole command line. A shell running `... niri-xmb-config-studio ...`
+    // must never be mistaken for the studio itself.
+    let argv0_name = cmdline
+        .split_whitespace()
+        .next()
+        .and_then(|arg| std::path::Path::new(arg).file_name())
+        .and_then(|name| name.to_str());
+    let executable = proc_executable_name(pid);
+    let executable_name = executable.as_deref();
+    if argv0_name != Some(PROCESS_NAME) && executable_name != Some(PROCESS_NAME) {
         return false;
     }
     match expected_starttime {
