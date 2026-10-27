@@ -634,6 +634,7 @@ struct LiveState {
     status: Value,
     snapshot: Value,
     error: String,
+    updated_at: Option<Instant>,
 }
 
 fn spawn_live(
@@ -670,6 +671,7 @@ fn spawn_live(
                     if let Some(status) = status {
                         state.status = status;
                         state.error.clear();
+                        state.updated_at = Some(Instant::now());
                     }
                     if let Some(snapshot) = snapshot {
                         state.snapshot = snapshot;
@@ -678,7 +680,10 @@ fn spawn_live(
                         state.error = "daemon status unavailable".to_string();
                     }
                 }
-                thread::sleep(Duration::from_millis(400));
+                // Analog telemetry is rendered by the trigger tuning panel.
+                // Keep this faster than the normal status cadence so reticles
+                // do not appear to jump between stale samples.
+                thread::sleep(Duration::from_millis(50));
             }
         })
         .expect("spawn live studio poller")
@@ -716,6 +721,10 @@ struct StudioApp {
     sim_rt: f32,
     sim_last_left: bool,
     sim_first_left: bool,
+    sim_override_live: bool,
+    display_pointer_multiplier: f32,
+    display_scroll_multiplier: f32,
+    display_multiplier_at: Instant,
     selected_point: Option<usize>,
     live: Arc<Mutex<LiveState>>,
     live_stop: Arc<AtomicBool>,
@@ -769,6 +778,10 @@ impl StudioApp {
             sim_rt: 0.0,
             sim_last_left: true,
             sim_first_left: true,
+            sim_override_live: false,
+            display_pointer_multiplier: 1.0,
+            display_scroll_multiplier: 1.0,
+            display_multiplier_at: Instant::now(),
             selected_point: None,
             live: Arc::new(Mutex::new(LiveState::default())),
             live_stop: Arc::new(AtomicBool::new(false)),
@@ -2989,7 +3002,22 @@ impl StudioApp {
     }
 
     fn pedal_simulation(&mut self, ui: &mut Ui) {
+        ui.ctx().request_repaint_after(Duration::from_millis(50));
         let pointer = "gamepad.navi.pointer";
+        let live_state = self
+            .live
+            .lock()
+            .map(|live| live.clone())
+            .unwrap_or_default();
+        let live_view = GamepadLiveView::from_status(&live_state.status);
+        let live_age_ms = live_state
+            .updated_at
+            .map(|at| at.elapsed().as_millis())
+            .unwrap_or(u128::MAX);
+        let live_active = !self.sim_override_live
+            && live_view.connected > 0
+            && !live_view.axes.is_empty()
+            && live_age_ms < 750;
         let deadzone = get_path(&self.model, &format!("{pointer}.trigger_deadzone"))
             .and_then(Value::as_f64)
             .unwrap_or(0.08) as f32;
@@ -3021,12 +3049,28 @@ impl StudioApp {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Simulated pull · offline")
-                    .size(10.0)
-                    .color(TEXT_DIM),
-            );
+        ui.horizontal_wrapped(|ui| {
+            let status = if live_active {
+                format!(
+                    "● LIVE · {} · {} ms ago",
+                    if live_view.device_name.is_empty() {
+                        "controller"
+                    } else {
+                        live_view.device_name.as_str()
+                    },
+                    live_age_ms
+                )
+            } else if live_view.connected > 0 && live_age_ms >= 750 {
+                "○ STALE · controller telemetry paused".to_string()
+            } else {
+                "○ OFFLINE SANDBOX · simulated input".to_string()
+            };
+            ui.label(RichText::new(status).size(10.0).color(if live_active {
+                OK
+            } else {
+                TEXT_DIM
+            }));
+            ui.checkbox(&mut self.sim_override_live, "Use simulated input");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("Reset").clicked() {
                     self.sim_lt = 0.0;
@@ -3037,24 +3081,58 @@ impl StudioApp {
             });
         });
         ui.add_space(4.0);
+        let (mut lt_input, mut rt_input) = if live_active {
+            (
+                live_view.trigger("ABS_Z", "BTN_TL2"),
+                live_view.trigger("ABS_RZ", "BTN_TR2"),
+            )
+        } else {
+            (self.sim_lt, self.sim_rt)
+        };
+        let points_for_display = self.trigger_points();
         let before_lt = self.sim_lt;
         let before_rt = self.sim_rt;
-        ui.columns(2, |cols| {
-            pedal_control(
-                &mut cols[0],
-                "LT brake (decel)",
-                &mut self.sim_lt,
-                WARN,
-                deadzone,
-            );
-            pedal_control(
-                &mut cols[1],
-                "RT gas (accel)",
-                &mut self.sim_rt,
-                OK,
-                deadzone,
-            );
-        });
+        if live_active {
+            ui.columns(2, |cols| {
+                live_pedal_meter(
+                    &mut cols[0],
+                    "LT brake",
+                    lt_input,
+                    deadzone,
+                    curve,
+                    &points_for_display,
+                    WARN,
+                );
+                live_pedal_meter(
+                    &mut cols[1],
+                    "RT gas",
+                    rt_input,
+                    deadzone,
+                    curve,
+                    &points_for_display,
+                    OK,
+                );
+            });
+        } else {
+            ui.columns(2, |cols| {
+                pedal_control(
+                    &mut cols[0],
+                    "LT brake (decel)",
+                    &mut self.sim_lt,
+                    WARN,
+                    deadzone,
+                );
+                pedal_control(
+                    &mut cols[1],
+                    "RT gas (accel)",
+                    &mut self.sim_rt,
+                    OK,
+                    deadzone,
+                );
+            });
+            lt_input = self.sim_lt;
+            rt_input = self.sim_rt;
+        }
         if (self.sim_lt - before_lt).abs() > 1e-6 {
             self.sim_last_left = true;
         }
@@ -3063,8 +3141,8 @@ impl StudioApp {
         }
         let before_lt_active = before_lt > deadzone;
         let before_rt_active = before_rt > deadzone;
-        let lt_active = self.sim_lt > deadzone;
-        let rt_active = self.sim_rt > deadzone;
+        let lt_active = lt_input > deadzone;
+        let rt_active = rt_input > deadzone;
         if !before_lt_active && lt_active && !before_rt_active {
             self.sim_first_left = true;
         }
@@ -3088,17 +3166,17 @@ impl StudioApp {
             (false, false) => None,
         };
         let side_inputs = |left: Option<bool>| match left {
-            Some(true) => (self.sim_lt, 0.0),
-            Some(false) => (0.0, self.sim_rt),
+            Some(true) => (lt_input, 0.0),
+            Some(false) => (0.0, rt_input),
             None => (0.0, 0.0),
         };
         let (effective_lt, effective_rt) = match socd {
             "last" => side_inputs(pick(self.sim_last_left)),
             "first" => side_inputs(pick(self.sim_first_left)),
             "cancel" if lt_active && rt_active => (0.0, 0.0),
-            "prio_decel" if lt_active => (self.sim_lt, 0.0),
-            "prio_accel" if rt_active => (0.0, self.sim_rt),
-            _ => (self.sim_lt, self.sim_rt),
+            "prio_decel" if lt_active => (lt_input, 0.0),
+            "prio_accel" if rt_active => (0.0, rt_input),
+            _ => (lt_input, rt_input),
         };
         let points = self.trigger_points();
         let lt_shape = trigger_shape(effective_lt, deadzone, curve, &points);
@@ -3129,15 +3207,99 @@ impl StudioApp {
         } else {
             1.0
         };
+        let now = Instant::now();
+        let dt = now
+            .duration_since(self.display_multiplier_at)
+            .as_secs_f32()
+            .min(0.25);
+        self.display_multiplier_at = now;
+        self.display_pointer_multiplier = smooth_display_multiplier(
+            self.display_pointer_multiplier,
+            pointer_multiplier,
+            get_path(&self.model, &format!("{pointer}.accel.smoothing_ms"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0) as f32,
+            dt,
+        );
+        self.display_scroll_multiplier = smooth_display_multiplier(
+            self.display_scroll_multiplier,
+            scroll_multiplier,
+            get_path(&self.model, &format!("{pointer}.scroll_accel.smoothing_ms"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0) as f32,
+            dt,
+        );
+        let (pointer_stick, scroll_stick) = (
+            live_view.stick(
+                get_path(&self.model, &format!("{pointer}.stick"))
+                    .and_then(Value::as_str)
+                    .map(|stick| stick == "left")
+                    .unwrap_or(true),
+            ),
+            live_view.stick(
+                get_path(&self.model, &format!("{pointer}.scroll_stick"))
+                    .and_then(Value::as_str)
+                    .map(|stick| stick == "left")
+                    .unwrap_or(false),
+            ),
+        );
+        let stick_deadzone = get_path(&self.model, &format!("{pointer}.deadzone"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.15) as f32;
+        let stick_curve = get_path(&self.model, &format!("{pointer}.curve"))
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0) as f32;
+        live_stick_summary(
+            ui,
+            "Pointer stick",
+            pointer_stick,
+            stick_deadzone,
+            stick_curve,
+            get_path(&self.model, &format!("{pointer}.speed"))
+                .and_then(Value::as_f64)
+                .unwrap_or(900.0) as f32,
+            "px/s",
+            self.display_pointer_multiplier,
+            false,
+            live_active,
+        );
+        live_stick_summary(
+            ui,
+            "Scroll stick",
+            scroll_stick,
+            get_path(&self.model, &format!("{pointer}.scroll_deadzone"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.2) as f32,
+            1.0,
+            get_path(&self.model, &format!("{pointer}.scroll_speed"))
+                .and_then(Value::as_f64)
+                .unwrap_or(12.0) as f32,
+            "steps/s",
+            self.display_scroll_multiplier,
+            true,
+            live_active,
+        );
         ui.label(
             RichText::new(format!(
-                "Target speed vs baseline (no smoothing · speed {socd})"
+                "Target vs actual speed · {socd} · smoothing included"
             ))
             .size(9.5)
             .color(TEXT_DIM),
         );
-        multiplier_row(ui, "Pointer", pointer_multiplier, pointer_enabled);
-        multiplier_row(ui, "Scroll", scroll_multiplier, scroll_enabled);
+        multiplier_pair_row(
+            ui,
+            "Pointer",
+            pointer_multiplier,
+            self.display_pointer_multiplier,
+            pointer_enabled,
+        );
+        multiplier_pair_row(
+            ui,
+            "Scroll",
+            scroll_multiplier,
+            self.display_scroll_multiplier,
+            scroll_enabled,
+        );
         ui.label(
             RichText::new(format!(
                 "After deadzone/curve: LT {:.0}% · RT {:.0}%",
@@ -3156,7 +3318,7 @@ impl StudioApp {
         self.f32_field(
             ui,
             &format!("{base}.decel_floor"),
-            "Full brake ×",
+            "Brake floor (min ×)",
             0.01,
             1.0,
             0.01,
@@ -3164,7 +3326,7 @@ impl StudioApp {
         self.f32_field(
             ui,
             &format!("{base}.boost_cap"),
-            "Full gas ×",
+            "Gas boost (max ×)",
             1.0,
             10.0,
             0.05,
@@ -3172,7 +3334,7 @@ impl StudioApp {
         self.f32_field(
             ui,
             &format!("{base}.smoothing_ms"),
-            "Smoothing ms",
+            "Speed smoothing (ms)",
             0.0,
             500.0,
             1.0,
@@ -3183,12 +3345,12 @@ impl StudioApp {
         let pointer = "gamepad.navi.pointer";
         if ui.available_width() >= 660.0 {
             ui.columns(3, |cols| {
-                mini_heading(&mut cols[0], "Trigger");
+                mini_heading(&mut cols[0], "Response shape & trigger conflict");
                 self.trigger_deadzone_field(&mut cols[0]);
                 self.f32_field(
                     &mut cols[0],
                     &format!("{pointer}.trigger_curve"),
-                    "Shape curve",
+                    "Response curve",
                     0.05,
                     5.0,
                     0.05,
@@ -3196,7 +3358,7 @@ impl StudioApp {
                 self.combo_field(
                     &mut cols[0],
                     &format!("{pointer}.speed_socd"),
-                    "Speed SOCD",
+                    "When LT + RT are held",
                     &[
                         "last",
                         "first",
@@ -3209,7 +3371,7 @@ impl StudioApp {
                 self.f32_field(
                     &mut cols[0],
                     &format!("{pointer}.trigger_threshold"),
-                    "Layer threshold",
+                    "Layer shift threshold (not speed)",
                     0.0,
                     1.0,
                     0.01,
@@ -3217,21 +3379,21 @@ impl StudioApp {
                 self.accel_settings_group(
                     &mut cols[1],
                     &format!("{pointer}.accel"),
-                    "Pointer accel",
+                    "Pointer speed range",
                 );
                 self.accel_settings_group(
                     &mut cols[2],
                     &format!("{pointer}.scroll_accel"),
-                    "Scroll accel",
+                    "Scroll speed range",
                 );
             });
         } else {
-            mini_heading(ui, "Trigger");
+            mini_heading(ui, "Response shape & trigger conflict");
             self.trigger_deadzone_field(ui);
             self.f32_field(
                 ui,
                 &format!("{pointer}.trigger_curve"),
-                "Shape curve",
+                "Response curve",
                 0.05,
                 5.0,
                 0.05,
@@ -3239,7 +3401,7 @@ impl StudioApp {
             self.combo_field(
                 ui,
                 &format!("{pointer}.speed_socd"),
-                "Speed SOCD",
+                "When LT + RT are held",
                 &[
                     "last",
                     "first",
@@ -3252,15 +3414,15 @@ impl StudioApp {
             self.f32_field(
                 ui,
                 &format!("{pointer}.trigger_threshold"),
-                "Layer threshold",
+                "Layer shift threshold (not speed)",
                 0.0,
                 1.0,
                 0.01,
             );
             ui.add_space(4.0);
-            self.accel_settings_group(ui, &format!("{pointer}.accel"), "Pointer accel");
+            self.accel_settings_group(ui, &format!("{pointer}.accel"), "Pointer speed range");
             ui.add_space(4.0);
-            self.accel_settings_group(ui, &format!("{pointer}.scroll_accel"), "Scroll accel");
+            self.accel_settings_group(ui, &format!("{pointer}.scroll_accel"), "Scroll speed range");
         }
     }
 
@@ -3929,13 +4091,23 @@ impl StudioApp {
             .unwrap_or("")
             .to_string();
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            let changed = ui
+            let mut changed = ui
                 .add(
                     egui::TextEdit::singleline(&mut value)
                         .desired_width(input_width(ui).min(150.0)),
                 )
                 .changed();
-            ui.label(RichText::new("■").color(parse_color(&value)));
+            // Interactive swatch: picking a colour writes it back as hex,
+            // typing hex updates the swatch on the next frame.
+            let mut swatch = style_color(&value);
+            if ui
+                .color_edit_button_srgba(&mut swatch)
+                .on_hover_text("Pick a colour")
+                .changed()
+            {
+                value = color_to_hex(swatch);
+                changed = true;
+            }
             changed
         });
         if changed {
@@ -4607,11 +4779,26 @@ impl StudioApp {
 struct GamepadLiveView {
     buttons: BTreeSet<String>,
     axes: BTreeMap<String, f32>,
+    connected: usize,
+    device_name: String,
 }
 
 impl GamepadLiveView {
     fn from_status(status: &Value) -> Self {
-        let mut view = Self::default();
+        let connected = status["gamepad"]["connected"]
+            .as_array()
+            .map_or(0, Vec::len);
+        let device_name = status["gamepad"]["connected"]
+            .as_array()
+            .and_then(|devices| devices.first())
+            .and_then(|device| device["name"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut view = Self {
+            connected,
+            device_name,
+            ..Self::default()
+        };
         for device in status["gamepad"]["live"].as_array().into_iter().flatten() {
             for button in device["buttons"].as_array().into_iter().flatten() {
                 if let Some(button) = button.as_str() {
@@ -4635,6 +4822,14 @@ impl GamepadLiveView {
 
     fn dn_axis(&self, axis: &str) -> f32 {
         self.axes.get(axis).copied().unwrap_or(0.0)
+    }
+
+    fn stick(&self, left: bool) -> (f32, f32) {
+        if left {
+            (self.dn_axis("ABS_X"), self.dn_axis("ABS_Y"))
+        } else {
+            (self.dn_axis("ABS_RX"), self.dn_axis("ABS_RY"))
+        }
     }
 
     fn hat(&self, axis: &str, positive: bool) -> bool {
@@ -5632,6 +5827,10 @@ fn load_texture(ctx: &egui::Context, template: Template) -> Option<TextureHandle
 
 /// Field row whose label and hover text come from the i18n catalog by
 /// config path (see `i18n.rs`); `label` is only the fallback.
+///
+/// Labels are right-aligned in a fixed-width box so the inputs of
+/// consecutive rows start at the same x position. (`Ui::add_sized` centers
+/// its content, which leaves both label edges ragged.)
 fn field_row_path(
     ui: &mut Ui,
     path: Option<&str>,
@@ -5641,12 +5840,7 @@ fn field_row_path(
     let label = path.map_or(label, |path| i18n::label_for_path(path, label));
     let label_width = (ui.available_width() * 0.42).clamp(110.0, 190.0);
     ui.horizontal(|ui| {
-        let label_response = ui.add_sized(
-            Vec2::new(label_width, 22.0),
-            egui::Label::new(RichText::new(label).size(12.0).color(TEXT_MUTED))
-                .truncate()
-                .sense(Sense::hover()),
-        );
+        let label_response = right_label(ui, label_width, label);
         if let Some(hover) = i18n::hover_for(path, label) {
             label_response.on_hover_text(hover);
         }
@@ -5665,15 +5859,28 @@ fn tt(response: egui::Response, key: &str) -> egui::Response {
 
 fn field_label(ui: &mut Ui, label: &str) {
     let width = (ui.available_width() * 0.34).clamp(110.0, 180.0);
-    let response = ui.add_sized(
-        Vec2::new(width, 22.0),
-        egui::Label::new(RichText::new(label).size(12.0).color(TEXT_MUTED))
-            .truncate()
-            .sense(Sense::hover()),
-    );
+    let response = right_label(ui, width, label);
     if let Some(hover) = i18n::hover_for(None, label) {
         response.on_hover_text(hover);
     }
+}
+
+/// Form label with its right edge flush against the input that follows.
+///
+/// Reserves a fixed-width box (so every input in a column starts at the same
+/// x) and paints the text right-aligned inside it. A `Label` widget cannot do
+/// this: `Ui::add_sized` centers its content, and a shrink-to-text galley in
+/// a `top_down(Align::RIGHT)` box still lands on the left.
+fn right_label(ui: &mut Ui, width: f32, label: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::hover());
+    ui.painter().text(
+        rect.right_center(),
+        Align2::RIGHT_CENTER,
+        label,
+        FontId::proportional(12.0),
+        TEXT_MUTED,
+    );
+    response
 }
 
 fn input_width(ui: &Ui) -> f32 {
@@ -5769,7 +5976,7 @@ fn paint_handle(painter: &egui::Painter, center: Pos2, color: Color32, active: b
     );
 }
 
-fn multiplier_row(ui: &mut Ui, label: &str, value: f32, enabled: bool) {
+fn multiplier_pair_row(ui: &mut Ui, label: &str, target: f32, actual: f32, enabled: bool) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(format!("{label} speed"))
@@ -5778,14 +5985,170 @@ fn multiplier_row(ui: &mut Ui, label: &str, value: f32, enabled: bool) {
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
-                RichText::new(format!("{value:.2}× baseline"))
+                RichText::new(format!("actual {actual:.2}× · target {target:.2}×"))
                     .monospace()
-                    .size(13.0)
+                    .size(12.0)
                     .color(if enabled { TEXT } else { TEXT_DIM }),
             );
             if !enabled {
                 ui.label(RichText::new("off").size(10.0).color(WARN));
             }
+        });
+    });
+}
+
+fn smooth_display_multiplier(previous: f32, target: f32, smoothing_ms: f32, dt: f32) -> f32 {
+    if smoothing_ms <= 0.0 || dt <= 0.0 {
+        target
+    } else {
+        let tau = smoothing_ms / 1000.0;
+        let alpha = 1.0 - (-dt / tau).exp();
+        previous + (target - previous) * alpha
+    }
+}
+
+fn live_pedal_meter(
+    ui: &mut Ui,
+    label: &str,
+    raw: f32,
+    deadzone: f32,
+    curve: f32,
+    points: &[CurvePoint],
+    color: Color32,
+) {
+    let shaped = trigger_shape(raw, deadzone, curve, points);
+    ui.vertical(|ui| {
+        ui.label(RichText::new(label).size(11.0).color(TEXT));
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 4.0, FIELD_BG);
+        painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, BORDER), StrokeKind::Inside);
+        let raw_rect = Rect::from_min_max(
+            rect.min,
+            Pos2::new(rect.min.x + rect.width() * raw, rect.max.y),
+        );
+        painter.rect_filled(raw_rect, 4.0, color.gamma_multiply(0.25));
+        let shaped_rect = Rect::from_min_max(
+            rect.min,
+            Pos2::new(rect.min.x + rect.width() * shaped, rect.max.y),
+        );
+        painter.rect_filled(shaped_rect, 4.0, color);
+        let dz_x = rect.min.x + rect.width() * deadzone;
+        painter.line_segment(
+            [
+                Pos2::new(dz_x, rect.min.y - 3.0),
+                Pos2::new(dz_x, rect.max.y + 3.0),
+            ],
+            Stroke::new(1.0_f32, TEXT_MUTED),
+        );
+        ui.label(
+            RichText::new(format!(
+                "raw {:.0}%  →  shaped {:.0}%  · deadzone {:.0}%",
+                raw * 100.0,
+                shaped * 100.0,
+                deadzone * 100.0
+            ))
+            .monospace()
+            .size(9.0)
+            .color(TEXT_DIM),
+        );
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn live_stick_summary(
+    ui: &mut Ui,
+    label: &str,
+    coordinate: (f32, f32),
+    deadzone: f32,
+    curve: f32,
+    speed: f32,
+    units: &str,
+    multiplier: f32,
+    scroll_axis: bool,
+    live: bool,
+) {
+    let (x, y) = coordinate;
+    let magnitude = (x * x + y * y).sqrt().min(1.0);
+    let (effective_x, effective_y) = if !live {
+        (0.0, 0.0)
+    } else if scroll_axis {
+        let value = y.abs();
+        (
+            x,
+            if value <= deadzone {
+                0.0
+            } else {
+                y.signum() * ((value - deadzone) / (1.0 - deadzone).max(0.001))
+            },
+        )
+    } else if magnitude <= deadzone {
+        (0.0, 0.0)
+    } else {
+        let scaled = ((magnitude - deadzone) / (1.0 - deadzone).max(0.001)).min(1.0);
+        (x / magnitude * scaled, y / magnitude * scaled)
+    };
+    let shaped_x = effective_x.signum() * effective_x.abs().powf(curve.max(0.05));
+    let shaped_y = effective_y.signum() * effective_y.abs().powf(curve.max(0.05));
+    let base_speed = if scroll_axis {
+        shaped_y.abs() * speed
+    } else {
+        (shaped_x * shaped_x + shaped_y * shaped_y).sqrt() * speed
+    };
+    let effective_speed = base_speed * multiplier;
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(86.0), Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 5.0, FIELD_BG);
+        painter.rect_stroke(rect, 5.0, Stroke::new(1.0_f32, BORDER), StrokeKind::Inside);
+        let center = rect.center();
+        let radius = rect.width().min(rect.height()) * 0.36;
+        painter.circle_stroke(center, radius, Stroke::new(1.0_f32, TEXT_DIM));
+        painter.circle_stroke(center, radius * deadzone, Stroke::new(1.0_f32, BORDER));
+        painter.line_segment(
+            [
+                Pos2::new(center.x - radius, center.y),
+                Pos2::new(center.x + radius, center.y),
+            ],
+            Stroke::new(1.0_f32, BORDER),
+        );
+        painter.line_segment(
+            [
+                Pos2::new(center.x, center.y - radius),
+                Pos2::new(center.x, center.y + radius),
+            ],
+            Stroke::new(1.0_f32, BORDER),
+        );
+        let point = Pos2::new(
+            center.x + effective_x * radius,
+            center.y + effective_y * radius,
+        );
+        painter.line_segment([center, point], Stroke::new(1.5_f32, ACCENT));
+        painter.circle_filled(point, 4.0, if live { ACCENT } else { TEXT_DIM });
+        ui.vertical(|ui| {
+            ui.label(RichText::new(label).size(11.0).color(TEXT));
+            ui.label(
+                RichText::new(if live {
+                    format!("x {x:+.2}  y {y:+.2}")
+                } else {
+                    "no live signal".to_string()
+                })
+                .monospace()
+                .size(9.0)
+                .color(TEXT_MUTED),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "magnitude {:.0}% · base {:.1} · output {:.1} {units}",
+                    magnitude * 100.0,
+                    base_speed,
+                    effective_speed,
+                ))
+                .monospace()
+                .size(9.0)
+                .color(TEXT_DIM),
+            );
         });
     });
 }
@@ -6151,8 +6514,13 @@ fn style_color(value: &str) -> Color32 {
     }
 }
 
-fn parse_color(value: &str) -> Color32 {
-    style_color(value)
+/// Serialise a picked colour back to the daemon's `#AARRGGBB` hex syntax
+/// (alpha first), matching `StyleColor`'s display format. Un-premultiplies
+/// first: `Color32` stores premultiplied channels, so writing the raw values
+/// would darken every translucent colour on each picker edit.
+fn color_to_hex(color: Color32) -> String {
+    let [r, g, b, a] = color.to_srgba_unmultiplied();
+    format!("#{a:02X}{r:02X}{g:02X}{b:02X}")
 }
 
 fn main() -> Result<()> {
@@ -6566,6 +6934,33 @@ mod tests {
     }
 
     #[test]
+    fn live_gamepad_view_exposes_both_stick_coordinates_and_device_state() {
+        let status = json!({
+            "gamepad": {
+                "connected": [{"name": "Test Pad"}],
+                "live": [{"axes": {
+                    "ABS_X": 0.25, "ABS_Y": -0.5,
+                    "ABS_RX": -0.75, "ABS_RY": 0.4
+                }}]
+            }
+        });
+        let view = GamepadLiveView::from_status(&status);
+        assert_eq!(view.connected, 1);
+        assert_eq!(view.device_name, "Test Pad");
+        assert_eq!(view.stick(true), (0.25, -0.5));
+        assert_eq!(view.stick(false), (-0.75, 0.4));
+    }
+
+    #[test]
+    fn display_multiplier_smoothing_is_instant_or_exponential() {
+        assert_eq!(smooth_display_multiplier(1.0, 2.5, 0.0, 0.01), 2.5);
+        let first = smooth_display_multiplier(1.0, 2.5, 100.0, 0.1);
+        assert!((first - 1.94818).abs() < 1e-4);
+        let settled = smooth_display_multiplier(first, 2.5, 100.0, 1.0);
+        assert!((settled - 2.49993).abs() < 1e-4);
+    }
+
+    #[test]
     fn patch_only_changes_edited_leaves_and_binding_entries() {
         let before = json!({
             "popup": {"width": 920, "height": 250},
@@ -6603,6 +6998,111 @@ mod tests {
             patch.set["gamepad.navi.layers.workspace"],
             after["gamepad"]["navi"]["layers"]["workspace"]
         );
+    }
+
+    #[test]
+    fn color_hex_round_trips_through_picker_format() {
+        // Opaque `#RRGGBB` parses to full alpha and writes back explicitly.
+        assert_eq!(color_to_hex(style_color("#E9E1E0")), "#FFE9E1E0");
+        // Translucent `#AARRGGBB` survives a picker edit within one step per
+        // channel (`Color32` stores premultiplied values) and is stable:
+        // a second edit changes nothing further.
+        for hex in ["#B8221D1D", "#FFDEBFC2", "#36000000"] {
+            let once = color_to_hex(style_color(hex));
+            let twice = color_to_hex(style_color(&once));
+            assert_eq!(once, twice, "picker edit should be stable for {hex}");
+            for (got, expected) in
+                once.chars()
+                    .skip(1)
+                    .zip(hex.chars().skip(1))
+                    .map(|(got, expected)| {
+                        (
+                            u8::from_str_radix(&got.to_string(), 16).unwrap() as i16,
+                            u8::from_str_radix(&expected.to_string(), 16).unwrap() as i16,
+                        )
+                    })
+            {
+                assert!(
+                    (got - expected).abs() <= 1,
+                    "picker edit of {hex} drifted to {once}"
+                );
+            }
+        }
+        // Invalid input never panics; it previews as transparent.
+        assert_eq!(style_color("not a colour"), Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn field_row_labels_share_a_right_edge_per_column() {
+        // Regression test for the Colors card: labels used to be centered in
+        // their fixed-width box (`Ui::add_sized` centers its content), leaving
+        // both edges ragged. They must be right-aligned so every input starts
+        // at the same x. Runs headless on the embedded font; no display needed.
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(1440.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        // Same two-column split as `style_fields`.
+        let left = COLOR_FIELDS.len().div_ceil(2);
+        let output = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.columns(2, |cols| {
+                    for (index, (path, label)) in COLOR_FIELDS.iter().copied().enumerate() {
+                        let column = usize::from(index >= left);
+                        field_row_path(&mut cols[column], Some(path), label, |ui| {
+                            ui.label("x");
+                            true
+                        });
+                    }
+                });
+            });
+        });
+        let wanted: Vec<String> = COLOR_FIELDS
+            .iter()
+            .map(|(path, label)| i18n::label_for_path(path, label).to_string())
+            .collect();
+        let mut edges: [Vec<(f32, f32)>; 2] = [Vec::new(), Vec::new()];
+        for shape in &output.shapes {
+            if let egui::epaint::Shape::Text(text) = &shape.shape
+                && let Some(index) = wanted
+                    .iter()
+                    .position(|want| want.as_str() == text.galley.text())
+            {
+                let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                edges[usize::from(index >= left)].push((rect.left(), rect.right()));
+            }
+        }
+        let spread = |xs: &[f32]| {
+            xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+                - xs.iter().cloned().fold(f32::INFINITY, f32::min)
+        };
+        for (column, group) in edges.iter().enumerate() {
+            let expected = if column == 0 {
+                left
+            } else {
+                COLOR_FIELDS.len() - left
+            };
+            assert_eq!(
+                group.len(),
+                expected,
+                "column {column} should render {expected} labels"
+            );
+            let rights: Vec<f32> = group.iter().map(|&(_, right)| right).collect();
+            let lefts: Vec<f32> = group.iter().map(|&(left, _)| left).collect();
+            assert!(
+                spread(&rights) <= 1.5,
+                "column {column} label right edges differ by {:.1}px: {rights:?}",
+                spread(&rights)
+            );
+            assert!(
+                spread(&lefts) > 20.0,
+                "column {column} labels look left-aligned or degenerate: {lefts:?}"
+            );
+        }
     }
 
     #[test]
