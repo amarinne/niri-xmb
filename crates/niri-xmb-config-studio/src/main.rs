@@ -1350,7 +1350,9 @@ impl StudioApp {
             sim_last_left: true,
             sim_first_left: true,
             sim_override_live: false,
-            controller_telemetry_expanded: true,
+            // Keep the high-volume diagnostic readout out of the way until
+            // the user explicitly opens it from the chevron header.
+            controller_telemetry_expanded: false,
             display_pointer_multiplier: 1.0,
             display_scroll_multiplier: 1.0,
             display_multiplier_at: Instant::now(),
