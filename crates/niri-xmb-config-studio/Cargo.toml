@@ -16,3 +16,6 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 serde_json = { workspace = true }
 sha2 = "0.10"
 toml_edit = "0.22"
+
+[dev-dependencies]
+evdev = "0.13.2"

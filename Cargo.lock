@@ -1544,6 +1544,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "eframe",
+ "evdev",
  "image",
  "serde_json",
  "sha2",
