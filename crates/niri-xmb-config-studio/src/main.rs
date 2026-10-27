@@ -11,6 +11,7 @@
 
 mod i18n;
 mod keymap;
+mod single_instance;
 mod validation;
 
 use anyhow::{Context, Result};
@@ -5914,17 +5915,45 @@ fn stick_reticle(ui: &mut Ui, title: &str, x_label: &str, x: f32, y_label: &str,
     });
 }
 
-fn axes_list(ui: &mut Ui, view: &GamepadLiveView) {
-    if view.axes.is_empty() {
-        ui.label(
-            RichText::new("no axis input yet")
-                .size(10.0)
-                .color(TEXT_DIM),
-        );
-        return;
+/// Axes shown in the telemetry panel in stable order.
+///
+/// Xbox/evdev controllers expose sticks on `ABS_X/Y` + `ABS_RX/RY`, analog
+/// triggers on `ABS_Z/RZ`, and the D-pad hat on `ABS_HAT0X/Y`. Missing entries
+/// read as neutral `0.0` so an idle-but-connected controller still shows its
+/// full control set instead of hiding; any extra axes from other hardware
+/// append after, sorted.
+const EXPECTED_AXES: &[&str] = &[
+    "ABS_X",
+    "ABS_Y",
+    "ABS_RX",
+    "ABS_RY",
+    "ABS_Z",
+    "ABS_RZ",
+    "ABS_HAT0X",
+    "ABS_HAT0Y",
+];
+
+fn telemetry_display_axes(view: &GamepadLiveView) -> Vec<(String, f32)> {
+    let mut rows = Vec::with_capacity(EXPECTED_AXES.len() + view.axes.len());
+    for axis in EXPECTED_AXES {
+        rows.push((
+            axis.to_string(),
+            view.axes.get(*axis).copied().unwrap_or(0.0),
+        ));
     }
-    for (axis, value) in &view.axes {
-        let value = *value;
+    let mut extra: Vec<(String, f32)> = view
+        .axes
+        .iter()
+        .filter(|(axis, _)| !EXPECTED_AXES.contains(&axis.as_str()))
+        .map(|(axis, value)| (axis.clone(), *value))
+        .collect();
+    extra.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.extend(extra);
+    rows
+}
+
+fn axes_list(ui: &mut Ui, view: &GamepadLiveView) {
+    for (axis, value) in telemetry_display_axes(view) {
         let trigger = matches!(axis.as_str(), "ABS_Z" | "ABS_RZ");
         ui.horizontal(|ui| {
             ui.label(RichText::new(axis).monospace().size(9.0).color(TEXT_DIM));
@@ -7070,6 +7099,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let (config, niri_xmb) = parse_args()?;
+    // Single instance with takeover: a new launch terminates the old studio
+    // and becomes active, so duplicate windows and orphaned subscribe streams
+    // cannot accumulate. The guard holds the flock until process exit.
+    let _instance = single_instance::acquire_single_instance()?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("niri-xmb-config-studio")
@@ -7647,6 +7680,93 @@ mod tests {
         assert_eq!((view.vendor, view.product), (0x054c, 0x05c4));
         assert_eq!(view.stick(true), (0.25, -0.5));
         assert_eq!(view.stick(false), (-0.75, 0.4));
+    }
+
+    #[test]
+    fn telemetry_display_axes_shows_neutral_xbox_controls_when_idle() {
+        // Idle-but-connected Xbox/evdev controller: no live axes yet, but the
+        // panel must still show neutral sticks, triggers, and hat.
+        let status = json!({
+            "gamepad": {
+                "connected": [{
+                    "name": "Xbox Wireless Controller",
+                    "path": "/dev/input/by-id/usb-Microsoft_Xbox-event-joystick",
+                    "preset": "xbox",
+                    "vendor": 0x045e,
+                    "product": 0x02fd
+                }],
+                "live": [{
+                    "path": "/dev/input/by-id/usb-Microsoft_Xbox-event-joystick",
+                    "buttons": [],
+                    "axes": {}
+                }]
+            }
+        });
+        let view = GamepadLiveView::from_status(&status);
+        assert_eq!(view.connected, 1);
+        assert_eq!(view.stick(true), (0.0, 0.0));
+        assert_eq!(view.stick(false), (0.0, 0.0));
+        assert_eq!(view.trigger("ABS_Z", "BTN_TL2"), 0.0);
+        assert_eq!(view.trigger("ABS_RZ", "BTN_TR2"), 0.0);
+        let rows = telemetry_display_axes(&view);
+        for axis in [
+            "ABS_X",
+            "ABS_Y",
+            "ABS_RX",
+            "ABS_RY",
+            "ABS_Z",
+            "ABS_RZ",
+            "ABS_HAT0X",
+            "ABS_HAT0Y",
+        ] {
+            let value = rows
+                .iter()
+                .find(|(name, _)| name == axis)
+                .map(|(_, value)| *value)
+                .expect("expected axis row stays visible at neutral");
+            assert_eq!(value, 0.0, "{axis} neutral must read 0.0");
+        }
+    }
+
+    #[test]
+    fn telemetry_display_axes_shows_live_xbox_sticks_triggers_and_buttons() {
+        // Non-neutral Xbox/evdev frame: both sticks, both triggers, one button.
+        let status = json!({
+            "gamepad": {
+                "connected": [{
+                    "name": "Xbox Wireless Controller",
+                    "path": "/dev/input/by-id/usb-Microsoft_Xbox-event-joystick",
+                    "preset": "xbox",
+                    "vendor": 0x045e,
+                    "product": 0x02fd
+                }],
+                "live": [{
+                    "path": "/dev/input/by-id/usb-Microsoft_Xbox-event-joystick",
+                    "buttons": ["BTN_SOUTH"],
+                    "axes": {
+                        "ABS_X": 0.5, "ABS_Y": -0.25,
+                        "ABS_RX": -0.75, "ABS_RY": 0.4,
+                        "ABS_Z": 0.8, "ABS_RZ": 0.0,
+                        "ABS_HAT0X": 1.0, "ABS_HAT0Y": 0.0
+                    }
+                }]
+            }
+        });
+        let view = GamepadLiveView::from_status(&status);
+        assert!(view.button("BTN_SOUTH"));
+        assert_eq!(view.stick(true), (0.5, -0.25));
+        assert_eq!(view.stick(false), (-0.75, 0.4));
+        assert_eq!(view.trigger("ABS_Z", "BTN_TL2"), 0.8);
+        assert_eq!(view.trigger("ABS_RZ", "BTN_TR2"), 0.0);
+        assert!(view.dpad("right"));
+        let rows: std::collections::HashMap<_, _> =
+            telemetry_display_axes(&view).into_iter().collect();
+        assert_eq!(rows["ABS_X"], 0.5);
+        assert_eq!(rows["ABS_Y"], -0.25);
+        assert_eq!(rows["ABS_RX"], -0.75);
+        assert_eq!(rows["ABS_RY"], 0.4);
+        assert_eq!(rows["ABS_Z"], 0.8);
+        assert_eq!(rows["ABS_RZ"], 0.0);
     }
 
     #[test]

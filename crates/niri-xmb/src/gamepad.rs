@@ -253,6 +253,17 @@ fn is_hat_axis(code: u16) -> bool {
     code == AbsoluteAxisCode::ABS_HAT0X.0 || code == AbsoluteAxisCode::ABS_HAT0Y.0
 }
 
+/// Whether a live entry should be kept while its reader is still active.
+///
+/// Live keys are the reader's display path (`by-id` when available, otherwise
+/// the event node). They must be compared against active reader display paths,
+/// not node event paths: comparing against node paths drops `by-id` entries on
+/// every hotplug tick, orphans the reader's live slot so later input has
+/// nowhere to record, and freezes the studio telemetry until a reconnect.
+fn live_session_is_active(live_path: &str, reader_paths: &[String]) -> bool {
+    reader_paths.iter().any(|path| path == live_path)
+}
+
 /// A running gamepad hotplug watcher.
 ///
 /// Dropping the service stops the watcher and joins every reader. The receiver
@@ -2162,7 +2173,11 @@ fn supervisor_loop(
             }
         }
         if let Ok(mut live) = live.lock() {
-            live.retain(|path, _| active.keys().any(|n| n.path.display().to_string() == *path));
+            let reader_paths: Vec<String> = active
+                .values()
+                .map(|reader| reader.path.display().to_string())
+                .collect();
+            live.retain(|path, _| live_session_is_active(path, &reader_paths));
         }
 
         if had_active
@@ -3241,5 +3256,67 @@ mod tests {
         let abs = parse_hex_bits("3003f");
         assert!(abs.contains(&0));
         assert!(abs.contains(&5));
+    }
+
+    #[test]
+    fn live_retain_keeps_by_id_reader_paths_and_drops_stale() {
+        let by_id = String::from("/dev/input/by-id/usb-Flydigi_Flydigi_VADER4-event-joystick");
+        let event_node = String::from("/dev/input/event5");
+        // Active reader owns the by-id display path while its node is event5.
+        let reader_paths = vec![by_id.clone()];
+        assert!(live_session_is_active(&by_id, &reader_paths));
+        // A stale entry from a disconnected controller is dropped.
+        assert!(!live_session_is_active(
+            "/dev/input/by-id/usb-Old_Old-event-joystick",
+            &reader_paths
+        ));
+        // The node event path alone is not a live key when by-id is in use;
+        // the old node-path comparison dropped the live entry every tick.
+        assert!(!live_session_is_active(&event_node, &reader_paths));
+        // Explicit-path setups where display == node still retain.
+        let explicit = vec![event_node.clone()];
+        assert!(live_session_is_active(&event_node, &explicit));
+    }
+
+    #[test]
+    fn live_state_tracks_xbox_sticks_and_triggers_neutral_and_live() {
+        let mut live = GamepadLive::default();
+        let ranges = HashMap::from([
+            (AbsoluteAxisCode::ABS_X.0, (-32768, 32767)),
+            (AbsoluteAxisCode::ABS_Y.0, (-32768, 32767)),
+            (AbsoluteAxisCode::ABS_RX.0, (-32768, 32767)),
+            (AbsoluteAxisCode::ABS_RY.0, (-32768, 32767)),
+            (AbsoluteAxisCode::ABS_Z.0, (0, 255)),
+            (AbsoluteAxisCode::ABS_RZ.0, (0, 255)),
+        ]);
+        // Neutral sticks center near 0 and neutral triggers read 0.
+        for axis in [
+            AbsoluteAxisCode::ABS_X,
+            AbsoluteAxisCode::ABS_Y,
+            AbsoluteAxisCode::ABS_RX,
+            AbsoluteAxisCode::ABS_RY,
+        ] {
+            live.record(&abs(axis, 0), &ranges);
+            assert!(
+                live.axes[&axis.0].abs() < 0.01,
+                "neutral {:?} should read ~0, got {}",
+                axis,
+                live.axes[&axis.0]
+            );
+        }
+        live.record(&abs(AbsoluteAxisCode::ABS_Z, 0), &ranges);
+        live.record(&abs(AbsoluteAxisCode::ABS_RZ, 0), &ranges);
+        assert_eq!(live.axes[&AbsoluteAxisCode::ABS_Z.0], 0.0);
+        assert_eq!(live.axes[&AbsoluteAxisCode::ABS_RZ.0], 0.0);
+        // Non-neutral deflection normalizes to the expected live range.
+        live.record(&abs(AbsoluteAxisCode::ABS_X, 16384), &ranges);
+        assert!((live.axes[&AbsoluteAxisCode::ABS_X.0] - 0.5).abs() < 0.02);
+        live.record(&abs(AbsoluteAxisCode::ABS_Z, 255), &ranges);
+        assert_eq!(live.axes[&AbsoluteAxisCode::ABS_Z.0], 1.0);
+        live.record(&abs(AbsoluteAxisCode::ABS_RZ, 128), &ranges);
+        assert!((live.axes[&AbsoluteAxisCode::ABS_RZ.0] - 0.502).abs() < 0.01);
+        // Returning to neutral is a visible change, not a duplicate.
+        assert!(live.record(&abs(AbsoluteAxisCode::ABS_X, 0), &ranges));
+        assert!(live.axes[&AbsoluteAxisCode::ABS_X.0].abs() < 0.01);
     }
 }

@@ -14,6 +14,7 @@ anyhow = { workspace = true }
 eframe = { version = "0.32.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 kdl = { version = "6.7", default-features = false, features = ["v1-fallback"] }
+libc = "0.2"
 niri-xmb = { path = "../niri-xmb" }
 serde_json = { workspace = true }
 sha2 = "0.10"

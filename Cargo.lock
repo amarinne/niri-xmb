@@ -1609,6 +1609,7 @@ dependencies = [
  "evdev",
  "image",
  "kdl 6.7.1",
+ "libc",
  "niri-xmb",
  "serde_json",
  "sha2",
