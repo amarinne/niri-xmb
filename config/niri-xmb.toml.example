@@ -132,6 +132,7 @@ close_on_escape = true       # Escape closes the popup
 # (udev/60-niri-xmb-gamepad.rules) or use the "input" group.
 #
 # preset: "none" uses only the buttons map; "auto" detects each device from its
+# identity; "flydigi" adds native VADER paddle bindings.
 # name, USB identity, and capabilities (Flydigi VADER4 and xpad-compatible pads
 # use "xbox"; Sony/DualShock/DualSense use "ds4"); "xbox" and "ds4" force a
 # layout. Explicit buttons below override preset entries by evdev code.

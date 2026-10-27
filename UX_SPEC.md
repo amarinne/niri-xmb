@@ -153,9 +153,9 @@ The current xpad interface exposes standard Xbox controls only. Full Vader 4
 paddles and gyro are a follow-up DInput/vendor-HID source; they are not inferred
 from the standard axes.
 
-`gamepad.preset` selects `none`, `auto`, `xbox`, or `ds4`. Explicit
+`gamepad.preset` selects `none`, `auto`, `xbox`, `ds4`, or `flydigi`. Explicit
 `gamepad.buttons` entries override preset entries by evdev code. `auto` maps
-Flydigi VADER4 and other xpad-compatible pads with face buttons to `xbox`, and
+Flydigi VADER4 devices to `flydigi`, other xpad-compatible pads with face buttons to `xbox`, and
 Sony/DualShock/DualSense devices to `ds4`; it falls back to explicit bindings
 for devices without a recognized layout. Both presets map the D-pad to
 navigation, South/Cross to confirm, East/Circle to close, West/Square to back,

@@ -1006,6 +1006,8 @@ pub enum GamepadPreset {
     Auto,
     Xbox,
     Ds4,
+    /// Flydigi native layout, including exposed paddle buttons.
+    Flydigi,
 }
 
 /// Game or desktop-navigation mode for the controller.
@@ -1032,6 +1034,7 @@ pub enum PointerButton {
 }
 
 impl PointerButton {
+    #[allow(dead_code)] // used by the daemon's pointer path, not the library
     pub(crate) fn code(self) -> u16 {
         match self {
             Self::Left => KeyCode::BTN_LEFT.0,
@@ -2181,6 +2184,7 @@ mod tests {
             ("auto", GamepadPreset::Auto),
             ("xbox", GamepadPreset::Xbox),
             ("ds4", GamepadPreset::Ds4),
+            ("flydigi", GamepadPreset::Flydigi),
         ] {
             let config = load_source(
                 &format!(

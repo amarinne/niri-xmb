@@ -22,9 +22,9 @@ hold the configured border region, then move the pointer after the normal
 `peek.move_popup` is a separate opt-in for an armed peek overlay.
 
 Gamepad input is off by default. The `[gamepad]` table selects a built-in
-`xbox` or `ds4` preset (or `auto` detection) and maps evdev button names or
+`xbox`, `ds4`, or `flydigi` preset (or `auto` detection) and maps evdev button names or
 16-bit codes to manual-popup actions. Explicit bindings override the preset.
-Flydigi VADER4 and other xpad-compatible pads auto-detect as `xbox`, and
+Flydigi VADER4 devices auto-detect as `flydigi`; other xpad-compatible pads use `xbox`, and
 D-pad hat axes work even when the kernel sends no `BTN_DPAD_*` events.
 
 The controller starts in **game** mode: niri-xmb does not grab it, so games get
@@ -51,9 +51,12 @@ controller to open the manual popup from hidden or peek in navi mode; it is
 disabled by default, does nothing when the manual popup is already open, and
 suppresses repeats until a combo button is released.
 
-The current Flydigi xpad interface exposes the standard Xbox controls only.
-Full Vader 4 paddles and gyro require the DInput/vendor-HID mode and a virtual
-gamepad target; that is a separate follow-up phase.
+The Flydigi preset maps the standard controls and any native M1-M4 paddle
+events exposed as `BTN_TRIGGER_HAPPY1` through `BTN_TRIGGER_HAPPY4`. Gyro and
+vendor-HID mode still require a separate virtual-gamepad path. Each unique
+controller identity is recorded in `$XDG_STATE_HOME/niri-xmb/controllers.json`
+(or `~/.local/state/niri-xmb/controllers.json`) with first/last seen times and
+connection count.
 
 A native config editor is available as `niri-xmb-config-studio`: it edits the
 controller and XMB TOML, previews panel/bar geometry and bindings, validates

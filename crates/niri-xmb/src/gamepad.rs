@@ -17,7 +17,8 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, KeyCode};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,6 +40,7 @@ const HOTPLUG_SLEEP_SLICE: Duration = Duration::from_millis(100);
 const READER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const GAMEPAD_EVENT_SUFFIXES: [&str; 2] = ["-event-joystick", "-event-gamepad"];
 const BY_ID_DIR: &str = "/dev/input/by-id";
+const HISTORY_FILE: &str = "niri-xmb/controllers.json";
 
 /// High-level input or output change emitted by a controller.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -191,6 +193,63 @@ fn navi_action_map(
         .collect()
 }
 
+/// Live button and axis state owned by one reader thread.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct GamepadLive {
+    buttons: BTreeSet<u16>,
+    axes: BTreeMap<u16, f32>,
+}
+
+impl GamepadLive {
+    /// Fold one evdev event into the state read by `status`.
+    fn record(&mut self, event: &InputEvent, ranges: &HashMap<u16, (i32, i32)>) {
+        let code = event.code();
+        match event.event_type() {
+            EventType::KEY => {
+                if event.value() == 0 {
+                    self.buttons.remove(&code);
+                } else {
+                    self.buttons.insert(code);
+                }
+            }
+            EventType::ABSOLUTE => {
+                let (min, max) = ranges
+                    .get(&code)
+                    .copied()
+                    .unwrap_or(if is_trigger_axis(code) {
+                        (0, 255)
+                    } else if is_hat_axis(code) {
+                        (-1, 1)
+                    } else {
+                        (i32::MIN, i32::MAX)
+                    });
+                let value = if is_hat_axis(code) {
+                    event.value().signum() as f32
+                } else if is_trigger_axis(code) {
+                    normalize_unsigned(event.value(), min, max)
+                } else {
+                    normalize_signed(event.value(), min, max)
+                };
+                self.axes.insert(code, value);
+            }
+            _ => {}
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buttons.clear();
+        self.axes.clear();
+    }
+}
+
+fn is_trigger_axis(code: u16) -> bool {
+    code == AbsoluteAxisCode::ABS_Z.0 || code == AbsoluteAxisCode::ABS_RZ.0
+}
+
+fn is_hat_axis(code: u16) -> bool {
+    code == AbsoluteAxisCode::ABS_HAT0X.0 || code == AbsoluteAxisCode::ABS_HAT0Y.0
+}
+
 /// A running gamepad hotplug watcher.
 ///
 /// Dropping the service stops the watcher and joins every reader. The receiver
@@ -203,6 +262,7 @@ pub struct GamepadService {
     open_combo: bool,
     devices: Arc<AtomicUsize>,
     connected: Arc<Mutex<Vec<GamepadDeviceStatus>>>,
+    live: Arc<Mutex<HashMap<String, GamepadLive>>>,
     supervisor: Option<JoinHandle<()>>,
 }
 
@@ -214,14 +274,40 @@ pub struct GamepadDeviceStatus {
     pub preset: GamepadPreset,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ControllerProfile {
+    id: String,
+    name: String,
+    vendor: u16,
+    product: u16,
+    version: u16,
+    first_seen: u64,
+    last_seen: u64,
+    connections: u32,
+    preset: GamepadPreset,
+}
+
 /// Read-only gamepad state exposed by the daemon status response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GamepadStatus {
     pub mode: GamepadMode,
     pub preset: GamepadPreset,
     pub open_combo: bool,
     pub devices: usize,
     pub connected: Vec<GamepadDeviceStatus>,
+    /// Per-device button and axis state for live overlays, sorted by path.
+    pub live: Vec<GamepadDeviceLive>,
+}
+
+/// A controller's currently held buttons and normalized axes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GamepadDeviceLive {
+    pub path: String,
+    /// Held evdev key codes.
+    pub buttons: BTreeSet<u16>,
+    /// Absolute axis code to a normalized value: -1..1 for sticks and hats,
+    /// 0..1 for triggers.
+    pub axes: BTreeMap<u16, f32>,
 }
 
 struct ActiveReader {
@@ -260,6 +346,7 @@ impl GamepadService {
         let mode = Arc::new(AtomicU8::new(mode_to_u8(navi.default_mode)));
         let devices = Arc::new(AtomicUsize::new(0));
         let connected = Arc::new(Mutex::new(Vec::new()));
+        let live = Arc::new(Mutex::new(HashMap::new()));
         let preset = config.preset;
         let open_combo = !combo_codes.is_empty();
         let config = Arc::new(config.clone());
@@ -274,6 +361,7 @@ impl GamepadService {
             let mode = Arc::clone(&mode);
             let devices = Arc::clone(&devices);
             let connected = Arc::clone(&connected);
+            let live = Arc::clone(&live);
             thread::Builder::new()
                 .name("niri-xmb-gamepad-hotplug".into())
                 .spawn(move || {
@@ -284,6 +372,7 @@ impl GamepadService {
                         mode,
                         devices,
                         connected,
+                        live,
                         tx,
                         wake,
                         stop,
@@ -299,6 +388,7 @@ impl GamepadService {
                 open_combo,
                 devices,
                 connected,
+                live,
                 supervisor: Some(handle),
             }),
             Err(error) => {
@@ -327,6 +417,22 @@ impl GamepadService {
                 .connected
                 .lock()
                 .map(|devices| devices.clone())
+                .unwrap_or_default(),
+            live: self
+                .live
+                .lock()
+                .map(|live| {
+                    let mut entries: Vec<GamepadDeviceLive> = live
+                        .iter()
+                        .map(|(path, state)| GamepadDeviceLive {
+                            path: path.clone(),
+                            buttons: state.buttons.clone(),
+                            axes: state.axes.clone(),
+                        })
+                        .collect();
+                    entries.sort_by(|a, b| a.path.cmp(&b.path));
+                    entries
+                })
                 .unwrap_or_default(),
         }
     }
@@ -403,6 +509,27 @@ const XBOX_PRESET: &[(&str, GamepadAction)] = &[
     ("BTN_MODE", GamepadAction::Close),
 ];
 
+/// Flydigi's xpad-compatible face controls plus native M1-M4 paddle events.
+const FLYDIGI_PRESET: &[(&str, GamepadAction)] = &[
+    ("BTN_DPAD_UP", GamepadAction::Up),
+    ("BTN_DPAD_DOWN", GamepadAction::Down),
+    ("BTN_DPAD_LEFT", GamepadAction::Left),
+    ("BTN_DPAD_RIGHT", GamepadAction::Right),
+    ("BTN_SOUTH", GamepadAction::Confirm),
+    ("BTN_EAST", GamepadAction::Close),
+    ("BTN_WEST", GamepadAction::Back),
+    ("BTN_NORTH", GamepadAction::Tab),
+    ("BTN_TL", GamepadAction::Back),
+    ("BTN_TR", GamepadAction::Tab),
+    ("BTN_SELECT", GamepadAction::Back),
+    ("BTN_START", GamepadAction::Confirm),
+    ("BTN_MODE", GamepadAction::Close),
+    ("BTN_TRIGGER_HAPPY1", GamepadAction::Left),
+    ("BTN_TRIGGER_HAPPY2", GamepadAction::Right),
+    ("BTN_TRIGGER_HAPPY3", GamepadAction::Back),
+    ("BTN_TRIGGER_HAPPY4", GamepadAction::Confirm),
+];
+
 /// Standard DualShock 4 positional layout.
 ///
 /// Linux exposes the same positional key codes as Xbox. The preset is kept
@@ -431,6 +558,7 @@ fn preset_bindings(preset: GamepadPreset) -> &'static [(&'static str, GamepadAct
     match preset {
         GamepadPreset::Xbox => XBOX_PRESET,
         GamepadPreset::Ds4 => DS4_PRESET,
+        GamepadPreset::Flydigi => FLYDIGI_PRESET,
         GamepadPreset::None | GamepadPreset::Auto => &[],
     }
 }
@@ -475,7 +603,11 @@ fn preset_from_identity(
         || identity.contains("microsoft")
         || has_face_buttons
     {
-        return GamepadPreset::Xbox;
+        return if identity.contains("flydigi") || identity.contains("vader") {
+            GamepadPreset::Flydigi
+        } else {
+            GamepadPreset::Xbox
+        };
     }
     GamepadPreset::None
 }
@@ -490,6 +622,60 @@ fn detect_preset(path: &Path, device: &Device) -> GamepadPreset {
         device.input_id().vendor(),
         has_face_buttons,
     )
+}
+
+fn history_path() -> Option<PathBuf> {
+    let root = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+        })?;
+    Some(root.join(HISTORY_FILE))
+}
+
+fn record_controller(_path: &Path, device: &Device, preset: GamepadPreset) {
+    let Some(file) = history_path() else { return };
+    let id = device.input_id();
+    let vendor = id.vendor();
+    let product = id.product();
+    let version = id.version();
+    let name = device.name().unwrap_or("unknown").to_string();
+    let stable_id = format!("{vendor:04x}:{product:04x}:{version:04x}:{name}");
+    let mut profiles: Vec<ControllerProfile> = std::fs::read(&file)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    if let Some(profile) = profiles.iter_mut().find(|profile| profile.id == stable_id) {
+        profile.last_seen = now;
+        profile.connections = profile.connections.saturating_add(1);
+        profile.preset = preset;
+    } else {
+        profiles.push(ControllerProfile {
+            id: stable_id,
+            name,
+            vendor,
+            product,
+            version,
+            first_seen: now,
+            last_seen: now,
+            connections: 1,
+            preset,
+        });
+    }
+    profiles.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    let Ok(bytes) = serde_json::to_vec_pretty(&profiles) else {
+        return;
+    };
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let temporary = file.with_extension("json.tmp");
+    if std::fs::write(&temporary, bytes).is_ok() {
+        let _ = std::fs::rename(temporary, file);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1304,6 +1490,7 @@ fn supervisor_loop(
     mode: Arc<AtomicU8>,
     devices: Arc<AtomicUsize>,
     connected: Arc<Mutex<Vec<GamepadDeviceStatus>>>,
+    live: Arc<Mutex<HashMap<String, GamepadLive>>>,
     tx: Sender<GamepadEvent>,
     wake: WakeHandle,
     stop: Arc<AtomicBool>,
@@ -1362,7 +1549,16 @@ fn supervisor_loop(
             if retry_at.get(&path).is_some_and(|until| now < *until) {
                 continue;
             }
-            match start_reader(&path, &config, &combo_codes, &navi, &mode, &tx, &wake) {
+            match start_reader(
+                &path,
+                &config,
+                &combo_codes,
+                &navi,
+                &mode,
+                &live,
+                &tx,
+                &wake,
+            ) {
                 Ok(Some(reader)) => {
                     active.insert(path.clone(), reader);
                     had_active = true;
@@ -1400,6 +1596,9 @@ fn supervisor_loop(
                 .collect();
             connected.sort_by(|a, b| a.path.cmp(&b.path));
         }
+        if let Ok(mut live) = live.lock() {
+            live.retain(|path, _| active.contains_key(Path::new(path)));
+        }
 
         if had_active
             && active.is_empty()
@@ -1427,15 +1626,20 @@ fn supervisor_loop(
     if let Ok(mut connected) = connected.lock() {
         connected.clear();
     }
+    if let Ok(mut live) = live.lock() {
+        live.clear();
+    }
     tracing::info!("gamepad hotplug watcher stopped");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_reader(
     path: &Path,
     config: &GamepadConfig,
     combo_codes: &HashSet<u16>,
     navi: &NaviRuntime,
     mode: &Arc<AtomicU8>,
+    live: &Arc<Mutex<HashMap<String, GamepadLive>>>,
     tx: &Sender<GamepadEvent>,
     wake: &WakeHandle,
 ) -> Result<Option<ActiveReader>> {
@@ -1448,6 +1652,7 @@ fn start_reader(
         GamepadPreset::Auto => detect_preset(path, &device),
         preset => preset,
     };
+    record_controller(path, &device, preset);
     let bindings = binding_map_for(config, preset)
         .with_context(|| format!("gamepad bindings for {}", path.display()))?;
     let navi_has_input =
@@ -1467,6 +1672,8 @@ fn start_reader(
     let combo_codes = combo_codes.clone();
     let navi = Arc::new(navi.clone());
     let mode = Arc::clone(mode);
+    let live = Arc::clone(live);
+    let live_key = path.display().to_string();
     let reader_stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&reader_stop);
     let thread_path = path.to_path_buf();
@@ -1475,6 +1682,9 @@ fn start_reader(
     let handle = thread::Builder::new()
         .name("niri-xmb-gamepad".into())
         .spawn(move || {
+            if let Ok(mut live) = live.lock() {
+                live.insert(live_key.clone(), GamepadLive::default());
+            }
             reader_loop(
                 thread_path,
                 device,
@@ -1482,10 +1692,14 @@ fn start_reader(
                 combo_codes,
                 navi,
                 mode,
+                Arc::clone(&live),
                 tx,
                 wake,
                 thread_stop,
-            )
+            );
+            if let Ok(mut live) = live.lock() {
+                live.remove(&live_key);
+            }
         })
         .context("failed to spawn gamepad reader")?;
     tracing::info!(
@@ -1529,13 +1743,15 @@ fn reader_loop(
     combo_codes: HashSet<u16>,
     navi: Arc<NaviRuntime>,
     mode: Arc<AtomicU8>,
+    live: Arc<Mutex<HashMap<String, GamepadLive>>>,
     tx: Sender<GamepadEvent>,
     wake: WakeHandle,
     stop: Arc<AtomicBool>,
 ) {
     let ranges = device_axis_ranges(&device);
+    let live_key = path.display().to_string();
     let mut xmb_tracker = HatTracker::new(combo_codes);
-    let mut navi_tracker = NaviTracker::new(Arc::clone(&navi), ranges);
+    let mut navi_tracker = NaviTracker::new(Arc::clone(&navi), ranges.clone());
     let mut mode_combo = ComboTracker::new(navi.mode_toggle.clone());
     let mut last_mode = mode_from_u8(mode.load(Ordering::Relaxed));
     apply_mode_grab(&mut device, last_mode, navi.grab_in_navi, &path);
@@ -1551,6 +1767,11 @@ fn reader_loop(
             apply_mode_grab(&mut device, observed_mode, navi.grab_in_navi, &path);
             navi_tracker.reset();
             last_mode = observed_mode;
+            if let Ok(mut live) = live.lock()
+                && let Some(state) = live.get_mut(&live_key)
+            {
+                state.clear();
+            }
         }
 
         let timeout = if last_mode == GamepadMode::Navi {
@@ -1603,12 +1824,22 @@ fn reader_loop(
 
         let mut sent = false;
         for event in events {
+            if let Ok(mut live) = live.lock()
+                && let Some(state) = live.get_mut(&live_key)
+            {
+                state.record(&event, &ranges);
+            }
             if event.event_type() == EventType::KEY && mode_combo.feed(event.code(), event.value())
             {
                 let next = toggle_mode(&mode);
                 apply_mode_grab(&mut device, next, navi.grab_in_navi, &path);
                 navi_tracker.reset();
                 last_mode = next;
+                if let Ok(mut live) = live.lock()
+                    && let Some(state) = live.get_mut(&live_key)
+                {
+                    state.clear();
+                }
                 let Ok(queued) =
                     queue_gamepad_event(&tx, GamepadEvent::ModeChanged(next), &mut full_logged)
                 else {
@@ -1725,6 +1956,28 @@ mod tests {
     }
 
     #[test]
+    fn live_state_tracks_buttons_and_normalizes_axes() {
+        let mut live = GamepadLive::default();
+        let ranges = HashMap::from([
+            (AbsoluteAxisCode::ABS_X.0, (-32768, 32767)),
+            (AbsoluteAxisCode::ABS_Z.0, (0, 255)),
+        ]);
+        live.record(&key(KeyCode::BTN_SOUTH, 1), &ranges);
+        assert!(live.buttons.contains(&KeyCode::BTN_SOUTH.0));
+        live.record(&key(KeyCode::BTN_SOUTH, 0), &ranges);
+        assert!(live.buttons.is_empty());
+        live.record(&abs(AbsoluteAxisCode::ABS_Z, 128), &ranges);
+        let trigger = live.axes[&AbsoluteAxisCode::ABS_Z.0];
+        assert!((trigger - 0.502).abs() < 0.01, "{trigger}");
+        live.record(&abs(AbsoluteAxisCode::ABS_X, 32767), &ranges);
+        assert!((live.axes[&AbsoluteAxisCode::ABS_X.0] - 1.0).abs() < 0.01);
+        live.record(&hat(AbsoluteAxisCode::ABS_HAT0X, -1), &ranges);
+        assert_eq!(live.axes[&AbsoluteAxisCode::ABS_HAT0X.0], -1.0);
+        live.clear();
+        assert!(live.buttons.is_empty() && live.axes.is_empty());
+    }
+
+    #[test]
     fn gamepad_event_names_use_stable_joystick_or_gamepad_suffixes() {
         assert!(is_gamepad_event_name("usb-test-event-joystick"));
         assert!(is_gamepad_event_name("usb-test-event-gamepad"));
@@ -1809,6 +2062,19 @@ mod tests {
     }
 
     #[test]
+    fn flydigi_preset_includes_native_paddles() {
+        let map = preset_map(GamepadPreset::Flydigi);
+        assert_eq!(
+            map.get(&KeyCode::BTN_TRIGGER_HAPPY1.0),
+            Some(&GamepadAction::Left)
+        );
+        assert_eq!(
+            map.get(&KeyCode::BTN_TRIGGER_HAPPY4.0),
+            Some(&GamepadAction::Confirm)
+        );
+    }
+
+    #[test]
     fn explicit_overrides_win_over_a_preset_by_code() {
         let config = GamepadConfig {
             enabled: true,
@@ -1827,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_detection_maps_flydigi_vader_to_xbox() {
+    fn auto_detection_maps_flydigi_vader_to_flydigi() {
         assert_eq!(
             preset_from_identity(
                 "/dev/input/by-id/usb-Flydigi_Flydigi_VADER4-event-joystick",
@@ -1835,7 +2101,7 @@ mod tests {
                 0x045e,
                 true
             ),
-            GamepadPreset::Xbox
+            GamepadPreset::Flydigi
         );
     }
 
