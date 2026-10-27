@@ -42,57 +42,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SurfaceKind {
-    Bar(usize),
-    Popup,
-}
-
-#[derive(Debug, Clone)]
-pub struct SurfaceInfo {
-    pub id: usize,
-    pub kind: SurfaceKind,
-    pub output: String,
-    pub global_x: f64,
-    pub global_y: f64,
-    pub width: u32,
-    pub height: u32,
-    pub configured: bool,
-    pub frame_ready: bool,
-    pub needs_full_redraw: bool,
-    pub scale_factor: i32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DamageRect {
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-}
-
-impl DamageRect {
-    fn right(self) -> u32 {
-        self.x + self.width
-    }
-
-    fn bottom(self) -> u32 {
-        self.y + self.height
-    }
-
-    pub fn union(self, other: Self) -> Self {
-        let x = self.x.min(other.x);
-        let y = self.y.min(other.y);
-        let right = self.right().max(other.right());
-        let bottom = self.bottom().max(other.bottom());
-        Self {
-            x,
-            y,
-            width: right - x,
-            height: bottom - y,
-        }
-    }
-}
+pub use crate::surface::{DamageRect, SurfaceInfo, SurfaceKind};
 
 struct SurfaceBuffer {
     buffer: Buffer,

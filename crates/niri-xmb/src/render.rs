@@ -8,8 +8,8 @@ use crate::draw::{
 };
 use crate::icons::IconCache;
 use crate::model::{OutputModel, Snapshot, WindowModel, WindowSlot, WorkspaceModel};
+use crate::surface::{DamageRect, SurfaceInfo, SurfaceKind};
 use crate::text::TextRenderer;
-use crate::wayland::{DamageRect, SurfaceInfo, SurfaceKind};
 use std::collections::HashMap;
 use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
 
@@ -330,6 +330,12 @@ struct DragRenderKey {
     y_bits: u64,
 }
 
+impl Default for Renderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Renderer {
     pub fn new() -> Self {
         Self {
@@ -467,6 +473,17 @@ impl Renderer {
             .rev()
             .find(|zone| zone.rect.contains(x, y))
             .map(|zone| &zone.target)
+    }
+
+    /// Every hit zone from the last render of `surface_id`, in paint order.
+    ///
+    /// The preview needs the whole set to translate panel-local clicks into
+    /// workspace/window targets; the daemon only needs the single hit.
+    #[allow(dead_code)] // used by the config studio preview
+    pub fn hit_zones(&self, surface_id: usize) -> &[HitZone] {
+        self.hit_zones
+            .get(&surface_id)
+            .map_or(&[], std::vec::Vec::as_slice)
     }
 
     /// Workspace under the pointer on a bar or popup canvas.

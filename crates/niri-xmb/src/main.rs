@@ -14,6 +14,7 @@ mod panel;
 mod render;
 mod selection;
 mod subscribe;
+mod surface;
 mod text;
 mod wayland;
 
@@ -658,6 +659,7 @@ fn snapshot_json(snapshot: &Snapshot, output_filter: Option<&str>) -> String {
                         "active": workspace.active,
                         "focused": workspace.focused,
                         "urgent": workspace.urgent,
+                        "active_window": workspace.active_window,
                         "windows": windows,
                     })
                 })
@@ -731,6 +733,18 @@ fn status_response(
                     "path": device.path,
                     "name": device.name,
                     "preset": device.preset,
+                })).collect::<Vec<_>>()
+            }).unwrap_or_default(),
+            // Live pressed buttons and axes for the Config Studio overlay.
+            "live": gamepad.as_ref().map(|status| {
+                status.live.iter().map(|device| serde_json::json!({
+                    "path": device.path,
+                    "buttons": device.buttons.iter().map(|code| {
+                        format!("{:?}", evdev::KeyCode(*code))
+                    }).collect::<Vec<_>>(),
+                    "axes": device.axes.iter().map(|(code, value)| {
+                        (format!("{:?}", evdev::AbsoluteAxisCode(*code)), serde_json::json!(value))
+                    }).collect::<serde_json::Map<String, serde_json::Value>>(),
                 })).collect::<Vec<_>>()
             }).unwrap_or_default(),
         },
@@ -2837,6 +2851,13 @@ mod tests {
                     name: "Flydigi VADER4".into(),
                     preset: crate::config::GamepadPreset::Xbox,
                 }],
+                live: vec![gamepad::GamepadDeviceLive {
+                    path: "/dev/input/event10".into(),
+                    buttons: [evdev::KeyCode::BTN_SOUTH.0].into_iter().collect(),
+                    axes: [(evdev::AbsoluteAxisCode::ABS_Z.0, 0.5)]
+                        .into_iter()
+                        .collect(),
+                }],
             }),
             0,
         ))
@@ -2848,6 +2869,8 @@ mod tests {
         assert_eq!(value["gamepad"]["open_combo"], true);
         assert_eq!(value["gamepad"]["devices"], 1);
         assert_eq!(value["gamepad"]["connected"][0]["name"], "Flydigi VADER4");
+        assert_eq!(value["gamepad"]["live"][0]["buttons"][0], "BTN_SOUTH");
+        assert_eq!(value["gamepad"]["live"][0]["axes"]["ABS_Z"], 0.5);
     }
 
     #[test]
