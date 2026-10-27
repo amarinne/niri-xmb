@@ -44,6 +44,7 @@ impl PopupConfig {
 impl Config {
     /// Validate a referenced theme with the same parser and semantic checks
     /// used while loading the daemon configuration.
+    #[allow(dead_code)]
     pub fn validate_theme_reference(theme: &str, config_path: &Path) -> Result<()> {
         if theme.trim().is_empty() {
             anyhow::bail!("theme must not be empty");
