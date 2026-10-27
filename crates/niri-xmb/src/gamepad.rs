@@ -1690,14 +1690,28 @@ pub(crate) fn is_gamepad_event_name(name: &str) -> bool {
 
 fn parse_hex_bits(s: &str) -> std::collections::BTreeSet<u16> {
     let mut bits = std::collections::BTreeSet::new();
-    for (word_index, word) in s.split_whitespace().enumerate() {
-        let Ok(value) = u64::from_str_radix(word.trim_start_matches("0x"), 16) else {
-            continue;
-        };
+    let words: Vec<u64> = s
+        .split_whitespace()
+        .filter_map(|word| u64::from_str_radix(word.trim_start_matches("0x"), 16).ok())
+        .collect();
+    for (word_index, value) in words.iter().copied().enumerate() {
         for bit in 0..64u16 {
             if value & (1u64 << bit) != 0 {
                 let code = word_index as u16 * 64 + bit;
                 bits.insert(code);
+            }
+        }
+    }
+    // Linux prints input bitmaps with the highest non-zero word first and
+    // omits trailing zero words. Try the compact reverse layout as well;
+    // the capability predicate still requires a complete stick/button set.
+    for word_count in words.len().max(1)..=8 {
+        for (word_index, value) in words.iter().copied().enumerate() {
+            let offset = word_count.saturating_sub(word_index + 1) * 64;
+            for bit in 0..64u16 {
+                if value & (1u64 << bit) != 0 {
+                    bits.insert(offset as u16 + bit);
+                }
             }
         }
     }
@@ -3217,5 +3231,15 @@ mod tests {
         assert!(!is_accepted_capability(&touchpad));
         let keyboard = meta_with(&[], &[30], "ID_INPUT_KEYBOARD=1");
         assert!(!is_accepted_capability(&keyboard));
+    }
+
+    #[test]
+    fn sysfs_bitmap_layout_keeps_standard_gamepad_codes() {
+        let key = parse_hex_bits("7fdb000000000000 0 0 0 0");
+        assert!(key.contains(&304));
+        assert!(key.contains(&318));
+        let abs = parse_hex_bits("3003f");
+        assert!(abs.contains(&0));
+        assert!(abs.contains(&5));
     }
 }

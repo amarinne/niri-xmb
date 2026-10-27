@@ -49,3 +49,6 @@ INTERACTION_DESIGN.md
 STATE_STREAM_DESIGN.md
 MACHINE_PROFILE.md
 HANDOVER.md
+
+# Private development deployment helper
+/scripts/deploy-dev.local.sh
