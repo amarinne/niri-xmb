@@ -831,6 +831,26 @@ fn preset_bindings(preset: GamepadPreset) -> &'static [(&'static str, GamepadAct
     }
 }
 
+/// xpad reports Xbox X/Y at the numeric codes that Linux aliases as
+/// `BTN_NORTH`/`BTN_WEST`, but those compass aliases are reversed relative to
+/// the physical Xbox layout. The DS4 driver uses the aliases semantically, so
+/// normalize only Xbox-compatible readers before dispatching or publishing
+/// their events. This keeps the existing config/UI names stable while making
+/// a Flydigi pad's physical X and Y land on the right controls.
+fn normalize_event_for_preset(event: &InputEvent, preset: GamepadPreset) -> InputEvent {
+    if event.event_type() != EventType::KEY
+        || !matches!(preset, GamepadPreset::Xbox | GamepadPreset::Flydigi)
+    {
+        return InputEvent::new(event.event_type().0, event.code(), event.value());
+    }
+    let code = match event.code() {
+        code if code == KeyCode::BTN_NORTH.0 => KeyCode::BTN_WEST.0,
+        code if code == KeyCode::BTN_WEST.0 => KeyCode::BTN_NORTH.0,
+        code => code,
+    };
+    InputEvent::new(event.event_type().0, code, event.value())
+}
+
 /// Merge a preset with the explicit config map. Explicit entries win by
 /// evdev code, so `0x130` overrides a preset's `BTN_SOUTH` entry.
 fn binding_map_for(
@@ -2275,6 +2295,7 @@ fn start_reader(
             reader_loop(
                 thread_path,
                 device,
+                preset,
                 bindings,
                 combo_codes,
                 navi,
@@ -2331,6 +2352,7 @@ fn queue_gamepad_event(
 fn reader_loop(
     path: PathBuf,
     mut device: Device,
+    preset: GamepadPreset,
     bindings: Arc<HashMap<u16, GamepadAction>>,
     combo_codes: HashSet<u16>,
     navi: Arc<NaviRuntime>,
@@ -2418,7 +2440,8 @@ fn reader_loop(
 
         let mut sent = false;
         let mut live_changed = false;
-        for event in events {
+        for raw_event in events {
+            let event = normalize_event_for_preset(&raw_event, preset);
             if let Ok(mut live) = live.lock()
                 && let Some(state) = live.get_mut(&live_key)
             {
@@ -2708,6 +2731,17 @@ mod tests {
             ),
             GamepadPreset::Xbox
         );
+    }
+
+    #[test]
+    fn xbox_face_events_swap_compass_aliases_but_ds4_does_not() {
+        let x = normalize_event_for_preset(&key(KeyCode::BTN_NORTH, 1), GamepadPreset::Xbox);
+        let y = normalize_event_for_preset(&key(KeyCode::BTN_WEST, 1), GamepadPreset::Flydigi);
+        assert_eq!(x.code(), KeyCode::BTN_WEST.0);
+        assert_eq!(y.code(), KeyCode::BTN_NORTH.0);
+
+        let ds4 = normalize_event_for_preset(&key(KeyCode::BTN_NORTH, 1), GamepadPreset::Ds4);
+        assert_eq!(ds4.code(), KeyCode::BTN_NORTH.0);
     }
 
     #[test]

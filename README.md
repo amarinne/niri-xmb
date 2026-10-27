@@ -26,7 +26,9 @@ Gamepad input is off by default. The `[gamepad]` table selects a built-in
 16-bit codes to manual-popup actions. Explicit bindings override the preset.
 Flydigi VADER4 devices in Xbox/xpad mode auto-detect as `xbox`; choose `flydigi`
 explicitly when you want native paddle bindings. Other xpad-compatible pads also use `xbox`, and
-D-pad hat axes work even when the kernel sends no `BTN_DPAD_*` events.
+D-pad hat axes work even when the kernel sends no `BTN_DPAD_*` events. Xbox/xpad face-button
+aliases are normalized so physical X/Y positions remain correct; DualShock devices keep their
+native evdev ordering.
 
 The controller starts in **game** mode: niri-xmb does not grab it, so games get
 normal input. `gamepad.mode.toggle` (default `BTN_MODE` + `BTN_START`) switches
