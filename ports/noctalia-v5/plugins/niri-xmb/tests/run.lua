@@ -1159,6 +1159,56 @@ test("a drop preview expires without a reply", function()
     assertTrue(env.renders > before, "expiry repaints canonical state")
 end)
 
+test("insertion markers expand on drag and sources lift from layout", function()
+    local env = newEnvironment()
+    setMirror(env, snapshot(1, 0, { activeWorkspace = 1, focusedWindow = 10 }))
+    loadPlugin(env)
+    update()
+    emitHello(env)
+    emitSnapshot(env, snapshot(2, 0, { activeWorkspace = 1, focusedWindow = 10 }))
+    update()
+
+    -- Every window has a before marker, and the last window an after marker.
+    -- A targeted marker expands to the dragged icon's width (host-side
+    -- expandOnDrag), so the strip opens a gap at the insertion point.
+    local before = findNode(env.lastTree, "before-11")
+    assertTrue(before ~= nil, "before marker rendered")
+    assertEqual(before.expandOnDrag, true, "before marker expands on drag")
+    assertEqual(before.width, 4, "before marker stays thin at rest")
+    assertEqual(before.height, 28, "before marker spans the item height")
+    assertEqual(before.value, "1|11|0.25", "before marker targets the left edge")
+    local after = findNode(env.lastTree, "after-11")
+    assertTrue(after ~= nil, "after marker rendered")
+    assertEqual(after.expandOnDrag, true, "after marker expands on drag")
+    assertEqual(after.value, "1|11|0.75", "after marker targets the right edge")
+
+    -- The dragged icon leaves the layout, so only the expanded marker
+    -- reserves its space while the ghost follows the pointer.
+    local source = findNode(env.lastTree, "window-10")
+    assertTrue(source ~= nil, "window rendered")
+    assertEqual(source.liftFromLayout, true, "drag source lifts from layout")
+    assertEqual(source.dragType, "niri-window", "drag source type")
+
+    -- Dropping straight onto a workspace pill appends to that workspace.
+    local workspaceTwo = findNode(env.lastTree, "workspace-auto-2")
+    assertTrue(workspaceTwo ~= nil and workspaceTwo.onDrop ~= nil, "workspace accepts a drop")
+    assertEqual(workspaceTwo.value, "2|0|0.5", "workspace drop appends")
+
+    -- Dropping on an in-between marker inserts before its target window.
+    before.onDrop("20", before.value, 10, 10)
+    local drop = findCommand(env, "'drop'")
+    assertTrue(drop ~= nil, "marker drop dispatched")
+    assertTrue(drop.command:find("'--target-window-id' '11'", 1, true) ~= nil, "marker drop targets window 11")
+    local workspaceOne = findNode(env.lastTree, "workspace-auto-1")
+    local row = findNode(workspaceOne, "windows")
+    local order = {}
+    for index, child in ipairs(row.children) do
+        order[child.key] = index
+    end
+    assertTrue(order["window-20"] ~= nil, "dropped window previews in workspace 1")
+    assertTrue(order["window-20"] < order["window-11"], "dropped window previews before window 11")
+end)
+
 test("malformed stream output falls back instead of crashing", function()
     local env = newEnvironment()
     setMirror(env, snapshot(1, 0, { activeWorkspace = 1, focusedWindow = 10 }))

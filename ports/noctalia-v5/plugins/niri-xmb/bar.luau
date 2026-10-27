@@ -795,13 +795,18 @@ end
 local function marker(workspaceId, targetWindowId, fraction, key, height, slop)
     return ui.dropZone({
         key = key,
-        width = 1,
+        -- Keep a thin full-height insertion marker in the idle layout, then
+        -- let the host animate it to the dragged icon's width while it is
+        -- targeted, so neighbouring icons slide aside as a drop preview.
+        -- The marker's hit slop makes the insertion point reachable without
+        -- idle gaps.
+        width = 4,
         height = height,
         accepts = { "niri-window" },
         value = idString(workspaceId) .. "|" .. idString(targetWindowId) .. "|" .. tostring(fraction),
         onDrop = onDrop,
         hitSlop = slop,
-        expandOnDrag = false,
+        expandOnDrag = true,
         fill = "#00000000",
     })
 end
@@ -901,7 +906,9 @@ local function windowItem(window, iconSize, allowDrag, indicatorMode)
         props.onDragEnd = onSourceDrop
         props.tooltip = tostring(window.title or window.app_id or "")
         props.previewAncestor = 0
-        props.liftFromLayout = false
+        -- Let the animated insertion marker reserve the space while the
+        -- source ghost follows the pointer.
+        props.liftFromLayout = true
         return ui.dragSource(props, children)
     end
     return ui.row(props, children)
