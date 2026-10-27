@@ -34,15 +34,35 @@ entry appears as **niri-xmb Config**.
 - **Popup:** panel, placements, behavior grouped into Input / Close when / Drop
   behavior, peek, and animation.
 - **Appearance:** theme, colors, geometry, and bar configuration.
-- **Preview:** the single live XMB/bar/model surface. It uses the daemon's live
-  status/snapshot, not a static mock; clicking a window sends the existing
-  `focus-window` command.
+- **Live dock:** persistent bottom panel with three tabs. Drag the grip on its
+  top edge to resize (the height survives tab switches), double-click the grip
+  or press Hide to collapse it to the header. Follow switches tabs with the
+  editor section.
+  - **Popup:** the daemon's own renderer with the edited config and the live
+    status/snapshot, so icons, layout, emphasis, and hit zones match the real
+    panel. Hovering highlights the same target; clicking a window or workspace
+    sends the existing `focus-window` / `focus-workspace` command.
+  - **Controller:** the current template with live pressed-button highlights,
+    trigger bars, and each control's Navi/XMB binding plus the Navi layers that
+    hold or rebind it. Live state comes from `gamepad.live` in `niri-xmb
+    status`.
+  - **Keyboard:** the full Niri keybind map read from `~/.config/niri/config.kdl`
+    and its includes. The ANSI board keeps normal key proportions (15 key
+    widths per row, square caps) and sits beside an aligned Hotkey / Action /
+    Source table; it stacks below 880 px. Bound keys are tinted, keys held in
+    the studio light up, clicking a key filters the list, and overridden or
+    duplicate binds are flagged. The search box filters by hotkey, action, or
+    overlay title.
 - The top command bar holds the config path, Load, and live daemon status. A
   persistent bottom action bar holds change count/SHA, Changes, Preview,
-  Validate, Save, Save & Restart, and Revert. Changes opens the patch-path
-  drawer and the validated TOML view.
+  Validate, Save, Save & Restart, and Revert. Preview opens the dock's Popup
+  tab. Changes opens the patch-path drawer and the validated TOML view.
 - Controller hotspots select a control; the inspector edits the active Navi
   base, XMB, or layer binding. Both templates use the same display box.
+- Binding rows pick the button from a dropdown of standard gamepad codes
+  (labeled A/Cross, LB/L1, and so on), filtered to buttons not already bound in
+  that map. Open combo, mode toggle, and layer hold lists use the same picker,
+  so button codes never need typing.
 - Trigger Lab's compact pedals use the same points and speed-SOCD policy; they
   are simulation, not live controller input. `speed_socd` selects `last`,
   `first`, `cancel`, `multiply`, `prio_decel`, or `prio_accel` for simultaneous
@@ -73,6 +93,20 @@ loaded style includes the theme merge; editing a style field writes the base
 
 `assets/controller-render.png` is the CC0 Xbox Controller.svg render from
 Wikimedia Commons.
+
+## Display texts and translations
+
+Every label, heading, button, and status is catalogued in
+`crates/niri-xmb-config-studio/src/i18n.rs` with a stable key (config path
+for fields, `ui.*` otherwise) and a one-sentence description. That
+description is the hover text on the label in the UI, so opaque terms
+(Pointer `Stick`/`Deadzone`/`Curve`/`Speed`/`Max step`/`Invert Y`, trigger
+`Shape curve`/`Speed SOCD`, peek timings, …) explain themselves on hover.
+The generated English template at
+`crates/niri-xmb-config-studio/locales/en.json` (same
+`{label, description}` shape as the Noctalia plugin translations) is kept
+in sync by a test; see `crates/niri-xmb-config-studio/locales/README.md`
+for the convention and how a future translation plugs in.
 
 ## Checks
 

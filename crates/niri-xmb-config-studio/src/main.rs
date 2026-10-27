@@ -1,20 +1,28 @@
 //! Native editor for niri-xmb TOML.
 //!
 //! Left navigation selects a section, the command bar loads, validates and
-//! saves, and a persistent preview pane paints the current model. The editor
-//! loads the real schema through `niri-xmb config-json`, writes only changed
-//! paths through `toml_edit`, validates with `config-check`, and saves
-//! atomically. It does not talk to the daemon except through the existing
-//! `restart` command after an explicit Save & Restart.
+//! saves, and a persistent live dock shows the popup render, controller state,
+//! and the Niri keybind map. The editor loads the real schema through
+//! `niri-xmb config-json`, writes only changed paths through `toml_edit`,
+//! validates with `config-check`, and saves atomically. It does not talk to the
+//! daemon except through the existing `restart` command after an explicit Save
+//! & Restart.
+
+mod i18n;
+mod keymap;
 
 use anyhow::{Context, Result};
 use eframe::egui;
 use egui::{
-    Align, Align2, Color32, ComboBox, FontId, Layout, Pos2, Rect, RichText, ScrollArea, Sense,
-    Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2,
+    Align, Align2, Color32, ColorImage, ComboBox, CursorIcon, FontId, Layout, Pos2, Rect, RichText,
+    ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2,
+};
+use niri_xmb::config::Config;
+use niri_xmb::preview::{
+    PopupPreview, PreviewFrame, PreviewSelection, PreviewTarget, snapshot_from_json,
 };
 use serde_json::{Map, Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,7 +30,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_CONFIG: &str = "~/.config/niri-xmb/config.toml";
 const XBOX_IMAGE: &[u8] = include_bytes!("../../../assets/controller-render.png");
@@ -69,6 +77,32 @@ const ACTIONS: &[&str] = &[
 ];
 const XMB_ACTIONS: &[&str] = &[
     "up", "down", "left", "right", "tab", "back", "confirm", "close", "open",
+];
+/// Standard gamepad buttons offered by the binding dropdowns, with the usual
+/// Xbox and DualShock labels. Stored values stay evdev names so the TOML also
+/// matches the daemon's presets.
+const BUTTONS: &[(&str, &str)] = &[
+    ("BTN_DPAD_UP", "D-pad up"),
+    ("BTN_DPAD_DOWN", "D-pad down"),
+    ("BTN_DPAD_LEFT", "D-pad left"),
+    ("BTN_DPAD_RIGHT", "D-pad right"),
+    ("BTN_SOUTH", "A / Cross"),
+    ("BTN_EAST", "B / Circle"),
+    ("BTN_WEST", "X / Square"),
+    ("BTN_NORTH", "Y / Triangle"),
+    ("BTN_TL", "LB / L1"),
+    ("BTN_TR", "RB / R1"),
+    ("BTN_TL2", "LT / L2"),
+    ("BTN_TR2", "RT / R2"),
+    ("BTN_SELECT", "Back / Share"),
+    ("BTN_START", "Start / Options"),
+    ("BTN_MODE", "Guide / PS"),
+    ("BTN_THUMBL", "L3"),
+    ("BTN_THUMBR", "R3"),
+    ("BTN_TRIGGER_HAPPY1", "Paddle 1"),
+    ("BTN_TRIGGER_HAPPY2", "Paddle 2"),
+    ("BTN_TRIGGER_HAPPY3", "Paddle 3"),
+    ("BTN_TRIGGER_HAPPY4", "Paddle 4"),
 ];
 
 const COLOR_FIELDS: &[(&str, &str)] = &[
@@ -143,40 +177,40 @@ const XBOX_HOTSPOTS: &[Hotspot] = &[
     Hotspot {
         control: "LT",
         code: None,
-        x: 0.247,
-        y: 0.142,
-        w: 0.070,
-        h: 0.080,
+        x: 0.248,
+        y: 0.139,
+        w: 0.067,
+        h: 0.081,
         circle: false,
         label: false,
     },
     Hotspot {
         control: "RT",
         code: None,
-        x: 0.753,
-        y: 0.142,
-        w: 0.070,
-        h: 0.080,
+        x: 0.752,
+        y: 0.139,
+        w: 0.067,
+        h: 0.081,
         circle: false,
         label: false,
     },
     Hotspot {
         control: "LB",
         code: Some("BTN_TL"),
-        x: 0.213,
-        y: 0.231,
-        w: 0.155,
-        h: 0.050,
+        x: 0.222,
+        y: 0.238,
+        w: 0.164,
+        h: 0.067,
         circle: false,
         label: false,
     },
     Hotspot {
         control: "RB",
         code: Some("BTN_TR"),
-        x: 0.784,
-        y: 0.231,
-        w: 0.150,
-        h: 0.050,
+        x: 0.773,
+        y: 0.238,
+        w: 0.164,
+        h: 0.067,
         circle: false,
         label: false,
     },
@@ -184,29 +218,29 @@ const XBOX_HOTSPOTS: &[Hotspot] = &[
         control: "L STICK",
         code: None,
         x: 0.223,
-        y: 0.530,
-        w: 0.105,
-        h: 0.105,
+        y: 0.52,
+        w: 0.13,
+        h: 0.134,
         circle: true,
         label: true,
     },
     Hotspot {
         control: "D-PAD",
         code: None,
-        x: 0.355,
-        y: 0.706,
-        w: 0.170,
-        h: 0.145,
+        x: 0.356,
+        y: 0.705,
+        w: 0.145,
+        h: 0.125,
         circle: false,
         label: true,
     },
     Hotspot {
         control: "R STICK",
         code: None,
-        x: 0.628,
-        y: 0.722,
-        w: 0.120,
-        h: 0.120,
+        x: 0.627,
+        y: 0.715,
+        w: 0.127,
+        h: 0.128,
         circle: true,
         label: true,
     },
@@ -233,9 +267,9 @@ const XBOX_HOTSPOTS: &[Hotspot] = &[
     Hotspot {
         control: "B",
         code: Some("BTN_EAST"),
-        x: 0.850,
-        y: 0.492,
-        w: 0.075,
+        x: 0.847,
+        y: 0.489,
+        w: 0.072,
         h: 0.075,
         circle: true,
         label: false,
@@ -243,8 +277,8 @@ const XBOX_HOTSPOTS: &[Hotspot] = &[
     Hotspot {
         control: "A",
         code: Some("BTN_SOUTH"),
-        x: 0.772,
-        y: 0.586,
+        x: 0.776,
+        y: 0.59,
         w: 0.075,
         h: 0.075,
         circle: true,
@@ -253,30 +287,30 @@ const XBOX_HOTSPOTS: &[Hotspot] = &[
     Hotspot {
         control: "SELECT",
         code: Some("BTN_SELECT"),
-        x: 0.378,
-        y: 0.487,
-        w: 0.052,
-        h: 0.060,
-        circle: false,
+        x: 0.399,
+        y: 0.497,
+        w: 0.047,
+        h: 0.047,
+        circle: true,
         label: false,
     },
     Hotspot {
         control: "START",
         code: Some("BTN_START"),
-        x: 0.567,
-        y: 0.487,
-        w: 0.052,
-        h: 0.060,
-        circle: false,
+        x: 0.598,
+        y: 0.497,
+        w: 0.047,
+        h: 0.047,
+        circle: true,
         label: false,
     },
     Hotspot {
         control: "GUIDE",
         code: Some("BTN_MODE"),
-        x: 0.500,
-        y: 0.490,
-        w: 0.085,
-        h: 0.085,
+        x: 0.499,
+        y: 0.489,
+        w: 0.095,
+        h: 0.095,
         circle: true,
         label: false,
     },
@@ -286,100 +320,100 @@ const DS4_HOTSPOTS: &[Hotspot] = &[
     Hotspot {
         control: "Touchpad",
         code: None,
-        x: 0.500,
-        y: 0.390,
-        w: 0.360,
-        h: 0.160,
+        x: 0.499,
+        y: 0.344,
+        w: 0.324,
+        h: 0.223,
         circle: false,
-        label: true,
+        label: false,
     },
     Hotspot {
         control: "L2",
         code: Some("BTN_TL2"),
-        x: 0.223,
-        y: 0.048,
-        w: 0.100,
-        h: 0.055,
+        x: 0.196,
+        y: 0.060,
+        w: 0.13,
+        h: 0.072,
         circle: false,
         label: false,
     },
     Hotspot {
         control: "R2",
         code: Some("BTN_TR2"),
-        x: 0.843,
-        y: 0.048,
-        w: 0.100,
-        h: 0.055,
+        x: 0.803,
+        y: 0.060,
+        w: 0.13,
+        h: 0.072,
         circle: false,
         label: false,
     },
     Hotspot {
         control: "L1",
         code: Some("BTN_TL"),
-        x: 0.225,
-        y: 0.122,
-        w: 0.100,
-        h: 0.050,
+        x: 0.196,
+        y: 0.127,
+        w: 0.137,
+        h: 0.061,
         circle: false,
         label: false,
     },
     Hotspot {
         control: "R1",
         code: Some("BTN_TR"),
-        x: 0.842,
-        y: 0.122,
-        w: 0.100,
-        h: 0.050,
+        x: 0.803,
+        y: 0.127,
+        w: 0.137,
+        h: 0.061,
         circle: false,
         label: false,
     },
     Hotspot {
         control: "Triangle",
         code: Some("BTN_NORTH"),
-        x: 0.806,
-        y: 0.396,
-        w: 0.070,
-        h: 0.070,
+        x: 0.803,
+        y: 0.392,
+        w: 0.066,
+        h: 0.066,
         circle: true,
         label: false,
     },
     Hotspot {
         control: "Circle",
         code: Some("BTN_EAST"),
-        x: 0.880,
+        x: 0.874,
         y: 0.508,
-        w: 0.070,
-        h: 0.070,
+        w: 0.066,
+        h: 0.066,
         circle: true,
         label: false,
     },
     Hotspot {
         control: "Cross",
         code: Some("BTN_SOUTH"),
-        x: 0.807,
-        y: 0.620,
-        w: 0.070,
-        h: 0.070,
+        x: 0.803,
+        y: 0.621,
+        w: 0.066,
+        h: 0.066,
         circle: true,
         label: false,
     },
     Hotspot {
         control: "Square",
         code: Some("BTN_WEST"),
-        x: 0.721,
-        y: 0.511,
-        w: 0.070,
-        h: 0.070,
+        x: 0.732,
+        y: 0.508,
+        w: 0.066,
+        h: 0.066,
         circle: true,
         label: false,
     },
     Hotspot {
         control: "D-PAD",
         code: None,
-        x: 0.182,
-        y: 0.505,
-        w: 0.170,
-        h: 0.140,
+        x: 0.196,
+        y: 0.500,
+        w: 0.188,
+        h: 0.188,
         circle: false,
         label: true,
     },
@@ -387,49 +421,49 @@ const DS4_HOTSPOTS: &[Hotspot] = &[
         control: "L3",
         code: Some("BTN_THUMBL"),
         x: 0.349,
-        y: 0.789,
-        w: 0.110,
-        h: 0.110,
+        y: 0.773,
+        w: 0.106,
+        h: 0.106,
         circle: true,
-        label: true,
+        label: false,
     },
     Hotspot {
         control: "R3",
         code: Some("BTN_THUMBR"),
-        x: 0.660,
-        y: 0.789,
-        w: 0.110,
-        h: 0.110,
+        x: 0.654,
+        y: 0.773,
+        w: 0.106,
+        h: 0.106,
         circle: true,
-        label: true,
+        label: false,
     },
     Hotspot {
         control: "Share",
         code: Some("BTN_SELECT"),
-        x: 0.292,
-        y: 0.319,
-        w: 0.045,
-        h: 0.060,
+        x: 0.312,
+        y: 0.341,
+        w: 0.033,
+        h: 0.059,
         circle: false,
         label: false,
     },
     Hotspot {
         control: "Options",
         code: Some("BTN_START"),
-        x: 0.706,
-        y: 0.319,
-        w: 0.045,
-        h: 0.060,
+        x: 0.700,
+        y: 0.341,
+        w: 0.033,
+        h: 0.059,
         circle: false,
         label: false,
     },
     Hotspot {
         control: "PS",
         code: Some("BTN_MODE"),
-        x: 0.500,
-        y: 0.681,
-        w: 0.070,
-        h: 0.070,
+        x: 0.502,
+        y: 0.692,
+        w: 0.055,
+        h: 0.055,
         circle: true,
         label: false,
     },
@@ -531,16 +565,14 @@ enum Section {
     Trigger,
     Popup,
     Appearance,
-    Preview,
 }
 
 impl Section {
-    const ALL: [(Section, &'static str); 5] = [
+    const ALL: [(Section, &'static str); 4] = [
         (Self::Controller, "Controller"),
         (Self::Trigger, "Trigger Lab"),
         (Self::Popup, "Popup"),
         (Self::Appearance, "Appearance"),
-        (Self::Preview, "Preview"),
     ];
 
     fn title(self) -> &'static str {
@@ -549,7 +581,6 @@ impl Section {
             Self::Trigger => "Trigger Lab",
             Self::Popup => "Popup",
             Self::Appearance => "Appearance",
-            Self::Preview => "Preview",
         }
     }
 
@@ -559,7 +590,34 @@ impl Section {
             Self::Trigger => "Response curve and speed tuning",
             Self::Popup => "Panel, behavior, peek, animation",
             Self::Appearance => "Theme, colors, bars",
-            Self::Preview => "Live daemon snapshot",
+        }
+    }
+}
+
+/// Tabs in the persistent live dock.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DockTab {
+    Popup,
+    Controller,
+    Keyboard,
+}
+
+impl DockTab {
+    const ALL: [DockTab; 3] = [Self::Popup, Self::Controller, Self::Keyboard];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Popup => "Popup",
+            Self::Controller => "Controller",
+            Self::Keyboard => "Keyboard",
+        }
+    }
+
+    /// The tab that best matches an editor section for auto-follow.
+    fn for_section(section: Section) -> Self {
+        match section {
+            Section::Controller | Section::Trigger => Self::Controller,
+            Section::Popup | Section::Appearance => Self::Popup,
         }
     }
 }
@@ -585,13 +643,28 @@ fn spawn_live(
     thread::Builder::new()
         .name("niri-xmb-studio-live".into())
         .spawn(move || {
+            // The daemon mirrors its snapshot into the runtime directory, so
+            // status plus a file read is enough after the first iteration.
+            let mut mirror: Option<PathBuf> = None;
             while !stop.load(Ordering::Relaxed) {
                 let status = run_niri(&niri_xmb, &["status"])
                     .ok()
                     .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-                let snapshot = run_niri(&niri_xmb, &["snapshot"])
-                    .ok()
-                    .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+                if let Some(path) = status
+                    .as_ref()
+                    .and_then(|status| status["snapshot_mirror"].as_str())
+                {
+                    mirror = Some(PathBuf::from(path));
+                }
+                let snapshot = mirror
+                    .as_ref()
+                    .and_then(|path| fs::read_to_string(path).ok())
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    .or_else(|| {
+                        run_niri(&niri_xmb, &["snapshot"])
+                            .ok()
+                            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    });
                 if let Ok(mut state) = live.lock() {
                     if let Some(status) = status {
                         state.status = status;
@@ -604,7 +677,7 @@ fn spawn_live(
                         state.error = "daemon status unavailable".to_string();
                     }
                 }
-                thread::sleep(Duration::from_millis(750));
+                thread::sleep(Duration::from_millis(400));
             }
         })
         .expect("spawn live studio poller")
@@ -645,6 +718,22 @@ struct StudioApp {
     live_thread: Option<JoinHandle<()>>,
     xbox_texture: Option<TextureHandle>,
     ds4_texture: Option<TextureHandle>,
+    preview: Option<PopupPreview>,
+    preview_texture: Option<TextureHandle>,
+    preview_frame: Option<PreviewFrame>,
+    preview_key: String,
+    preview_hover: Option<PreviewTarget>,
+    preview_selection: Option<PreviewSelection>,
+    preview_selection_at: Instant,
+    dock_tab: DockTab,
+    dock_collapsed: bool,
+    dock_height: f32,
+    dock_follow: bool,
+    dock_section: Section,
+    keymap: keymap::NiriKeymap,
+    keymap_at: Instant,
+    keymap_search: String,
+    keymap_selected: Option<String>,
 }
 
 impl StudioApp {
@@ -676,6 +765,22 @@ impl StudioApp {
             live_thread: None,
             xbox_texture: None,
             ds4_texture: None,
+            preview: None,
+            preview_texture: None,
+            preview_frame: None,
+            preview_key: String::new(),
+            preview_hover: None,
+            preview_selection: None,
+            preview_selection_at: Instant::now(),
+            dock_tab: DockTab::Popup,
+            dock_collapsed: false,
+            dock_height: 360.0,
+            dock_follow: true,
+            dock_section: Section::Controller,
+            keymap: keymap::NiriKeymap::load_default(),
+            keymap_at: Instant::now(),
+            keymap_search: String::new(),
+            keymap_selected: None,
         };
         app.live_thread = Some(spawn_live(
             niri_xmb,
@@ -868,7 +973,7 @@ impl StudioApp {
                                 .desired_width(path_width)
                                 .hint_text("~/.config/niri-xmb/config.toml"),
                         );
-                        if ui.button("Load").clicked() {
+                        if tt(ui.button("Load"), "ui.action.load").clicked() {
                             self.load();
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -889,7 +994,7 @@ impl StudioApp {
                                 .desired_width(path_width)
                                 .hint_text("~/.config/niri-xmb/config.toml"),
                         );
-                        if ui.button("Load").clicked() {
+                        if tt(ui.button("Load"), "ui.action.load").clicked() {
                             self.load();
                         }
                     });
@@ -1003,28 +1108,49 @@ impl StudioApp {
 
     fn action_buttons(&mut self, ui: &mut Ui) {
         let dirty = self.dirty();
-        if ui.selectable_label(self.show_changes, "Changes").clicked() {
+        if tt(
+            ui.selectable_label(self.show_changes, "Changes"),
+            "ui.action.changes",
+        )
+        .clicked()
+        {
             self.show_changes = !self.show_changes;
         }
-        if ui.button("Preview").clicked() {
-            self.section = Section::Preview;
+        if tt(ui.button("Preview"), "ui.action.preview").clicked() {
+            self.dock_tab = DockTab::Popup;
+            self.dock_collapsed = false;
+            self.dock_follow = true;
         }
-        if ui
-            .add_enabled(self.model != Value::Null, egui::Button::new("Validate"))
-            .clicked()
+        if tt(
+            ui.add_enabled(self.model != Value::Null, egui::Button::new("Validate")),
+            "ui.action.validate",
+        )
+        .clicked()
         {
             self.validate();
         }
-        if ui.add_enabled(dirty, egui::Button::new("Save")).clicked() {
+        if tt(
+            ui.add_enabled(dirty, egui::Button::new("Save")),
+            "ui.action.save",
+        )
+        .clicked()
+        {
             self.request_save(false);
         }
-        if ui
-            .add_enabled(dirty, egui::Button::new("Save & Restart"))
-            .clicked()
+        if tt(
+            ui.add_enabled(dirty, egui::Button::new("Save & Restart")),
+            "ui.action.save_restart",
+        )
+        .clicked()
         {
             self.request_save(true);
         }
-        if ui.add_enabled(dirty, egui::Button::new("Revert")).clicked() {
+        if tt(
+            ui.add_enabled(dirty, egui::Button::new("Revert")),
+            "ui.action.revert",
+        )
+        .clicked()
+        {
             self.revert();
         }
     }
@@ -1040,7 +1166,7 @@ impl StudioApp {
                 {
                     self.show_candidate = !self.show_candidate;
                 }
-                if ui.small_button("Copy TOML").clicked() {
+                if tt(ui.small_button("Copy TOML"), "ui.action.copy_toml").clicked() {
                     ui.ctx().copy_text(self.candidate.clone());
                 }
             }
@@ -1151,7 +1277,7 @@ impl StudioApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Error").strong().color(ERROR));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("Dismiss").clicked() {
+                        if tt(ui.small_button("Dismiss"), "ui.action.dismiss").clicked() {
                             self.error.clear();
                         }
                     });
@@ -1188,7 +1314,6 @@ impl StudioApp {
                             Section::Trigger => self.trigger_section(ui),
                             Section::Popup => self.popup_section(ui),
                             Section::Appearance => self.appearance_section(ui),
-                            Section::Preview => self.preview_section(ui),
                         }
                         ui.add_space(24.0);
                     });
@@ -1419,11 +1544,20 @@ impl StudioApp {
                     .rect_stroke(hit, 6.0, stroke, StrokeKind::Inside);
             }
             if hotspot.label {
+                let pos = Pos2::new(center.x, hit.max.y + 3.0);
+                let font = FontId::monospace(label_size);
                 ui.painter().text(
-                    Pos2::new(center.x, hit.max.y + 3.0),
+                    pos + Vec2::new(0.0, 1.0),
                     Align2::CENTER_TOP,
                     hotspot.control,
-                    FontId::monospace(label_size),
+                    font.clone(),
+                    Color32::from_rgba_unmultiplied(12, 14, 18, 200),
+                );
+                ui.painter().text(
+                    pos,
+                    Align2::CENTER_TOP,
+                    hotspot.control,
+                    font,
                     Color32::from_gray(166),
                 );
             }
@@ -1576,7 +1710,7 @@ impl StudioApp {
                     &["none", "auto", "xbox", "ds4"],
                 );
                 self.list_field(&mut cols[0], "gamepad.devices", "Devices");
-                self.list_field(&mut cols[0], "gamepad.open_combo", "Open combo");
+                self.button_list_field(&mut cols[0], "gamepad.open_combo", "Open combo");
 
                 self.combo_field(
                     &mut cols[1],
@@ -1584,7 +1718,7 @@ impl StudioApp {
                     "Default mode",
                     &["game", "navi"],
                 );
-                self.list_field(&mut cols[1], "gamepad.mode.toggle", "Mode toggle");
+                self.button_list_field(&mut cols[1], "gamepad.mode.toggle", "Mode toggle");
                 self.bool_field(&mut cols[1], "gamepad.mode.grab_in_navi", "Grab in navi");
                 self.bool_field(
                     &mut cols[1],
@@ -1601,14 +1735,14 @@ impl StudioApp {
                 &["none", "auto", "xbox", "ds4"],
             );
             self.list_field(ui, "gamepad.devices", "Devices");
-            self.list_field(ui, "gamepad.open_combo", "Open combo");
+            self.button_list_field(ui, "gamepad.open_combo", "Open combo");
             self.combo_field(
                 ui,
                 "gamepad.mode.default",
                 "Default mode",
                 &["game", "navi"],
             );
-            self.list_field(ui, "gamepad.mode.toggle", "Mode toggle");
+            self.button_list_field(ui, "gamepad.mode.toggle", "Mode toggle");
             self.bool_field(ui, "gamepad.mode.grab_in_navi", "Grab in navi");
             self.bool_field(
                 ui,
@@ -1861,14 +1995,19 @@ impl StudioApp {
         let mut value = get_path(&self.model, "gamepad.navi.pointer.trigger_deadzone")
             .and_then(Value::as_f64)
             .unwrap_or(0.08) as f32;
-        let changed = field_row(ui, "Pull deadzone", |ui| {
-            ui.add(
-                egui::DragValue::new(&mut value)
-                    .speed(0.005)
-                    .range(0.0..=max),
-            )
-            .changed()
-        });
+        let changed = field_row_path(
+            ui,
+            Some("gamepad.navi.pointer.trigger_deadzone"),
+            "Pull deadzone",
+            |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut value)
+                        .speed(0.005)
+                        .range(0.0..=max),
+                )
+                .changed()
+            },
+        );
         if changed {
             set_json_path(
                 &mut self.model,
@@ -3296,141 +3435,11 @@ impl StudioApp {
             {
                 bars.remove(index);
             }
-            if ui.button("Add bar").clicked()
+            if tt(ui.button("Add bar"), "ui.action.add_bar").clicked()
                 && let Some(bars) = self.model["bars"].as_array_mut()
             {
                 bars.push(default_bar());
             }
-        });
-    }
-
-    fn preview_section(&mut self, ui: &mut Ui) {
-        self.section_header(ui);
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("XMB panel").size(12.0).strong());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} / {} / {}",
-                            self.model["popup"]["outputs"].as_str().unwrap_or("focused"),
-                            self.model["popup"]["position"].as_str().unwrap_or("cursor"),
-                            self.model["popup"]["surface_mode"]
-                                .as_str()
-                                .unwrap_or("fixed")
-                        ))
-                        .monospace()
-                        .size(9.5)
-                        .color(TEXT_DIM),
-                    );
-                });
-            });
-            ui.add_space(6.0);
-            self.live_xmb_preview(ui, ui.available_width());
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "labels {}",
-                        if self.model["popup"]["show_labels"]
-                            .as_bool()
-                            .unwrap_or(false)
-                        {
-                            "on"
-                        } else {
-                            "off"
-                        }
-                    ))
-                    .monospace()
-                    .size(9.5)
-                    .color(TEXT_DIM),
-                );
-                ui.label(
-                    RichText::new(format!(
-                        "titles {}",
-                        if self.model["popup"]["show_titles"]
-                            .as_bool()
-                            .unwrap_or(false)
-                        {
-                            "on"
-                        } else {
-                            "off"
-                        }
-                    ))
-                    .monospace()
-                    .size(9.5)
-                    .color(TEXT_DIM),
-                );
-                ui.label(
-                    RichText::new(format!(
-                        "anim {}",
-                        self.model["animation"]["panel_ms"].as_f64().unwrap_or(0.0)
-                    ))
-                    .monospace()
-                    .size(9.5)
-                    .color(TEXT_DIM),
-                );
-            });
-        });
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Bars").size(12.0).strong());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!("{} bars", array_len(&self.model["bars"])))
-                            .monospace()
-                            .size(9.5)
-                            .color(TEXT_DIM),
-                    );
-                });
-            });
-            ui.add_space(4.0);
-            if !self.model["bars_enabled"].as_bool().unwrap_or(false) {
-                ui.label(RichText::new("Bars disabled").size(11.0).color(TEXT_MUTED));
-            } else {
-                let bars = self.model["bars"].as_array().cloned().unwrap_or_default();
-                if bars.is_empty() {
-                    ui.label(RichText::new("No bars").size(11.0).color(TEXT_MUTED));
-                }
-                for (index, bar) in bars.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("Bar {}", index + 1)).size(11.0));
-                        ui.label(
-                            RichText::new(bar["output"].as_str().unwrap_or(""))
-                                .monospace()
-                                .size(9.5)
-                                .color(TEXT_DIM),
-                        );
-                    });
-                    self.bar_preview(ui, bar, ui.available_width());
-                    ui.add_space(6.0);
-                }
-            }
-        });
-        card(ui, |ui| {
-            ui.label(RichText::new("Model").size(12.0).strong());
-            ui.add_space(4.0);
-            metric_row(
-                ui,
-                "Navi bindings",
-                map_len(&self.model["gamepad"]["navi"]["bindings"]),
-            );
-            metric_row(
-                ui,
-                "XMB buttons",
-                map_len(&self.model["gamepad"]["buttons"]),
-            );
-            metric_row(
-                ui,
-                "Layers",
-                map_len(&self.model["gamepad"]["navi"]["layers"]),
-            );
-            metric_row(ui, "Bars", array_len(&self.model["bars"]));
-            metric_row(
-                ui,
-                "Placements",
-                array_len(&self.model["popup"]["placements"]),
-            );
         });
     }
 
@@ -3439,7 +3448,7 @@ impl StudioApp {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let changed = field_row(ui, label, |ui| {
+        let changed = field_row_path(ui, Some(path), label, |ui| {
             ui.add(egui::TextEdit::singleline(&mut value).desired_width(input_width(ui)))
                 .changed()
         });
@@ -3452,7 +3461,9 @@ impl StudioApp {
         let mut value = get_path(&self.model, path)
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let changed = field_row(ui, label, |ui| ui.checkbox(&mut value, "").changed());
+        let changed = field_row_path(ui, Some(path), label, |ui| {
+            ui.checkbox(&mut value, "").changed()
+        });
         if changed {
             set_json_path(&mut self.model, path, Value::Bool(value));
         }
@@ -3462,7 +3473,7 @@ impl StudioApp {
         let mut value = get_path(&self.model, path)
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
-        let changed = field_row(ui, label, |ui| {
+        let changed = field_row_path(ui, Some(path), label, |ui| {
             ui.add(
                 egui::DragValue::new(&mut value)
                     .speed(speed)
@@ -3479,7 +3490,7 @@ impl StudioApp {
         let mut value = get_path(&self.model, path)
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let changed = field_row(ui, label, |ui| {
+        let changed = field_row_path(ui, Some(path), label, |ui| {
             ui.add(egui::DragValue::new(&mut value).speed(1.0).range(min..=max))
                 .changed()
         });
@@ -3492,7 +3503,7 @@ impl StudioApp {
         let mut value = get_path(&self.model, path)
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        let changed = field_row(ui, label, |ui| {
+        let changed = field_row_path(ui, Some(path), label, |ui| {
             ui.add(egui::DragValue::new(&mut value).speed(1.0))
                 .changed()
         });
@@ -3507,7 +3518,7 @@ impl StudioApp {
             .unwrap_or("")
             .to_string();
         let old = value.clone();
-        let changed = field_row(ui, label, |ui| {
+        let changed = field_row_path(ui, Some(path), label, |ui| {
             let mut changed = false;
             ComboBox::from_id_salt(path)
                 .width(input_width(ui).clamp(90.0, 280.0))
@@ -3538,7 +3549,7 @@ impl StudioApp {
             })
             .unwrap_or_default();
         let mut text = value;
-        let changed = field_row(ui, label, |ui| {
+        let changed = field_row_path(ui, Some(path), label, |ui| {
             ui.add(egui::TextEdit::singleline(&mut text).desired_width(input_width(ui)))
                 .changed()
         });
@@ -3553,6 +3564,47 @@ impl StudioApp {
         }
     }
 
+    /// Multi-select for button-code lists such as the open combo, the mode
+    /// toggle, and layer hold buttons.
+    fn button_list_field(&mut self, ui: &mut Ui, path: &str, label: &str) {
+        let values = get_path(&self.model, path)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut removed = None;
+        let mut added = None;
+        field_row_path(ui, Some(path), label, |ui| {
+            for (index, value) in values.iter().enumerate() {
+                let mut text = RichText::new(format!("{value}  ×")).monospace().size(10.5);
+                if !BUTTONS.iter().any(|(name, _)| *name == value.as_str()) {
+                    text = text.color(WARN);
+                }
+                if ui.small_button(text).on_hover_text("Remove").clicked() {
+                    removed = Some(index);
+                }
+            }
+            added = button_menu(ui, "+ Add", &values);
+            removed.is_some() || added.is_some()
+        });
+        if let Some(index) = removed {
+            if let Some(items) = get_path_mut(&mut self.model, path).and_then(Value::as_array_mut)
+                && index < items.len()
+            {
+                items.remove(index);
+            }
+        } else if let Some(button) = added
+            && let Some(items) = get_path_mut(&mut self.model, path).and_then(Value::as_array_mut)
+        {
+            items.push(json!(button));
+        }
+    }
+
     fn length_field(&mut self, ui: &mut Ui, path: &str, label: &str) {
         let value = get_path(&self.model, path)
             .map(|value| match value {
@@ -3562,7 +3614,7 @@ impl StudioApp {
             })
             .unwrap_or_default();
         let mut text = value;
-        let changed = field_row(ui, label, |ui| {
+        let changed = field_row_path(ui, Some(path), label, |ui| {
             ui.add(egui::TextEdit::singleline(&mut text).desired_width(input_width(ui).min(170.0)))
                 .changed()
         });
@@ -3584,7 +3636,7 @@ impl StudioApp {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let changed = field_row(ui, label, |ui| {
+        let changed = field_row_path(ui, Some(path), label, |ui| {
             let changed = ui
                 .add(
                     egui::TextEdit::singleline(&mut value)
@@ -3609,7 +3661,12 @@ impl StudioApp {
             })
             .unwrap_or_default();
         ui.horizontal(|ui| {
-            ui.label(RichText::new(title).size(11.5).strong());
+            let title_response = ui.add(
+                egui::Label::new(RichText::new(title).size(11.5).strong()).sense(Sense::hover()),
+            );
+            if let Some(hover) = i18n::hover_for(None, title) {
+                title_response.on_hover_text(hover);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
                     RichText::new(format!("{} entries", entries.len()))
@@ -3635,17 +3692,12 @@ impl StudioApp {
                 self.binding_row(ui, path, actions, code, action);
             }
         }
-        if ui.button("Add binding").clicked() {
-            let mut code = "BTN_NEW".to_string();
-            let mut suffix = 1;
-            while get_path(&self.model, path)
-                .and_then(Value::as_object)
-                .is_some_and(|map| map.contains_key(&code))
-            {
-                code = format!("BTN_NEW{suffix}");
-                suffix += 1;
-            }
-            set_map_value(&mut self.model, path, &code, actions[0]);
+        let used = entries
+            .iter()
+            .map(|(code, _)| code.clone())
+            .collect::<Vec<_>>();
+        if let Some(code) = button_menu(ui, "Add binding", &used) {
+            set_map_value(&mut self.model, path, code, actions[0]);
         }
     }
 
@@ -3653,15 +3705,44 @@ impl StudioApp {
         let mut next_code = code.to_string();
         let mut next_action = action.to_string();
         let mut remove = false;
+        // Every other row's code, so the dropdown only offers free buttons.
+        let used = get_path(&self.model, path)
+            .and_then(Value::as_object)
+            .map(|map| {
+                map.keys()
+                    .filter(|key| key.as_str() != code)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let changed = ui
             .horizontal(|ui| {
-                let code_changed = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut next_code)
-                            .desired_width(120.0)
-                            .font(egui::TextStyle::Monospace),
-                    )
-                    .changed();
+                let mut code_changed = false;
+                ComboBox::from_id_salt(("binding-code", path, code))
+                    .width(120.0)
+                    .selected_text(RichText::new(&next_code).monospace())
+                    .show_ui(ui, |ui| {
+                        if !BUTTONS.iter().any(|(name, _)| *name == next_code) {
+                            let current = next_code.clone();
+                            ui.selectable_value(
+                                &mut next_code,
+                                current.clone(),
+                                RichText::new(current).monospace(),
+                            )
+                            .on_hover_text("Custom button code from the config");
+                        }
+                        for (option, label) in button_options(&used) {
+                            code_changed |= ui
+                                .selectable_value(
+                                    &mut next_code,
+                                    option.to_string(),
+                                    RichText::new(format!("{option}   {label}"))
+                                        .monospace()
+                                        .size(11.0),
+                                )
+                                .changed();
+                        }
+                    });
                 let mut action_changed = false;
                 ComboBox::from_id_salt(("binding", path, code))
                     .width((ui.available_width() - 34.0).clamp(100.0, 320.0))
@@ -3714,7 +3795,7 @@ impl StudioApp {
                 });
             });
             ui.add_space(4.0);
-            self.list_field(ui, &format!("{path}.hold"), "Hold buttons");
+            self.button_list_field(ui, &format!("{path}.hold"), "Hold buttons");
             let axes_count = self.model["gamepad"]["navi"]["layers"][&name]["hold_axes"]
                 .as_array()
                 .map_or(0, Vec::len);
@@ -3768,7 +3849,7 @@ impl StudioApp {
             {
                 axes.remove(index);
             }
-            if ui.button("Add hold axis").clicked()
+            if tt(ui.button("Add hold axis"), "ui.action.add_hold_axis").clicked()
                 && let Some(axes) =
                     self.model["gamepad"]["navi"]["layers"][&name]["hold_axes"].as_array_mut()
             {
@@ -3781,7 +3862,7 @@ impl StudioApp {
         {
             layers.remove(&name);
         }
-        if ui.button("Add layer").clicked() {
+        if tt(ui.button("Add layer"), "ui.action.add_layer").clicked() {
             let mut name = "layer".to_string();
             let mut suffix = 1;
             while self.model["gamepad"]["navi"]["layers"]
@@ -3860,21 +3941,20 @@ impl StudioApp {
         {
             items.remove(index);
         }
-        if ui.button("Add placement").clicked()
+        if tt(ui.button("Add placement"), "ui.action.add_placement").clicked()
             && let Some(items) = self.model["popup"]["placements"].as_array_mut()
         {
             items.push(json!({"output": "", "x": "center", "y": "center", "margin": 48.0}));
         }
     }
 
-    fn live_xmb_preview(&self, ui: &mut Ui, max_width: f32) {
+    fn live_xmb_preview(&mut self, ui: &mut Ui, max: Vec2) {
         let live = self
             .live
             .lock()
             .map(|live| live.clone())
             .unwrap_or_default();
-        let snapshot = &live.snapshot;
-        let Some(outputs) = snapshot["outputs"].as_array() else {
+        let Some(snapshot) = snapshot_from_json(&live.snapshot) else {
             ui.label(
                 RichText::new("Waiting for niri-xmb live snapshot")
                     .size(10.0)
@@ -3882,7 +3962,7 @@ impl StudioApp {
             );
             return;
         };
-        if outputs.is_empty() {
+        if snapshot.outputs.is_empty() {
             ui.label(
                 RichText::new("No outputs in live snapshot")
                     .size(10.0)
@@ -3890,166 +3970,181 @@ impl StudioApp {
             );
             return;
         }
-        let width = max_width.clamp(240.0, 720.0);
-        let height = 220.0;
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-        let painter = ui.painter();
-        let style = &self.model["style"];
-        let background = style_color(style["background"].as_str().unwrap_or(""));
-        let border = style_color(style["border"].as_str().unwrap_or(""));
-        let surface = style_color(style["surface"].as_str().unwrap_or(""));
-        let accent = style_color(style["accent"].as_str().unwrap_or(""));
-        painter.rect_filled(rect, 10.0, background);
-        painter.rect_stroke(rect, 10.0, Stroke::new(1.0_f32, border), StrokeKind::Inside);
-        painter.text(
-            Pos2::new(rect.min.x + 10.0, rect.min.y + 7.0),
-            Align2::LEFT_TOP,
-            "LIVE",
-            FontId::monospace(9.0),
-            accent,
-        );
-        let mode = live.status["mode"].as_str().unwrap_or("daemon");
-        painter.text(
-            Pos2::new(rect.max.x - 10.0, rect.min.y + 7.0),
-            Align2::RIGHT_TOP,
-            mode,
-            FontId::monospace(9.0),
-            TEXT_DIM,
-        );
-        let inner = Rect::from_min_max(
-            Pos2::new(rect.min.x + 10.0, rect.min.y + 22.0),
-            Pos2::new(rect.max.x - 10.0, rect.max.y - 8.0),
-        );
-        let selected_window = live.status["selection"]["window_id"]
-            .as_u64()
-            .or_else(|| snapshot["focused_window"].as_u64());
-        let visible = outputs.iter().take(2).collect::<Vec<_>>();
-        let gap = 8.0;
-        let col_width = (inner.width() - gap * (visible.len().saturating_sub(1) as f32))
-            / visible.len().max(1) as f32;
-        let mut focus_window = None;
-        for (output_index, output) in visible.iter().enumerate() {
-            let col = Rect::from_min_size(
-                Pos2::new(
-                    inner.min.x + output_index as f32 * (col_width + gap),
-                    inner.min.y,
-                ),
-                Vec2::new(col_width, inner.height()),
+        let Ok(config) = serde_json::from_value::<Config>(self.model.clone()) else {
+            ui.label(
+                RichText::new("Preview cannot read the current config")
+                    .size(10.0)
+                    .color(ERROR),
             );
-            painter.rect_filled(col, 6.0, surface);
-            painter.text(
-                Pos2::new(col.min.x + 7.0, col.min.y + 5.0),
-                Align2::LEFT_TOP,
-                output["name"].as_str().unwrap_or("output"),
-                FontId::monospace(9.0),
-                TEXT_MUTED,
+            return;
+        };
+        let live_selection = PreviewSelection::from_live(&live.status, &snapshot);
+        let landed = self.preview_selection.as_ref().is_some_and(|pending| {
+            live_selection.as_ref().is_some_and(|live| {
+                live.output == pending.output
+                    && live.workspace_id == pending.workspace_id
+                    && pending
+                        .window_id
+                        .is_none_or(|window| live.window_id == Some(window))
+            })
+        });
+        if landed || self.preview_selection_at.elapsed() > Duration::from_millis(1800) {
+            self.preview_selection = None;
+        }
+        let selection = self.preview_selection.clone().or(live_selection);
+        let mode = live.status["mode"].as_str().unwrap_or("hidden");
+        let input_active = matches!(mode, "manual" | "peek_armed");
+        let key = format!(
+            "{}\n{}\n{:?}\n{}\n{input_active}",
+            self.model, live.snapshot, selection, mode
+        );
+        if self.preview.is_none() {
+            self.preview = Some(PopupPreview::new());
+        }
+        if let Some(preview) = self.preview.as_mut() {
+            preview.set_input_active(input_active);
+        }
+        if key != self.preview_key || self.preview_texture.is_none() {
+            self.preview_key = key;
+            self.render_live_preview(ui.ctx(), &config, &snapshot, selection.as_ref());
+        }
+        let Some(frame) = self.preview_frame.as_ref() else {
+            ui.label(
+                RichText::new("Popup could not be rendered")
+                    .size(10.0)
+                    .color(TEXT_DIM),
             );
-            let workspaces = output["workspaces"].as_array().cloned().unwrap_or_default();
-            let row_height = ((col.height() - 22.0) / workspaces.len().max(1) as f32).max(24.0);
-            for (workspace_index, workspace) in workspaces.iter().take(4).enumerate() {
-                let row = Rect::from_min_size(
-                    Pos2::new(
-                        col.min.x + 5.0,
-                        col.min.y + 21.0 + workspace_index as f32 * row_height,
-                    ),
-                    Vec2::new(col.width() - 10.0, row_height - 3.0),
-                );
-                let active = workspace["active"].as_bool().unwrap_or(false)
-                    || workspace["focused"].as_bool().unwrap_or(false);
-                if active {
-                    painter.rect_stroke(row, 4.0, Stroke::new(1.0_f32, accent), StrokeKind::Inside);
-                }
-                let label = workspace["name"]
-                    .as_str()
-                    .or_else(|| workspace["label"].as_str())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("#{}", workspace["index"].as_u64().unwrap_or(0)));
-                painter.text(
-                    Pos2::new(row.min.x + 4.0, row.center().y),
-                    Align2::LEFT_CENTER,
-                    label,
-                    FontId::monospace(8.0),
-                    if active { accent } else { TEXT_DIM },
-                );
-                let windows = workspace["windows"].as_array().cloned().unwrap_or_default();
-                for (window_index, window) in windows.iter().take(6).enumerate() {
-                    let tile = Rect::from_min_size(
-                        Pos2::new(
-                            row.min.x + 34.0 + window_index as f32 * 28.0,
-                            row.center().y - 10.0,
-                        ),
-                        Vec2::splat(20.0),
-                    );
-                    if tile.max.x > row.max.x {
-                        break;
-                    }
-                    let focused = selected_window == window["id"].as_u64();
-                    let urgent = window["urgent"].as_bool().unwrap_or(false);
-                    let color = app_color(window["app_id"].as_str().unwrap_or("?"));
-                    painter.rect_filled(tile, 4.0, color);
-                    painter.rect_stroke(
-                        tile,
-                        4.0,
-                        Stroke::new(
-                            if focused { 2.0_f32 } else { 1.0_f32 },
-                            if focused {
-                                Color32::WHITE
-                            } else if urgent {
-                                ERROR
-                            } else {
-                                border
-                            },
-                        ),
-                        StrokeKind::Inside,
-                    );
-                    painter.text(
-                        tile.center(),
-                        Align2::CENTER_CENTER,
-                        window["app_id"]
-                            .as_str()
-                            .unwrap_or("?")
-                            .rsplit('.')
-                            .next()
-                            .unwrap_or("?")
-                            .chars()
-                            .next()
-                            .unwrap_or('?')
-                            .to_ascii_uppercase()
-                            .to_string(),
-                        FontId::monospace(8.0),
-                        Color32::WHITE,
-                    );
-                    let response = ui.interact(
-                        tile,
-                        ui.id()
-                            .with(("live-window", output_index, workspace_index, window_index)),
-                        Sense::click(),
-                    );
-                    if response.clicked() {
-                        focus_window = window["id"].as_u64();
-                    }
-                    if let Some(title) = window["title"].as_str() {
-                        response.on_hover_text(title);
-                    }
-                }
+            return;
+        };
+        let image_size = Vec2::new(frame.width.max(1) as f32, frame.height.max(1) as f32);
+        let scale = (max.x / image_size.x).min(max.y / image_size.y).min(1.0);
+        if scale <= 0.0 {
+            return;
+        }
+        let size = image_size * scale;
+        let stage = Vec2::new(max.x.max(size.x), max.y.max(size.y + 8.0));
+        let (stage_rect, response) = ui.allocate_exact_size(stage, Sense::click());
+        let rect = Rect::from_center_size(stage_rect.center(), size);
+
+        let pointer = response.hover_pos().and_then(|pos| {
+            rect.contains(pos).then(|| {
+                (
+                    (pos.x - rect.min.x) / rect.width() * image_size.x,
+                    (pos.y - rect.min.y) / rect.height() * image_size.y,
+                )
+            })
+        });
+        let target =
+            pointer.and_then(|(x, y)| self.preview_frame.as_ref()?.target_at(x, y).cloned());
+        if target != self.preview_hover {
+            self.preview_hover = target.clone();
+            let changed = self
+                .preview
+                .as_mut()
+                .is_some_and(|preview| preview.set_pointer(pointer));
+            if changed {
+                self.render_live_preview(ui.ctx(), &config, &snapshot, selection.as_ref());
             }
         }
-        if let Some(window_id) = focus_window {
-            let _ = Command::new(&self.niri_xmb)
-                .args(["focus-window", "--window-id", &window_id.to_string()])
-                .spawn();
+        if matches!(
+            target,
+            Some(PreviewTarget::Window { .. } | PreviewTarget::Workspace { .. })
+        ) {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        painter.text(
-            Pos2::new(rect.min.x + 10.0, rect.max.y - 7.0),
-            Align2::LEFT_BOTTOM,
-            if snapshot["focused_window"].is_u64() {
-                "click a window to focus"
-            } else {
-                "live snapshot"
-            },
-            FontId::monospace(8.0),
-            TEXT_DIM,
+
+        if let Some(texture) = self.preview_texture.clone() {
+            ui.painter().image(
+                texture.id(),
+                rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+
+        if response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let click = (
+                (pos.x - rect.min.x) / rect.width() * image_size.x,
+                (pos.y - rect.min.y) / rect.height() * image_size.y,
+            );
+            let clicked = self
+                .preview_frame
+                .as_ref()
+                .and_then(|frame| frame.target_at(click.0, click.1).cloned());
+            if let Some(target) = clicked {
+                let output = selection
+                    .as_ref()
+                    .map(|selection| selection.output.clone())
+                    .or_else(|| snapshot.focused_output().map(str::to_string))
+                    .or_else(|| snapshot.outputs.keys().next().cloned());
+                self.preview_click(target, output);
+            }
+        }
+    }
+
+    fn render_live_preview(
+        &mut self,
+        ctx: &egui::Context,
+        config: &Config,
+        snapshot: &niri_xmb::model::Snapshot,
+        selection: Option<&PreviewSelection>,
+    ) {
+        let Some(preview) = self.preview.as_mut() else {
+            return;
+        };
+        let Some(frame) = preview.render(config, snapshot, selection) else {
+            self.preview_texture = None;
+            self.preview_frame = None;
+            return;
+        };
+        let image = ColorImage::from_rgba_premultiplied(
+            [frame.width as usize, frame.height as usize],
+            &frame.rgba,
         );
+        self.preview_texture =
+            Some(ctx.load_texture("xmb-popup-preview", image, TextureOptions::LINEAR));
+        self.preview_frame = Some(frame);
+    }
+
+    fn preview_click(&mut self, target: PreviewTarget, output: Option<String>) {
+        match target {
+            PreviewTarget::Window {
+                workspace_id,
+                window_id,
+            } => {
+                let _ = Command::new(&self.niri_xmb)
+                    .args(["focus-window", "--window-id", &window_id.to_string()])
+                    .spawn();
+                if let Some(output) = output {
+                    self.preview_selection = Some(PreviewSelection {
+                        output,
+                        workspace_id,
+                        window_id: Some(window_id),
+                    });
+                    self.preview_selection_at = Instant::now();
+                }
+            }
+            PreviewTarget::Workspace { workspace_id } => {
+                let _ = Command::new(&self.niri_xmb)
+                    .args([
+                        "focus-workspace",
+                        "--workspace-id",
+                        &workspace_id.to_string(),
+                    ])
+                    .spawn();
+                if let Some(output) = output {
+                    self.preview_selection = Some(PreviewSelection {
+                        output,
+                        workspace_id,
+                        window_id: None,
+                    });
+                    self.preview_selection_at = Instant::now();
+                }
+            }
+            PreviewTarget::Panel | PreviewTarget::Canvas { .. } => {}
+        }
     }
 
     fn bar_preview(&self, ui: &mut Ui, bar: &Value, max_width: f32) {
@@ -4124,6 +4219,1306 @@ impl StudioApp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Persistent live dock
+// ---------------------------------------------------------------------------
+
+/// Controller button and axis state aggregated from `niri-xmb status`.
+#[derive(Default, Clone)]
+struct GamepadLiveView {
+    buttons: BTreeSet<String>,
+    axes: BTreeMap<String, f32>,
+}
+
+impl GamepadLiveView {
+    fn from_status(status: &Value) -> Self {
+        let mut view = Self::default();
+        for device in status["gamepad"]["live"].as_array().into_iter().flatten() {
+            for button in device["buttons"].as_array().into_iter().flatten() {
+                if let Some(button) = button.as_str() {
+                    view.buttons.insert(button.to_string());
+                }
+            }
+            for (axis, value) in device["axes"].as_object().into_iter().flatten() {
+                let value = value.as_f64().unwrap_or(0.0) as f32;
+                let entry = view.axes.entry(axis.clone()).or_insert(0.0);
+                if value.abs() > entry.abs() {
+                    *entry = value;
+                }
+            }
+        }
+        view
+    }
+
+    fn button(&self, code: &str) -> bool {
+        self.buttons.contains(code)
+    }
+
+    fn dn_axis(&self, axis: &str) -> f32 {
+        self.axes.get(axis).copied().unwrap_or(0.0)
+    }
+
+    fn hat(&self, axis: &str, positive: bool) -> bool {
+        let value = self.dn_axis(axis);
+        if positive { value > 0.5 } else { value < -0.5 }
+    }
+
+    fn trigger(&self, axis: &str, button: &str) -> f32 {
+        self.dn_axis(axis)
+            .max(if self.button(button) { 1.0 } else { 0.0 })
+    }
+
+    fn dpad(&self, direction: &str) -> bool {
+        let code = match direction {
+            "up" => "BTN_DPAD_UP",
+            "down" => "BTN_DPAD_DOWN",
+            "left" => "BTN_DPAD_LEFT",
+            "right" => "BTN_DPAD_RIGHT",
+            _ => return false,
+        };
+        self.button(code)
+            || match direction {
+                "up" => self.hat("ABS_HAT0Y", false),
+                "down" => self.hat("ABS_HAT0Y", true),
+                "left" => self.hat("ABS_HAT0X", false),
+                "right" => self.hat("ABS_HAT0X", true),
+                _ => false,
+            }
+    }
+}
+
+struct ControllerRow {
+    label: String,
+    code: String,
+    pressed: bool,
+    trigger: Option<f32>,
+    hold_axis: Option<&'static str>,
+}
+
+impl StudioApp {
+    fn live_dock(&mut self, ctx: &egui::Context) {
+        let frame = egui::Frame::new()
+            .fill(PANEL)
+            .inner_margin(egui::Margin::symmetric(12, 4))
+            .stroke(Stroke::new(1.0_f32, BORDER));
+        let max_height = (ctx.screen_rect().height() * 0.62).max(180.0);
+        self.dock_height = self.dock_height.clamp(170.0, max_height);
+        if self.dock_collapsed {
+            egui::TopBottomPanel::bottom("live-dock")
+                .frame(frame)
+                .exact_height(38.0)
+                .show(ctx, |ui| self.dock_header(ui));
+            return;
+        }
+        egui::TopBottomPanel::bottom("live-dock")
+            .frame(frame)
+            .exact_height(self.dock_height)
+            .show(ctx, |ui| {
+                self.dock_grip(ui, max_height);
+                self.dock_header(ui);
+                ui.add_space(4.0);
+                let body = Vec2::new(ui.available_width(), ui.available_height().max(80.0));
+                if self.dock_tab == DockTab::Keyboard
+                    && self.keymap_at.elapsed() > Duration::from_secs(5)
+                {
+                    self.reload_keymap();
+                }
+                match self.dock_tab {
+                    DockTab::Popup => self.dock_popup(ui, body),
+                    DockTab::Controller => self.dock_controller(ui, body),
+                    DockTab::Keyboard => self.dock_keyboard(ui, body),
+                }
+            });
+    }
+
+    /// Visible drag handle on the dock's top edge.
+    ///
+    /// egui's built-in panel border is only a few pixels wide and invisible, so
+    /// the owner could not find the resize affordance. This strip owns the
+    /// height directly and paints a grip for it.
+    fn dock_grip(&mut self, ui: &mut Ui, max_height: f32) {
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 9.0), Sense::drag());
+        let active = response.hovered() || response.dragged();
+        ui.painter().rect_filled(
+            Rect::from_center_size(rect.center(), Vec2::new(56.0, 5.0)),
+            2.5,
+            if active {
+                ACCENT
+            } else {
+                Color32::from_rgb(92, 102, 118)
+            },
+        );
+        if active {
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+        }
+        if response.dragged() {
+            let delta = ui.ctx().input(|input| input.pointer.delta().y);
+            self.dock_height = (self.dock_height - delta).clamp(170.0, max_height);
+        }
+        if response.double_clicked() {
+            self.dock_collapsed = true;
+        }
+        response.on_hover_text("Drag to resize · double-click to hide");
+    }
+
+    fn dock_header(&mut self, ui: &mut Ui) {
+        if self.dock_section != self.section {
+            self.dock_section = self.section;
+            if self.dock_follow {
+                self.dock_tab = DockTab::for_section(self.section);
+            }
+        }
+        ui.horizontal(|ui| {
+            let (dot, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+            let live = self
+                .live
+                .lock()
+                .map(|live| live.clone())
+                .unwrap_or_default();
+            let color = if live.status.is_null() { WARN } else { OK };
+            ui.painter().circle_filled(dot.center(), 3.5, color);
+            ui.label(RichText::new("Live").size(12.0).strong());
+            ui.add_space(6.0);
+            for tab in DockTab::ALL {
+                if dock_tab_button(ui, self.dock_tab == tab, tab.label()).clicked() {
+                    self.dock_tab = tab;
+                    if tab == DockTab::Keyboard {
+                        // The key map needs vertical room to stay square.
+                        self.dock_height = self.dock_height.max(380.0);
+                    }
+                }
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let label = if self.dock_collapsed { "Show" } else { "Hide" };
+                if ui
+                    .add(egui::Button::new(label).small())
+                    .on_hover_text(if self.dock_collapsed {
+                        "Expand live dock"
+                    } else {
+                        "Collapse live dock"
+                    })
+                    .clicked()
+                {
+                    self.dock_collapsed = !self.dock_collapsed;
+                }
+                if ui
+                    .checkbox(&mut self.dock_follow, RichText::new("Follow").size(10.5))
+                    .on_hover_text("Switch the dock tab with the editor section")
+                    .clicked()
+                    && self.dock_follow
+                {
+                    self.dock_tab = DockTab::for_section(self.section);
+                }
+                let status = self.dock_status_text(&live);
+                ui.label(RichText::new(status).monospace().size(9.5).color(TEXT_DIM));
+            });
+        });
+    }
+
+    fn dock_status_text(&self, live: &LiveState) -> String {
+        if live.status.is_null() {
+            return if live.error.is_empty() {
+                "waiting for daemon".into()
+            } else {
+                live.error.clone()
+            };
+        }
+        let mut text = format!(
+            "daemon {}",
+            live.status["mode"].as_str().unwrap_or("hidden")
+        );
+        if let Some(selection) = live.status["selection"].as_object() {
+            if let Some(output) = selection["output"].as_str() {
+                text.push_str(&format!(" · {output}"));
+            }
+            if let Some(workspace) = selection["workspace_id"].as_u64() {
+                text.push_str(&format!(" · ws {workspace}"));
+            }
+        }
+        if let Some(generation) = live.status["generation"].as_u64() {
+            text.push_str(&format!(" · gen {generation}"));
+        }
+        text
+    }
+
+    fn dock_popup(&mut self, ui: &mut Ui, body: Vec2) {
+        let preview_w = (body.x * 0.58).clamp(240.0, body.x);
+        let preview_h = (body.y - 4.0).max(70.0);
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                Vec2::new(preview_w, preview_h),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_min_height(preview_h);
+                    self.live_xmb_preview(ui, Vec2::new(preview_w, preview_h));
+                },
+            );
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("Panel").size(11.5).strong());
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    metric_chip(
+                        ui,
+                        "outputs",
+                        self.model["popup"]["outputs"].as_str().unwrap_or("focused"),
+                    );
+                    metric_chip(
+                        ui,
+                        "position",
+                        self.model["popup"]["position"].as_str().unwrap_or("cursor"),
+                    );
+                    metric_chip(
+                        ui,
+                        "surface",
+                        self.model["popup"]["surface_mode"]
+                            .as_str()
+                            .unwrap_or("fixed"),
+                    );
+                    metric_chip(
+                        ui,
+                        "labels",
+                        on_off(self.model["popup"]["show_labels"].as_bool()),
+                    );
+                    metric_chip(
+                        ui,
+                        "titles",
+                        on_off(self.model["popup"]["show_titles"].as_bool()),
+                    );
+                    metric_chip(
+                        ui,
+                        "anim",
+                        format!(
+                            "{} ms",
+                            self.model["animation"]["panel_ms"].as_f64().unwrap_or(0.0)
+                        ),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    metric_chip(ui, "bars", array_len(&self.model["bars"]));
+                    metric_chip(
+                        ui,
+                        "placements",
+                        array_len(&self.model["popup"]["placements"]),
+                    );
+                    metric_chip(
+                        ui,
+                        "navi binds",
+                        map_len(&self.model["gamepad"]["navi"]["bindings"]),
+                    );
+                    metric_chip(ui, "xmb binds", map_len(&self.model["gamepad"]["buttons"]));
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Same renderer as the daemon · hover to preview · click an icon to focus",
+                    )
+                    .size(9.5)
+                    .color(TEXT_DIM),
+                );
+            });
+        });
+    }
+
+    fn dock_controller(&mut self, ui: &mut Ui, body: Vec2) {
+        let live = self
+            .live
+            .lock()
+            .map(|live| GamepadLiveView::from_status(&live.status))
+            .unwrap_or_default();
+        let rows = self.controller_rows(&live);
+        let map_h = (body.y - 4.0).clamp(100.0, 300.0);
+        let map_w = (map_h / self.template.aspect()).min((body.x * 0.55).max(220.0));
+        ui.horizontal_top(|ui| {
+            self.controller_live_map(ui, Vec2::new(map_w, map_h), &live);
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Controls").size(11.5).strong());
+                    ui.add_space(4.0);
+                    for template in [Template::Xbox, Template::Ds4] {
+                        if ui
+                            .selectable_label(self.template == template, template.label())
+                            .clicked()
+                        {
+                            self.switch_template(template);
+                        }
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} connected · {}",
+                                self.connected_count(),
+                                self.gamepad_mode_name()
+                            ))
+                            .monospace()
+                            .size(9.0)
+                            .color(TEXT_DIM),
+                        );
+                    });
+                });
+                if self.connected_count() > 0 && !self.gamepad_live_available() {
+                    ui.label(
+                        RichText::new(
+                            "Live presses unavailable: the running daemon predates gamepad.live",
+                        )
+                        .size(9.0)
+                        .color(WARN),
+                    );
+                }
+                ui.add_space(2.0);
+                for (label, axis, button) in
+                    [("LT", "ABS_Z", "BTN_TL2"), ("RT", "ABS_RZ", "BTN_TR2")]
+                {
+                    let value = live.trigger(axis, button);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(label).monospace().size(9.0).color(TEXT_DIM));
+                        let width = (ui.available_width() - 44.0).max(60.0);
+                        let (bar, _) =
+                            ui.allocate_exact_size(Vec2::new(width, 5.0), Sense::hover());
+                        ui.painter().rect_filled(bar, 2.5, FIELD_BG);
+                        let fill = Rect::from_min_size(
+                            bar.min,
+                            Vec2::new(bar.width() * value.clamp(0.0, 1.0), bar.height()),
+                        );
+                        ui.painter().rect_filled(
+                            fill,
+                            2.5,
+                            if value > 0.05 { ACCENT } else { BORDER },
+                        );
+                        ui.label(
+                            RichText::new(format!("{:>3.0}%", value * 100.0))
+                                .monospace()
+                                .size(9.0)
+                                .color(TEXT_DIM),
+                        );
+                    });
+                }
+                ui.add_space(2.0);
+                let list_w = ui.available_width();
+                let label_w = 96.0_f32.min(list_w * 0.28);
+                let remaining_w = (list_w - label_w - 22.0).max(160.0);
+                let layer_w = remaining_w * 0.26;
+                let binding_w = remaining_w - layer_w;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.add_space(17.0);
+                    column_header(ui, "Control", label_w);
+                    column_header(ui, "Binding", binding_w);
+                    column_header(ui, "Layers", layer_w);
+                });
+                ui.separator();
+                ScrollArea::vertical()
+                    .id_salt("dock-controller-list")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for row in &rows {
+                            let binding = self.controller_binding(&row.code);
+                            let layers = self.controller_layers(&row.code, row.hold_axis);
+                            controller_row(
+                                ui,
+                                row,
+                                binding.as_deref(),
+                                &layers,
+                                label_w,
+                                binding_w,
+                                layer_w,
+                            );
+                        }
+                    });
+            });
+        });
+    }
+
+    fn connected_count(&self) -> usize {
+        self.live
+            .lock()
+            .map(|live| {
+                live.status["gamepad"]["connected"]
+                    .as_array()
+                    .map_or(0, Vec::len)
+            })
+            .unwrap_or(0)
+    }
+
+    fn gamepad_live_available(&self) -> bool {
+        self.live
+            .lock()
+            .map(|live| live.status["gamepad"]["live"].is_array())
+            .unwrap_or(false)
+    }
+
+    fn gamepad_mode_name(&self) -> &'static str {
+        let mode = self
+            .live
+            .lock()
+            .ok()
+            .and_then(|live| live.status["gamepad"]["mode"].as_str().map(str::to_string));
+        match mode.as_deref() {
+            Some("navi") => "navi",
+            Some("game") => "game",
+            _ => "off",
+        }
+    }
+
+    fn controller_rows(&self, live: &GamepadLiveView) -> Vec<ControllerRow> {
+        let mut rows = Vec::new();
+        for hotspot in self.template.hotspots() {
+            match hotspot.control {
+                "D-PAD" => {
+                    for (label, code, direction) in [
+                        ("D-Pad Up", "BTN_DPAD_UP", "up"),
+                        ("D-Pad Down", "BTN_DPAD_DOWN", "down"),
+                        ("D-Pad Left", "BTN_DPAD_LEFT", "left"),
+                        ("D-Pad Right", "BTN_DPAD_RIGHT", "right"),
+                    ] {
+                        rows.push(ControllerRow {
+                            label: label.into(),
+                            code: code.into(),
+                            pressed: live.dpad(direction),
+                            trigger: None,
+                            hold_axis: None,
+                        });
+                    }
+                }
+                "LT" | "L2" => rows.push(ControllerRow {
+                    label: if hotspot.control == "LT" { "LT" } else { "L2" }.into(),
+                    code: "BTN_TL2".into(),
+                    pressed: live.trigger("ABS_Z", "BTN_TL2") > 0.05,
+                    trigger: Some(live.trigger("ABS_Z", "BTN_TL2")),
+                    hold_axis: Some("ABS_Z"),
+                }),
+                "RT" | "R2" => rows.push(ControllerRow {
+                    label: if hotspot.control == "RT" { "RT" } else { "R2" }.into(),
+                    code: "BTN_TR2".into(),
+                    pressed: live.trigger("ABS_RZ", "BTN_TR2") > 0.05,
+                    trigger: Some(live.trigger("ABS_RZ", "BTN_TR2")),
+                    hold_axis: Some("ABS_RZ"),
+                }),
+                "L STICK" => rows.push(ControllerRow {
+                    label: "L3".into(),
+                    code: "BTN_THUMBL".into(),
+                    pressed: live.button("BTN_THUMBL"),
+                    trigger: None,
+                    hold_axis: None,
+                }),
+                "R STICK" => rows.push(ControllerRow {
+                    label: "R3".into(),
+                    code: "BTN_THUMBR".into(),
+                    pressed: live.button("BTN_THUMBR"),
+                    trigger: None,
+                    hold_axis: None,
+                }),
+                control => {
+                    let Some(code) = hotspot.code else {
+                        continue;
+                    };
+                    rows.push(ControllerRow {
+                        label: control.into(),
+                        code: code.into(),
+                        pressed: live.button(code),
+                        trigger: None,
+                        hold_axis: None,
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    fn controller_binding(&self, code: &str) -> Option<String> {
+        self.model["gamepad"]["navi"]["bindings"][code]
+            .as_str()
+            .or_else(|| self.model["gamepad"]["buttons"][code].as_str())
+            .map(str::to_string)
+    }
+
+    fn controller_layers(&self, code: &str, axis: Option<&str>) -> Vec<String> {
+        let mut names = Vec::new();
+        let Some(layers) = self.model["gamepad"]["navi"]["layers"].as_object() else {
+            return names;
+        };
+        for (name, layer) in layers {
+            let holds = layer["hold"]
+                .as_array()
+                .is_some_and(|hold| hold.iter().any(|value| value.as_str() == Some(code)));
+            let holds_axis = axis.is_some_and(|axis| {
+                layer["hold_axes"].as_array().is_some_and(|holds| {
+                    holds.iter().any(|hold| hold["axis"].as_str() == Some(axis))
+                })
+            });
+            let binds = layer["bindings"][code].is_string();
+            if holds || holds_axis || binds {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+
+    fn controller_live_map(&self, ui: &mut Ui, size: Vec2, live: &GamepadLiveView) {
+        let template = self.template;
+        let (box_rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        if let Some(backdrop) = template.backdrop() {
+            ui.painter().rect_filled(box_rect, 10.0, backdrop);
+            ui.painter().rect_stroke(
+                box_rect,
+                10.0,
+                Stroke::new(1.0_f32, BORDER),
+                StrokeKind::Inside,
+            );
+        }
+        let image_size = if size.x * template.aspect() <= size.y {
+            Vec2::new(size.x, size.x * template.aspect())
+        } else {
+            Vec2::new(size.y / template.aspect(), size.y)
+        };
+        let rect = Rect::from_center_size(box_rect.center(), image_size);
+        let texture_id = match template {
+            Template::Xbox => self.xbox_texture.as_ref(),
+            Template::Ds4 => self.ds4_texture.as_ref(),
+        }
+        .map(TextureHandle::id);
+        if let Some(texture_id) = texture_id {
+            ui.painter().image(
+                texture_id,
+                rect,
+                Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        for hotspot in template.hotspots() {
+            let center = Pos2::new(
+                rect.min.x + hotspot.x * rect.width(),
+                rect.min.y + hotspot.y * rect.height(),
+            );
+            let hit = Rect::from_center_size(
+                center,
+                Vec2::new(hotspot.w * rect.width(), hotspot.h * rect.width()),
+            );
+            let pressed = match hotspot.control {
+                "LT" | "L2" => live.trigger("ABS_Z", "BTN_TL2") > 0.05,
+                "RT" | "R2" => live.trigger("ABS_RZ", "BTN_TR2") > 0.05,
+                "L STICK" => live.button("BTN_THUMBL"),
+                "R STICK" => live.button("BTN_THUMBR"),
+                "D-PAD" => ["up", "down", "left", "right"]
+                    .iter()
+                    .any(|direction| live.dpad(direction)),
+                _ => hotspot.code.is_some_and(|code| live.button(code)),
+            };
+            let response = ui.interact(
+                hit,
+                ui.id()
+                    .with(("dock-hotspot", template.label(), hotspot.control)),
+                Sense::hover(),
+            );
+            if pressed {
+                let color = Color32::from_rgba_unmultiplied(116, 162, 255, 70);
+                if hotspot.circle {
+                    ui.painter()
+                        .circle_filled(center, hit.width().min(hit.height()) / 2.0, color);
+                    ui.painter().circle_stroke(
+                        center,
+                        hit.width().min(hit.height()) / 2.0,
+                        Stroke::new(1.8_f32, Color32::WHITE),
+                    );
+                } else {
+                    ui.painter().rect_filled(hit, 7.0, color);
+                    ui.painter().rect_stroke(
+                        hit,
+                        7.0,
+                        Stroke::new(1.8_f32, Color32::WHITE),
+                        StrokeKind::Inside,
+                    );
+                }
+            }
+            if response.hovered()
+                && let Some(code) = hotspot.code
+            {
+                response
+                    .clone()
+                    .on_hover_text(match self.controller_binding(code) {
+                        Some(binding) => format!("{} · {binding}", hotspot.control),
+                        None => format!("{} · unbound", hotspot.control),
+                    });
+            }
+        }
+    }
+
+    fn dock_keyboard(&mut self, ui: &mut Ui, body: Vec2) {
+        let mapped_keys = self
+            .keymap
+            .effective()
+            .filter_map(|bind| bind.key_id)
+            .collect::<BTreeSet<_>>()
+            .len();
+        let extra_keys = self
+            .keymap
+            .effective()
+            .filter(|bind| bind.key_id.is_none())
+            .count();
+        let duplicates = self
+            .keymap
+            .binds
+            .iter()
+            .filter(|bind| bind.duplicate)
+            .count();
+        self.keymap_toolbar(ui, mapped_keys, extra_keys, duplicates);
+        ui.add_space(4.0);
+
+        let pressed = pressed_key_ids(ui.ctx());
+        let index = keymap_index(&self.keymap);
+        let query = self.keymap_search.trim().to_ascii_lowercase();
+        let selected = self.keymap_selected.clone();
+        let mut filtered: Vec<&keymap::NiriBind> = self
+            .keymap
+            .binds
+            .iter()
+            .filter(|bind| selected.as_deref().is_none_or(|id| bind.key_id == Some(id)))
+            .filter(|bind| query.is_empty() || keymap_matches(bind, &query))
+            .collect();
+        filtered.sort_by_key(|bind| bind.shadowed || bind.duplicate);
+
+        let remaining = ui.available_size();
+        let mut clicked = None;
+        if body.x >= 880.0 {
+            // Wide dock: board on the left, bind table on the right. The board
+            // keeps its 15-key width and never stretches to fill the column.
+            let cell_by_height = ((remaining.y - 24.0) / 6.0).clamp(12.0, 40.0);
+            let map_w = (15.0 * cell_by_height + 18.0).clamp(320.0, 640.0);
+            let list_w = (body.x - map_w - 14.0).max(260.0);
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(map_w, remaining.y),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_min_width(map_w);
+                        clicked = self.keyboard_map(ui, &pressed, &index, &query);
+                    },
+                );
+                ui.add_space(14.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(list_w, remaining.y),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_min_width(list_w);
+                        keymap_list(ui, &filtered, remaining.y);
+                    },
+                );
+            });
+        } else {
+            let map_h = (remaining.y * 0.55).max(150.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(remaining.x, map_h),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    clicked = self.keyboard_map(ui, &pressed, &index, &query);
+                },
+            );
+            ui.add_space(6.0);
+            let list_h = (remaining.y - map_h - 8.0).max(80.0);
+            keymap_list(ui, &filtered, list_h);
+        }
+        if let Some(id) = clicked {
+            self.keymap_selected = if self.keymap_selected.as_deref() == Some(id) {
+                None
+            } else {
+                Some(id.to_string())
+            };
+        }
+    }
+
+    fn keymap_toolbar(
+        &mut self,
+        ui: &mut Ui,
+        mapped_keys: usize,
+        extra_keys: usize,
+        duplicates: usize,
+    ) {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.keymap_search)
+                    .hint_text("Filter action, hotkey, or title")
+                    .desired_width(230.0),
+            );
+            if !self.keymap_search.is_empty() && ui.small_button("Clear").clicked() {
+                self.keymap_search.clear();
+            }
+            if let Some(selected) = self.keymap_selected.clone()
+                && ui
+                    .button(format!("{}  ×", keymap::key_label(&selected)))
+                    .on_hover_text("Clear the selected key")
+                    .clicked()
+            {
+                self.keymap_selected = None;
+            }
+            if ui
+                .button("Reload")
+                .on_hover_text("Re-read the Niri config and its includes")
+                .clicked()
+            {
+                self.reload_keymap();
+            }
+            let mut stats = format!(
+                "{} binds · {mapped_keys} mapped keys · {extra_keys} extra keys · {} files",
+                self.keymap.effective_count(),
+                self.keymap.files.len()
+            );
+            if duplicates > 0 {
+                stats.push_str(&format!(" · {duplicates} duplicate"));
+            }
+            if !self.keymap.errors.is_empty() {
+                stats.push_str(&format!(" · {} errors", self.keymap.errors.len()));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if let Some(error) = self.keymap.errors.first() {
+                    ui.label(RichText::new("config error").size(10.0).color(ERROR))
+                        .on_hover_text(error);
+                } else {
+                    ui.label(
+                        RichText::new(&stats)
+                            .monospace()
+                            .size(10.0)
+                            .color(if duplicates > 0 { WARN } else { TEXT_DIM }),
+                    );
+                }
+            });
+        });
+    }
+
+    fn keyboard_map(
+        &self,
+        ui: &mut Ui,
+        pressed: &BTreeSet<&'static str>,
+        index: &HashMap<&'static str, Vec<&keymap::NiriBind>>,
+        query: &str,
+    ) -> Option<&'static str> {
+        let avail = ui.available_size();
+        // Rows are 60 layout units wide, so 15 standard key widths fit across.
+        // Size each key from that width and make the row height match it, which
+        // keeps caps square instead of stretching them into bars.
+        let legend_h = if avail.y >= 150.0 { 18.0 } else { 0.0 };
+        let cell = ((avail.x - 12.0) / 15.0)
+            .min((avail.y - legend_h - 12.0) / 6.0)
+            .clamp(9.0, 40.0);
+        let unit = cell / 4.0;
+        let gap = (unit * 0.18).clamp(1.0, 2.8);
+        let board_w = 15.0 * cell + 10.0;
+        let board_h = 6.0 * cell + 10.0;
+        let (outer, _) =
+            ui.allocate_exact_size(Vec2::new(avail.x, board_h + legend_h + 6.0), Sense::hover());
+        let board = Rect::from_min_size(
+            Pos2::new(outer.center().x - board_w / 2.0, outer.min.y),
+            Vec2::new(board_w, board_h),
+        );
+        let painter = ui.painter_at(outer);
+        painter.rect_filled(board, 10.0, FIELD_BG);
+        painter.rect_stroke(
+            board,
+            10.0,
+            Stroke::new(1.0_f32, BORDER),
+            StrokeKind::Inside,
+        );
+        let mut clicked = None;
+        for (row_index, keys) in keymap::ANSI_ROWS.iter().enumerate() {
+            let y = board.min.y + 5.0 + row_index as f32 * cell;
+            let mut x = board.min.x + 5.0;
+            for (id, units) in keys.iter() {
+                let cap_width = *units as f32 * unit;
+                if id.is_empty() {
+                    x += cap_width;
+                    continue;
+                }
+                let cap = Rect::from_min_size(
+                    Pos2::new(x + gap * 0.5, y + gap * 0.5),
+                    Vec2::new(cap_width - gap, cell - gap),
+                );
+                let binds = index.get(id).map(Vec::as_slice).unwrap_or_default();
+                let bound = binds.len();
+                let is_pressed = pressed.contains(id);
+                let is_selected = self.keymap_selected.as_deref() == Some(*id);
+                let search_hit =
+                    !query.is_empty() && binds.iter().any(|bind| keymap_matches(bind, query));
+                let (fill, stroke) = if is_pressed {
+                    (
+                        Color32::from_rgba_unmultiplied(116, 162, 255, 110),
+                        Stroke::new(1.5_f32, Color32::WHITE),
+                    )
+                } else if is_selected {
+                    (Color32::from_rgb(46, 63, 90), Stroke::new(1.4_f32, ACCENT))
+                } else if search_hit {
+                    (Color32::from_rgb(64, 53, 30), Stroke::new(1.2_f32, WARN))
+                } else if bound > 0 {
+                    (
+                        Color32::from_rgb(38, 50, 70),
+                        Stroke::new(1.0_f32, Color32::from_rgb(78, 112, 166)),
+                    )
+                } else {
+                    (
+                        Color32::from_rgb(24, 27, 33),
+                        Stroke::new(1.0_f32, Color32::from_rgb(35, 40, 48)),
+                    )
+                };
+                painter.rect_filled(cap, 4.0, fill);
+                painter.rect_stroke(cap, 4.0, stroke, StrokeKind::Inside);
+                if bound > 1 {
+                    painter.circle_filled(Pos2::new(cap.max.x - 4.5, cap.max.y - 4.5), 2.0, ACCENT);
+                }
+                let label = keymap::key_label(id);
+                if !label.is_empty() {
+                    painter.text(
+                        cap.center(),
+                        Align2::CENTER_CENTER,
+                        label,
+                        FontId::monospace((cell * 0.31).clamp(7.0, 13.0)),
+                        if is_pressed {
+                            Color32::WHITE
+                        } else {
+                            TEXT_MUTED
+                        },
+                    );
+                }
+                let response = ui.interact(cap, ui.id().with(("dock-key", *id)), Sense::click());
+                if response.clicked() {
+                    clicked = Some(*id);
+                }
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    response.on_hover_ui(|ui| {
+                        ui.label(RichText::new(keymap::key_label(id)).strong().size(12.0));
+                        if binds.is_empty() {
+                            ui.label(RichText::new("Unbound").size(10.0).color(TEXT_DIM));
+                        }
+                        for bind in binds.iter().take(6) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}   {}",
+                                    bind.hotkey_text(),
+                                    bind.action_text()
+                                ))
+                                .monospace()
+                                .size(10.0)
+                                .color(if bind.shadowed {
+                                    TEXT_DIM
+                                } else {
+                                    TEXT
+                                }),
+                            );
+                        }
+                    });
+                }
+                x += cap_width;
+            }
+        }
+        // Legend keeps the colour language explicit instead of leaving the
+        // owner to infer what the tinted caps mean.
+        if legend_h == 0.0 {
+            return clicked;
+        }
+        let legend_y = board.max.y + 10.0;
+        let mut x = board.min.x + 2.0;
+        for (label, color) in [
+            ("Bound", Color32::from_rgb(38, 50, 70)),
+            ("Pressed", ACCENT),
+            ("Selected", Color32::from_rgb(78, 112, 166)),
+            ("Search hit", WARN),
+        ] {
+            painter.circle_filled(Pos2::new(x + 3.0, legend_y), 3.0, color);
+            let galley =
+                painter.layout_no_wrap(label.to_string(), FontId::proportional(10.0), TEXT_DIM);
+            let width = galley.size().x;
+            painter.galley(
+                Pos2::new(x + 10.0, legend_y - galley.size().y / 2.0),
+                galley,
+                TEXT_DIM,
+            );
+            x += 10.0 + width + 14.0;
+        }
+        clicked
+    }
+
+    fn reload_keymap(&mut self) {
+        self.keymap = keymap::NiriKeymap::load_default();
+        self.keymap_at = Instant::now();
+    }
+}
+
+fn keymap_index(keymap: &keymap::NiriKeymap) -> HashMap<&'static str, Vec<&keymap::NiriBind>> {
+    let mut index: HashMap<&'static str, Vec<&keymap::NiriBind>> = HashMap::new();
+    for bind in keymap.effective() {
+        if let Some(id) = bind.key_id {
+            index.entry(id).or_default().push(bind);
+        }
+    }
+    index
+}
+
+fn keymap_matches(bind: &keymap::NiriBind, query: &str) -> bool {
+    bind.hotkey_text().to_ascii_lowercase().contains(query)
+        || bind.action_text().to_ascii_lowercase().contains(query)
+        || bind
+            .title
+            .as_deref()
+            .is_some_and(|title| title.to_ascii_lowercase().contains(query))
+}
+
+fn keymap_list(ui: &mut Ui, binds: &[&keymap::NiriBind], height: f32) {
+    let width = ui.available_width();
+    let source_w = (width * 0.22).clamp(110.0, 170.0);
+    let hotkey_w = (width * 0.30).clamp(120.0, 210.0);
+    let action_w = (width - hotkey_w - source_w - 18.0).max(80.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        column_header(ui, "Hotkey", hotkey_w);
+        column_header(ui, "Action", action_w);
+        column_header(ui, "Source", source_w);
+    });
+    ui.add_space(2.0);
+    ui.separator();
+    ScrollArea::vertical()
+        .id_salt("keymap-bind-list")
+        .max_height((height - 32.0).max(40.0))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_width(width);
+            if binds.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("No matching binds")
+                        .size(11.0)
+                        .color(TEXT_DIM),
+                );
+                return;
+            }
+            for (index, bind) in binds.iter().enumerate() {
+                keymap_row(ui, bind, index, hotkey_w, action_w, source_w);
+            }
+        });
+}
+
+/// Fixed-width, left-aligned cell. `Ui::add_sized` centers its widget, which
+/// made table columns look ragged; this keeps every row on the same grid.
+fn text_cell(ui: &mut Ui, width: f32, height: f32, text: RichText) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, height),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.set_min_width(width);
+            ui.set_min_height(height);
+            ui.add(egui::Label::new(text).truncate())
+        },
+    )
+    .inner
+}
+
+fn column_header(ui: &mut Ui, label: &str, width: f32) {
+    text_cell(
+        ui,
+        width,
+        18.0,
+        RichText::new(label).size(10.0).color(TEXT_DIM),
+    );
+}
+
+fn keymap_row(
+    ui: &mut Ui,
+    bind: &keymap::NiriBind,
+    index: usize,
+    hotkey_w: f32,
+    action_w: f32,
+    source_w: f32,
+) {
+    let fill = if index % 2 == 1 {
+        CARD
+    } else {
+        Color32::TRANSPARENT
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .inner_margin(egui::Margin::symmetric(2, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let hotkey_color = if bind.duplicate {
+                    ERROR
+                } else if bind.shadowed {
+                    TEXT_DIM
+                } else {
+                    TEXT
+                };
+                let hotkey = text_cell(
+                    ui,
+                    hotkey_w,
+                    19.0,
+                    RichText::new(bind.hotkey_text())
+                        .monospace()
+                        .size(11.0)
+                        .color(hotkey_color),
+                );
+                let action = text_cell(
+                    ui,
+                    action_w,
+                    19.0,
+                    RichText::new(bind.action_text())
+                        .monospace()
+                        .size(11.0)
+                        .color(if bind.shadowed { TEXT_DIM } else { TEXT_MUTED }),
+                );
+                let source = bind.file.file_name().and_then(|name| name.to_str());
+                let detail = text_cell(
+                    ui,
+                    source_w,
+                    19.0,
+                    RichText::new(source.unwrap_or(""))
+                        .size(10.5)
+                        .color(if bind.duplicate {
+                            ERROR
+                        } else if bind.shadowed {
+                            WARN
+                        } else {
+                            TEXT_DIM
+                        }),
+                );
+                let mut hover = format!(
+                    "{}\n{}\n{}\n{}",
+                    bind.hotkey_text(),
+                    bind.action_text(),
+                    bind.title.as_deref().unwrap_or("(no overlay title)"),
+                    bind.file.display()
+                );
+                if bind.duplicate {
+                    hover.push_str("\nNiri refuses to start when one binds block repeats a key");
+                } else if bind.shadowed {
+                    hover.push_str("\nA later bind replaces this one");
+                }
+                hotkey.on_hover_text(&hover);
+                action.on_hover_text(&hover);
+                detail.on_hover_text(&hover);
+            });
+        });
+}
+
+fn controller_row(
+    ui: &mut Ui,
+    row: &ControllerRow,
+    binding: Option<&str>,
+    layers: &[String],
+    label_w: f32,
+    binding_w: f32,
+    layer_w: f32,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let (dot, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+        ui.painter()
+            .circle_filled(dot.center(), 2.8, if row.pressed { ACCENT } else { BORDER });
+        text_cell(
+            ui,
+            label_w,
+            19.0,
+            RichText::new(&row.label)
+                .size(11.0)
+                .color(if row.pressed { TEXT } else { TEXT_MUTED }),
+        );
+        let text = match binding {
+            Some(binding) => binding.to_string(),
+            None => "unbound".to_string(),
+        };
+        let binding_response = text_cell(
+            ui,
+            binding_w,
+            19.0,
+            RichText::new(text)
+                .monospace()
+                .size(10.5)
+                .color(if row.pressed { ACCENT } else { TEXT_DIM }),
+        );
+        if let Some(binding) = binding {
+            binding_response.on_hover_text(binding);
+        }
+        let lane = if layers.is_empty() {
+            "—".to_string()
+        } else {
+            layers.join(", ")
+        };
+        text_cell(
+            ui,
+            layer_w,
+            19.0,
+            RichText::new(lane)
+                .size(10.0)
+                .color(if layers.is_empty() { TEXT_DIM } else { WARN }),
+        );
+        if let Some(value) = row.trigger
+            && value > 0.05
+        {
+            ui.label(
+                RichText::new(format!("{:.0}%", value * 100.0))
+                    .monospace()
+                    .size(10.0)
+                    .color(ACCENT),
+            );
+        }
+    });
+}
+
+fn metric_chip(ui: &mut Ui, label: &str, value: impl ToString) {
+    egui::Frame::new()
+        .fill(FIELD_BG)
+        .stroke(Stroke::new(1.0_f32, BORDER))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).size(8.5).color(TEXT_DIM));
+                ui.label(
+                    RichText::new(value.to_string())
+                        .monospace()
+                        .size(9.0)
+                        .color(TEXT),
+                );
+            });
+        });
+}
+
+fn dock_tab_button(ui: &mut Ui, selected: bool, label: &str) -> egui::Response {
+    let response = egui::Frame::new()
+        .fill(if selected {
+            Color32::from_rgb(36, 47, 64)
+        } else {
+            Color32::TRANSPARENT
+        })
+        .stroke(if selected {
+            Stroke::new(1.0_f32, ACCENT)
+        } else {
+            Stroke::NONE
+        })
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(9, 2))
+        .show(ui, |ui| {
+            ui.label(RichText::new(label).size(10.5).color(if selected {
+                Color32::WHITE
+            } else {
+                TEXT_MUTED
+            }));
+        })
+        .response
+        .interact(Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    response
+}
+
+fn on_off(value: Option<bool>) -> &'static str {
+    if value.unwrap_or(false) { "on" } else { "off" }
+}
+
+fn pressed_key_ids(ctx: &egui::Context) -> BTreeSet<&'static str> {
+    let mut pressed = BTreeSet::new();
+    ctx.input(|input| {
+        for key in &input.keys_down {
+            if let Some(id) = egui_key_id(*key) {
+                pressed.insert(id);
+            }
+        }
+        let modifiers = input.modifiers;
+        if modifiers.shift {
+            pressed.insert("shiftleft");
+        }
+        if modifiers.ctrl {
+            pressed.insert("ctrlleft");
+        }
+        if modifiers.alt {
+            pressed.insert("altleft");
+        }
+        if modifiers.mac_cmd {
+            pressed.insert("superleft");
+        }
+    });
+    pressed
+}
+
+fn egui_key_id(key: egui::Key) -> Option<&'static str> {
+    Some(match key {
+        egui::Key::A => "a",
+        egui::Key::B => "b",
+        egui::Key::C => "c",
+        egui::Key::D => "d",
+        egui::Key::E => "e",
+        egui::Key::F => "f",
+        egui::Key::G => "g",
+        egui::Key::H => "h",
+        egui::Key::I => "i",
+        egui::Key::J => "j",
+        egui::Key::K => "k",
+        egui::Key::L => "l",
+        egui::Key::M => "m",
+        egui::Key::N => "n",
+        egui::Key::O => "o",
+        egui::Key::P => "p",
+        egui::Key::Q => "q",
+        egui::Key::R => "r",
+        egui::Key::S => "s",
+        egui::Key::T => "t",
+        egui::Key::U => "u",
+        egui::Key::V => "v",
+        egui::Key::W => "w",
+        egui::Key::X => "x",
+        egui::Key::Y => "y",
+        egui::Key::Z => "z",
+        egui::Key::Num0 => "0",
+        egui::Key::Num1 => "1",
+        egui::Key::Num2 => "2",
+        egui::Key::Num3 => "3",
+        egui::Key::Num4 => "4",
+        egui::Key::Num5 => "5",
+        egui::Key::Num6 => "6",
+        egui::Key::Num7 => "7",
+        egui::Key::Num8 => "8",
+        egui::Key::Num9 => "9",
+        egui::Key::ArrowUp => "up",
+        egui::Key::ArrowDown => "down",
+        egui::Key::ArrowLeft => "left",
+        egui::Key::ArrowRight => "right",
+        egui::Key::Escape => "escape",
+        egui::Key::Tab => "tab",
+        egui::Key::Backspace => "backspace",
+        egui::Key::Enter => "return",
+        egui::Key::Space => "space",
+        egui::Key::Insert => "insert",
+        egui::Key::Delete => "delete",
+        egui::Key::Minus => "minus",
+        egui::Key::Equals => "equal",
+        egui::Key::Comma => "comma",
+        egui::Key::Period => "period",
+        egui::Key::Slash => "slash",
+        egui::Key::Backslash => "backslash",
+        egui::Key::Semicolon => "semicolon",
+        egui::Key::Quote => "quote",
+        egui::Key::Backtick => "grave",
+        egui::Key::OpenBracket => "bracketleft",
+        egui::Key::CloseBracket => "bracketright",
+        egui::Key::F1 => "f1",
+        egui::Key::F2 => "f2",
+        egui::Key::F3 => "f3",
+        egui::Key::F4 => "f4",
+        egui::Key::F5 => "f5",
+        egui::Key::F6 => "f6",
+        egui::Key::F7 => "f7",
+        egui::Key::F8 => "f8",
+        egui::Key::F9 => "f9",
+        egui::Key::F10 => "f10",
+        egui::Key::F11 => "f11",
+        egui::Key::F12 => "f12",
+        _ => return None,
+    })
+}
+
 impl eframe::App for StudioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_textures(ctx);
@@ -4134,8 +5529,15 @@ impl eframe::App for StudioApp {
         } else {
             self.nav_strip(ctx);
         }
+        self.live_dock(ctx);
         self.content(ctx);
         self.confirm_modal(ctx);
+        // The live poller updates a shared snapshot without waking egui.
+        // Repaint while the dock is open so daemon focus changes, controller
+        // presses and click feedback arrive even when the pointer is idle.
+        if !self.dock_collapsed {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
     }
 }
 
@@ -4194,7 +5596,12 @@ fn section_card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
         .inner_margin(egui::Margin::same(10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).size(12.5).strong());
+            let title_response = ui.add(
+                egui::Label::new(RichText::new(title).size(12.5).strong()).sense(Sense::hover()),
+            );
+            if let Some(hover) = i18n::hover_for(None, title) {
+                title_response.on_hover_text(hover);
+            }
             ui.add_space(4.0);
             ui.separator();
             ui.add_space(6.0);
@@ -4211,32 +5618,105 @@ fn load_texture(ctx: &egui::Context, template: Template) -> Option<TextureHandle
     Some(ctx.load_texture(template.texture_name(), pixels, TextureOptions::LINEAR))
 }
 
-fn field_row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> bool) -> bool {
+/// Field row whose label and hover text come from the i18n catalog by
+/// config path (see `i18n.rs`); `label` is only the fallback.
+fn field_row_path(
+    ui: &mut Ui,
+    path: Option<&str>,
+    label: &str,
+    add: impl FnOnce(&mut Ui) -> bool,
+) -> bool {
+    let label = path.map_or(label, |path| i18n::label_for_path(path, label));
     let label_width = (ui.available_width() * 0.42).clamp(110.0, 190.0);
     ui.horizontal(|ui| {
-        ui.add_sized(
+        let label_response = ui.add_sized(
             Vec2::new(label_width, 22.0),
-            egui::Label::new(RichText::new(label).size(12.0).color(TEXT_MUTED)).truncate(),
+            egui::Label::new(RichText::new(label).size(12.0).color(TEXT_MUTED))
+                .truncate()
+                .sense(Sense::hover()),
         );
+        if let Some(hover) = i18n::hover_for(path, label) {
+            label_response.on_hover_text(hover);
+        }
         add(ui)
     })
     .inner
 }
 
+/// Attach the catalog hover text for a `ui.*` key to a widget response.
+fn tt(response: egui::Response, key: &str) -> egui::Response {
+    match i18n::hover_for_key(key) {
+        Some(hover) => response.on_hover_text(hover),
+        None => response,
+    }
+}
+
 fn field_label(ui: &mut Ui, label: &str) {
     let width = (ui.available_width() * 0.34).clamp(110.0, 180.0);
-    ui.add_sized(
+    let response = ui.add_sized(
         Vec2::new(width, 22.0),
-        egui::Label::new(RichText::new(label).size(12.0).color(TEXT_MUTED)).truncate(),
+        egui::Label::new(RichText::new(label).size(12.0).color(TEXT_MUTED))
+            .truncate()
+            .sense(Sense::hover()),
     );
+    if let Some(hover) = i18n::hover_for(None, label) {
+        response.on_hover_text(hover);
+    }
 }
 
 fn input_width(ui: &Ui) -> f32 {
     (ui.available_width() - 2.0).clamp(64.0, 360.0)
 }
 
+/// Standard buttons that are not bound yet, so one physical button never
+/// lands on two rows of the same map.
+fn button_options(used: &[String]) -> Vec<(&'static str, &'static str)> {
+    BUTTONS
+        .iter()
+        .copied()
+        .filter(|(code, _)| !used.iter().any(|value| value == code))
+        .collect()
+}
+
+/// Menu of unbound standard buttons. Returns the picked evdev name.
+fn button_menu(ui: &mut Ui, title: &str, used: &[String]) -> Option<&'static str> {
+    let options = button_options(used);
+    ui.menu_button(title, |ui| {
+        let mut picked = None;
+        if options.is_empty() {
+            ui.label(
+                RichText::new("All standard buttons are bound")
+                    .size(10.5)
+                    .color(TEXT_MUTED),
+            );
+        }
+        for (code, label) in &options {
+            if ui
+                .button(
+                    RichText::new(format!("{code}   {label}"))
+                        .monospace()
+                        .size(11.0),
+                )
+                .clicked()
+            {
+                picked = Some(*code);
+                ui.close();
+            }
+        }
+        picked
+    })
+    .inner
+    .flatten()
+}
+
 fn mini_heading(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).size(10.5).strong().color(TEXT_DIM));
+    let response = ui.add(
+        egui::Label::new(RichText::new(text).size(10.5).strong().color(TEXT_DIM))
+            .sense(Sense::hover()),
+    );
+    if let Some(hover) = i18n::hover_for(None, text) {
+        response.on_hover_text(hover);
+    }
     ui.add_space(2.0);
 }
 
@@ -4385,20 +5865,6 @@ fn nav_item(ui: &mut Ui, selected: bool, label: &str) -> egui::Response {
     } else {
         response
     }
-}
-
-fn metric_row(ui: &mut Ui, label: &str, value: impl ToString) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(11.0).color(TEXT_MUTED));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(value.to_string())
-                    .monospace()
-                    .size(11.0)
-                    .color(TEXT),
-            );
-        });
-    });
 }
 
 fn map_len(value: &Value) -> usize {
@@ -4657,21 +6123,6 @@ fn trigger_multiplier(
         * boost_cap.powf(trigger_shape(rt, deadzone, curve, points))
 }
 
-fn app_color(app_id: &str) -> Color32 {
-    const PALETTE: [Color32; 6] = [
-        Color32::from_rgb(72, 104, 168),
-        Color32::from_rgb(132, 78, 148),
-        Color32::from_rgb(58, 128, 104),
-        Color32::from_rgb(164, 104, 62),
-        Color32::from_rgb(90, 112, 150),
-        Color32::from_rgb(132, 76, 92),
-    ];
-    let hash = app_id.bytes().fold(2166136261_u32, |hash, byte| {
-        hash.wrapping_mul(16777619) ^ u32::from(byte)
-    });
-    PALETTE[hash as usize % PALETTE.len()]
-}
-
 fn style_color(value: &str) -> Color32 {
     let digits = value.strip_prefix('#').unwrap_or("");
     let parse = |at: usize| u8::from_str_radix(&digits[at..at + 2], 16).unwrap_or(0);
@@ -4687,6 +6138,10 @@ fn parse_color(value: &str) -> Color32 {
 }
 
 fn main() -> Result<()> {
+    if env::args().any(|arg| arg == "--print-strings") {
+        print!("{}", i18n::en_template_json());
+        return Ok(());
+    }
     let (config, niri_xmb) = parse_args()?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -4716,8 +6171,9 @@ fn parse_args() -> Result<(PathBuf, PathBuf)> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: niri-xmb-config-studio [--config PATH] [--niri-xmb PATH]\n\
-                     Native TOML editor. Validation and save use the niri-xmb binary."
+                    "usage: niri-xmb-config-studio [--config PATH] [--niri-xmb PATH] [--print-strings]\n\
+                     Native TOML editor. Validation and save use the niri-xmb binary.\n\
+                     --print-strings prints the English display-text template (locales/en.json) and exits."
                 );
                 std::process::exit(0);
             }
@@ -5057,6 +6513,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_gamepad_view_aggregates_devices_and_dpad_hats() {
+        let status = json!({
+            "gamepad": {
+                "live": [
+                    {
+                        "path": "/dev/input/event1",
+                        "buttons": ["BTN_SOUTH"],
+                        "axes": {"ABS_Z": 0.4, "ABS_HAT0X": -1.0}
+                    },
+                    {
+                        "path": "/dev/input/event2",
+                        "buttons": ["BTN_THUMBL"],
+                        "axes": {"ABS_Z": 0.8, "ABS_HAT0Y": 1.0}
+                    }
+                ]
+            }
+        });
+        let view = GamepadLiveView::from_status(&status);
+        assert!(view.button("BTN_SOUTH"));
+        assert!(view.button("BTN_THUMBL"));
+        assert_eq!(view.trigger("ABS_Z", "BTN_TL2"), 0.8);
+        assert!(view.dpad("left"));
+        assert!(view.dpad("down"));
+        assert!(!view.dpad("up"));
+        assert!(!view.dpad("right"));
+    }
+
+    #[test]
+    fn live_gamepad_view_is_empty_without_the_live_field() {
+        let view = GamepadLiveView::from_status(&json!({"gamepad": {"devices": 0}}));
+        assert!(view.buttons.is_empty());
+        assert!(view.axes.is_empty());
+    }
+
+    #[test]
     fn patch_only_changes_edited_leaves_and_binding_entries() {
         let before = json!({
             "popup": {"width": 920, "height": 250},
@@ -5240,6 +6731,30 @@ unknown_gamepad_field = 7
         assert!((multiplier(0.0, 1.0) - 2.5).abs() < 1e-5);
         assert!((multiplier(1.0, 1.0) - 0.75).abs() < 1e-5);
         assert!((multiplier(0.08, 0.0) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn binding_dropdown_lists_standard_buttons_only() {
+        let used = vec!["BTN_SOUTH".to_string(), "0x130".to_string()];
+        let options = button_options(&used);
+        assert!(!options.iter().any(|(code, _)| *code == "BTN_SOUTH"));
+        assert!(options.iter().any(|(code, _)| *code == "BTN_EAST"));
+
+        let mut codes = BUTTONS.iter().map(|(code, _)| *code).collect::<Vec<_>>();
+        let count = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), count, "dropdown codes must be unique");
+    }
+
+    #[test]
+    fn binding_dropdown_codes_pass_config_validation() {
+        let mut source = String::from("[gamepad.navi.bindings]\n");
+        for (code, _) in BUTTONS {
+            source.push_str(&format!("{code} = \"pointer.left\"\n"));
+        }
+        let config: Config = toml::from_str(&source).unwrap();
+        config.validate().unwrap();
     }
 
     #[test]

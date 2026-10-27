@@ -1,0 +1,898 @@
+{
+  "fallback": "en",
+  "locale": "en",
+  "messages": {
+    "animation.emphasis_ms": {
+      "description": "Hover/selection emphasis animation duration in milliseconds.",
+      "label": "Emphasis ms"
+    },
+    "animation.enabled": {
+      "description": "Animate popup open, close, and movement.",
+      "label": "Enabled"
+    },
+    "animation.open_scale": {
+      "description": "Scale the popup starts from when opening, as a fraction of full size. 0.94 starts at 94%; 1.0 disables the zoom.",
+      "label": "Open scale"
+    },
+    "animation.panel_ms": {
+      "description": "Panel open/close animation duration in milliseconds.",
+      "label": "Panel ms"
+    },
+    "animation.scroll_ms": {
+      "description": "Popup scroll animation duration in milliseconds.",
+      "label": "Scroll ms"
+    },
+    "bars.*.align": {
+      "description": "Alignment of the bar contents along its edge: start, center, or end.",
+      "label": "Align"
+    },
+    "bars.*.allow_column_join": {
+      "description": "Treat drops nearest a window as joining its column instead of inserting left or right.",
+      "label": "Column join"
+    },
+    "bars.*.edge": {
+      "description": "Screen edge the bar attaches to: top, bottom, left, or right.",
+      "label": "Edge"
+    },
+    "bars.*.height": {
+      "description": "Bar height in logical pixels.",
+      "label": "Height"
+    },
+    "bars.*.hide_empty_workspaces": {
+      "description": "Hide workspaces with no windows, except the active one.",
+      "label": "Hide empty"
+    },
+    "bars.*.margin": {
+      "description": "Distance in logical pixels from the screen edge.",
+      "label": "Margin"
+    },
+    "bars.*.offset": {
+      "description": "Shift along the edge in logical pixels, after alignment and margin.",
+      "label": "Offset"
+    },
+    "bars.*.output": {
+      "description": "Niri output name this bar sits on, e.g. DP-1. Empty uses the focused output.",
+      "label": "Output"
+    },
+    "bars.*.scroll_repeat_ms": {
+      "description": "Minimum milliseconds between wheel-triggered workspace switches. Higher stops one scroll flick skipping several workspaces.",
+      "label": "Wheel repeat ms"
+    },
+    "bars.*.scroll_reverse": {
+      "description": "Reverse the wheel direction for workspace switching.",
+      "label": "Reverse wheel"
+    },
+    "bars.*.scroll_to_switch": {
+      "description": "Mouse wheel over the bar switches workspaces.",
+      "label": "Wheel switches"
+    },
+    "bars.*.scroll_wrap": {
+      "description": "Wheel switching wraps from the last workspace back to the first, and vice versa.",
+      "label": "Wheel wraps"
+    },
+    "bars.*.show_active_indicator": {
+      "description": "Mark the active window with an indicator dot.",
+      "label": "Active indicator"
+    },
+    "bars.*.show_capsule": {
+      "description": "Draw a capsule (pill) background behind the active workspace indicator.",
+      "label": "Capsule"
+    },
+    "bars.*.show_workspace_labels": {
+      "description": "Show workspace name labels in the bar.",
+      "label": "Workspace labels"
+    },
+    "bars.*.width": {
+      "description": "Bar width in logical pixels.",
+      "label": "Width"
+    },
+    "bars_enabled": {
+      "description": "Master switch for the built-in workspace bars. The Noctalia dock plugin is separate and unaffected.",
+      "label": "Enabled"
+    },
+    "behavior.close_on_drop": {
+      "description": "Close the popup after a drag-and-drop completes.",
+      "label": "Drop"
+    },
+    "behavior.close_on_escape": {
+      "description": "Close the popup with Escape (and the gamepad close action).",
+      "label": "Escape"
+    },
+    "behavior.close_on_external_focus_change": {
+      "description": "Close the popup when Niri focus changes for a reason outside the popup itself.",
+      "label": "External focus"
+    },
+    "behavior.close_on_outside_click": {
+      "description": "Legacy field: the manual popup always closes on an outside click. Use Replay outside to control whether that click is then delivered.",
+      "label": "Outside click"
+    },
+    "behavior.close_on_window_click": {
+      "description": "Close the popup when a window inside it is clicked.",
+      "label": "Window click"
+    },
+    "behavior.close_on_workspace_click": {
+      "description": "Close the popup when a workspace inside it is clicked.",
+      "label": "Workspace click"
+    },
+    "behavior.drag_threshold": {
+      "description": "Pointer travel in logical pixels before a press counts as a drag instead of a click.",
+      "label": "Drag threshold"
+    },
+    "behavior.empty_drop_floats": {
+      "description": "Dropping a window onto empty popup space makes it floating instead of tiled.",
+      "label": "Empty drop floats"
+    },
+    "behavior.floating_drop_tiles": {
+      "description": "Dropping a floating window onto the popup tiles it instead of keeping it floating.",
+      "label": "Floating drop tiles"
+    },
+    "behavior.focus_after_drop": {
+      "description": "Focus the dropped window after a drop completes.",
+      "label": "Focus after drop"
+    },
+    "behavior.move_popup": {
+      "description": "Allow moving the manual popup by pressing and holding its border.",
+      "label": "Border drag"
+    },
+    "behavior.navigation": {
+      "description": "deferred: move a selection in the popup and apply it only on confirm. live: move Niri focus with every step, alt-tab style.",
+      "label": "Navigation"
+    },
+    "behavior.popup_grab_region": {
+      "description": "Border inset in logical pixels that starts a popup-move press when Border drag is on.",
+      "label": "Grab region"
+    },
+    "behavior.replay_outside_click": {
+      "description": "Replay a captured outside click to what is underneath after the popup closes, so the click still lands.",
+      "label": "Replay outside"
+    },
+    "behavior.snap_cursor_after_drop": {
+      "description": "Move the pointer onto the dropped window after a drop, so it stays under the cursor.",
+      "label": "Snap cursor after drop"
+    },
+    "gamepad.devices": {
+      "description": "evdev device paths to read, comma-separated. Empty: auto-discover /dev/input/by-id/*-event-joystick and *-event-gamepad.",
+      "label": "Devices"
+    },
+    "gamepad.enabled": {
+      "description": "Master switch for gamepad input. Off: the daemon ignores controllers entirely.",
+      "label": "Enabled"
+    },
+    "gamepad.mode.default": {
+      "description": "Mode at startup: game (input passes through to games) or navi (controller drives the desktop).",
+      "label": "Default mode"
+    },
+    "gamepad.mode.grab_in_navi": {
+      "description": "Grab the controller exclusively in navi mode so games do not also receive the input.",
+      "label": "Grab in navi"
+    },
+    "gamepad.mode.reset_on_disconnect": {
+      "description": "Return to game mode when the last controller disconnects.",
+      "label": "Reset on disconnect"
+    },
+    "gamepad.mode.toggle": {
+      "description": "Buttons held together (at least two) to switch between game and navi mode. Empty disables the toggle.",
+      "label": "Mode toggle"
+    },
+    "gamepad.navi.layers.*.hold": {
+      "description": "Buttons that must all be held to activate this layer. While held, the layer's bindings replace the base navi bindings.",
+      "label": "Hold buttons"
+    },
+    "gamepad.navi.pointer.accel.boost_cap": {
+      "description": "Pointer speed multiplier at full RT gas. 2.5× means 250% of baseline speed; between 1 and 10.",
+      "label": "Full gas ×"
+    },
+    "gamepad.navi.pointer.accel.decel_floor": {
+      "description": "Pointer speed multiplier at full LT brake. 0.30× means 30% of baseline speed; must be above 0 and at most 1.",
+      "label": "Full brake ×"
+    },
+    "gamepad.navi.pointer.accel.enabled": {
+      "description": "Let the triggers modulate pointer speed: LT brakes, RT accelerates.",
+      "label": "Enabled"
+    },
+    "gamepad.navi.pointer.accel.smoothing_ms": {
+      "description": "How fast the pointer speed multiplier eases toward its target, in milliseconds. Higher is smoother and laggier; 0 is instant.",
+      "label": "Smoothing ms"
+    },
+    "gamepad.navi.pointer.curve": {
+      "description": "Pointer response exponent applied after the deadzone. 1.0 is linear; higher keeps small tilts slower for precision and reaches full speed only near full tilt; lower reacts faster early.",
+      "label": "Curve"
+    },
+    "gamepad.navi.pointer.deadzone": {
+      "description": "Stick tilt below this fraction (0–1) is ignored, so a resting or drifting stick does not move the pointer. Higher needs a bigger push to start.",
+      "label": "Deadzone"
+    },
+    "gamepad.navi.pointer.enabled": {
+      "description": "Use an analog stick to move the desktop pointer in navi mode.",
+      "label": "Enabled"
+    },
+    "gamepad.navi.pointer.invert_y": {
+      "description": "Flip vertical pointer movement: push the stick up to move the pointer down, and vice versa.",
+      "label": "Invert Y"
+    },
+    "gamepad.navi.pointer.max_step": {
+      "description": "Largest pointer movement emitted in a single frame, in logical pixels. Caps bursts and lag spikes; 0 disables the cap.",
+      "label": "Max step"
+    },
+    "gamepad.navi.pointer.scroll_accel.boost_cap": {
+      "description": "Scroll speed multiplier at full RT gas. 3.0× means 300% of baseline speed; between 1 and 10.",
+      "label": "Full gas ×"
+    },
+    "gamepad.navi.pointer.scroll_accel.decel_floor": {
+      "description": "Scroll speed multiplier at full LT brake. 0.35× means 35% of baseline speed; must be above 0 and at most 1.",
+      "label": "Full brake ×"
+    },
+    "gamepad.navi.pointer.scroll_accel.enabled": {
+      "description": "Let the triggers modulate scroll speed: LT brakes, RT accelerates.",
+      "label": "Enabled"
+    },
+    "gamepad.navi.pointer.scroll_accel.smoothing_ms": {
+      "description": "How fast the scroll speed multiplier eases toward its target, in milliseconds. Higher is smoother and laggier; 0 is instant.",
+      "label": "Smoothing ms"
+    },
+    "gamepad.navi.pointer.scroll_deadzone": {
+      "description": "Stick tilt below this fraction (0–1) is ignored for scrolling, so a resting stick does not scroll. Higher needs a bigger push to start.",
+      "label": "Scroll deadzone"
+    },
+    "gamepad.navi.pointer.scroll_speed": {
+      "description": "Scroll rate in wheel steps per second at full stick deflection.",
+      "label": "Full-stick speed"
+    },
+    "gamepad.navi.pointer.scroll_stick": {
+      "description": "Which analog stick scrolls, left or right. Pick the stick not used for pointer motion.",
+      "label": "Scroll stick"
+    },
+    "gamepad.navi.pointer.speed": {
+      "description": "Pointer speed in logical pixels per second at full stick deflection, before trigger speed modulation.",
+      "label": "Speed"
+    },
+    "gamepad.navi.pointer.speed_socd": {
+      "description": "How simultaneous LT brake and RT gas resolve (SOCD): last/first pressed wins, both cancel, both multiply, or brake/gas wins. Affects speed only, not bindings or layers.",
+      "label": "Speed SOCD"
+    },
+    "gamepad.navi.pointer.stick": {
+      "description": "Which analog stick moves the pointer, left or right. The other stick can scroll.",
+      "label": "Stick"
+    },
+    "gamepad.navi.pointer.trigger_curve": {
+      "description": "Trigger response exponent when no custom points are set. 1.0 is linear; higher stays slower until a deeper pull.",
+      "label": "Shape curve"
+    },
+    "gamepad.navi.pointer.trigger_deadzone": {
+      "description": "Initial analog-trigger travel ignored before LT/RT speed modulation starts, as a fraction (0–1) of full pull.",
+      "label": "Pull deadzone"
+    },
+    "gamepad.navi.pointer.trigger_threshold": {
+      "description": "Analog axis pull (0–1) at which a layer hold_axes entry counts as held.",
+      "label": "Layer threshold"
+    },
+    "gamepad.open_combo": {
+      "description": "Buttons held together (at least two) to open the XMB popup. Empty disables the combo.",
+      "label": "Open combo"
+    },
+    "gamepad.preset": {
+      "description": "Built-in button layout: none (only your explicit bindings), auto (detect Xbox/DS4/Flydigi per device), xbox, or ds4.",
+      "label": "Preset"
+    },
+    "peek.arm_grace_ms": {
+      "description": "How long peek stays click-through after appearing, in milliseconds, so a click already travelling underneath still lands there.",
+      "label": "Arm grace ms"
+    },
+    "peek.demote_ms": {
+      "description": "How long peek lingers after the pointer leaves it, in milliseconds. Shorter than Duration on purpose: moving away means you declined it.",
+      "label": "Demote ms"
+    },
+    "peek.duration_ms": {
+      "description": "How long peek lingers after the last focus change, in milliseconds. Each further change restarts the countdown.",
+      "label": "Duration ms"
+    },
+    "peek.enabled": {
+      "description": "Show the passive peek overlay while navigating with Niri keybinds. It mirrors focus, takes no input, and hides when navigation stops.",
+      "label": "Enabled"
+    },
+    "peek.move_popup": {
+      "description": "Allow moving an armed peek by its border. Off keeps peek passive.",
+      "label": "Border move"
+    },
+    "peek.pointer_promote": {
+      "description": "Let the pointer take peek over: moving onto it holds it open and clicking turns it into a full manual session. Off keeps peek click-through.",
+      "label": "Pointer promote"
+    },
+    "popup.canvas_height": {
+      "description": "Height of the combined canvas in logical pixels when Outputs is combined.",
+      "label": "Canvas height"
+    },
+    "popup.canvas_width": {
+      "description": "Width of the combined canvas in logical pixels when Outputs is combined.",
+      "label": "Canvas width"
+    },
+    "popup.fixed_x": {
+      "description": "Horizontal position in logical pixels when Position is fixed.",
+      "label": "Fixed X"
+    },
+    "popup.fixed_y": {
+      "description": "Vertical position in logical pixels when Position is fixed.",
+      "label": "Fixed Y"
+    },
+    "popup.follow_delay_ms": {
+      "description": "Delay in milliseconds before a follow_active surface moves to the newly active output.",
+      "label": "Follow delay ms"
+    },
+    "popup.height": {
+      "description": "Popup height in logical pixels, or a percentage such as 80%.",
+      "label": "Height"
+    },
+    "popup.outputs": {
+      "description": "Which monitors the popup covers: focused only, all separately, or all combined into one canvas.",
+      "label": "Outputs"
+    },
+    "popup.placements.*.margin": {
+      "description": "Distance in logical pixels from the anchored edge.",
+      "label": "Margin"
+    },
+    "popup.placements.*.output": {
+      "description": "Niri output name this placement applies to, e.g. DP-1. Empty matches any output.",
+      "label": "Output"
+    },
+    "popup.placements.*.x": {
+      "description": "Horizontal anchoring for this placement: left, center, or right.",
+      "label": "X"
+    },
+    "popup.placements.*.y": {
+      "description": "Vertical anchoring for this placement: top, center, or bottom.",
+      "label": "Y"
+    },
+    "popup.position": {
+      "description": "Where the popup appears: at the cursor, at fixed coordinates, centred, or anchored to an edge placement.",
+      "label": "Position"
+    },
+    "popup.show_labels": {
+      "description": "Show workspace labels in the popup.",
+      "label": "Labels"
+    },
+    "popup.show_titles": {
+      "description": "Show window titles in the popup.",
+      "label": "Titles"
+    },
+    "popup.surface_mode": {
+      "description": "fixed: one surface. follow_active: the surface follows the active output. mirror: mirrored surfaces per output.",
+      "label": "Surface"
+    },
+    "popup.width": {
+      "description": "Popup width in logical pixels, or a percentage such as 80%.",
+      "label": "Width"
+    },
+    "style.accent": {
+      "description": "Accent colour for selection and active indicators.",
+      "label": "Accent"
+    },
+    "style.background": {
+      "description": "Popup background colour (hex, e.g. #101216).",
+      "label": "Background"
+    },
+    "style.background_end": {
+      "description": "Second colour of the popup background gradient.",
+      "label": "Background end"
+    },
+    "style.border": {
+      "description": "Panel and tile border colour.",
+      "label": "Border"
+    },
+    "style.border_soft": {
+      "description": "Subtler border colour used inside tiles.",
+      "label": "Soft border"
+    },
+    "style.border_width": {
+      "description": "Border thickness in logical pixels.",
+      "label": "Border width"
+    },
+    "style.canvas_gap": {
+      "description": "Gap between output canvases in logical pixels when Outputs is combined.",
+      "label": "Canvas gap"
+    },
+    "style.column_gap": {
+      "description": "Gap between window columns in logical pixels.",
+      "label": "Column gap"
+    },
+    "style.dim_alpha": {
+      "description": "Opacity (0–1) of the dimmed backdrop behind the popup. 0 is transparent, 1 is solid.",
+      "label": "Dim alpha"
+    },
+    "style.empty_dot_radius": {
+      "description": "Radius of the dot marking an empty workspace, in logical pixels.",
+      "label": "Empty dot"
+    },
+    "style.floating_backing": {
+      "description": "Backing colour behind floating windows in the popup.",
+      "label": "Floating backing"
+    },
+    "style.gap": {
+      "description": "General gap between popup elements in logical pixels.",
+      "label": "Gap"
+    },
+    "style.icon_size": {
+      "description": "Window icon size in logical pixels for unfocused workspaces.",
+      "label": "Icon size"
+    },
+    "style.icon_size_focused": {
+      "description": "Window icon size in logical pixels for the focused workspace.",
+      "label": "Focused icon size"
+    },
+    "style.label_font_size": {
+      "description": "Workspace label font size in logical pixels.",
+      "label": "Label size"
+    },
+    "style.muted": {
+      "description": "Secondary, de-emphasised text colour.",
+      "label": "Muted"
+    },
+    "style.panel_padding": {
+      "description": "Inner padding of the popup panel in logical pixels.",
+      "label": "Panel padding"
+    },
+    "style.panel_radius": {
+      "description": "Corner radius of the popup panel in logical pixels.",
+      "label": "Panel radius"
+    },
+    "style.radius": {
+      "description": "Corner radius of tiles and small elements in logical pixels.",
+      "label": "Small radius"
+    },
+    "style.row_gap": {
+      "description": "Gap between workspace rows in logical pixels.",
+      "label": "Row gap"
+    },
+    "style.selection_border": {
+      "description": "Border colour of the selected tile.",
+      "label": "Selection"
+    },
+    "style.shadow": {
+      "description": "Popup drop-shadow colour, usually with alpha.",
+      "label": "Shadow"
+    },
+    "style.shadow_offset": {
+      "description": "Vertical drop-shadow offset in logical pixels. Negative moves the shadow up.",
+      "label": "Shadow offset"
+    },
+    "style.shadow_spread": {
+      "description": "Drop-shadow blur/spread radius in logical pixels.",
+      "label": "Shadow spread"
+    },
+    "style.stack_gap": {
+      "description": "Gap between stacked windows in a column, in logical pixels.",
+      "label": "Stack gap"
+    },
+    "style.surface": {
+      "description": "Workspace and window tile background colour.",
+      "label": "Surface"
+    },
+    "style.surface_hover": {
+      "description": "Tile background colour under the pointer.",
+      "label": "Surface hover"
+    },
+    "style.text": {
+      "description": "Primary label text colour.",
+      "label": "Text"
+    },
+    "style.title_font_size": {
+      "description": "Window title font size in logical pixels.",
+      "label": "Title size"
+    },
+    "style.urgent": {
+      "description": "Colour used for urgent (attention-demanding) workspaces.",
+      "label": "Urgent"
+    },
+    "style.urgent_badge_radius": {
+      "description": "Urgent badge radius in logical pixels (Urgent indicator: badge).",
+      "label": "Urgent badge"
+    },
+    "style.urgent_glow_alpha": {
+      "description": "Urgent glow opacity (0–1).",
+      "label": "Urgent alpha"
+    },
+    "style.urgent_glow_spread": {
+      "description": "Urgent glow spread radius in logical pixels (Urgent indicator: glow).",
+      "label": "Urgent spread"
+    },
+    "style.urgent_indicator": {
+      "description": "How a workspace demanding attention is marked: none, a ring, a glow, or a badge.",
+      "label": "Urgent indicator"
+    },
+    "style.urgent_ring_padding": {
+      "description": "Gap between a tile and its urgent ring, in logical pixels.",
+      "label": "Urgent padding"
+    },
+    "style.urgent_ring_width": {
+      "description": "Urgent ring thickness in logical pixels (Urgent indicator: ring).",
+      "label": "Urgent ring"
+    },
+    "theme": {
+      "description": "Path to a theme TOML merged over the built-in style. Editing style fields below writes the base config value.",
+      "label": "Theme file"
+    },
+    "ui.action.add_bar": {
+      "description": "Add a built-in workspace bar.",
+      "label": "Add bar"
+    },
+    "ui.action.add_binding": {
+      "description": "Bind another standard button in this map. Only unbound buttons are offered.",
+      "label": "Add binding"
+    },
+    "ui.action.add_hold_axis": {
+      "description": "Add an analog axis (e.g. a trigger) that must be pulled past its threshold to hold this layer.",
+      "label": "Add hold axis"
+    },
+    "ui.action.add_layer": {
+      "description": "Add a hold-to-activate binding layer.",
+      "label": "Add layer"
+    },
+    "ui.action.add_placement": {
+      "description": "Add a per-output anchored popup position.",
+      "label": "Add placement"
+    },
+    "ui.action.add_point": {
+      "description": "Add a response point to the trigger graph (at most five).",
+      "label": "+ Point"
+    },
+    "ui.action.cancel": {
+      "description": "Close without saving.",
+      "label": "Cancel"
+    },
+    "ui.action.changes": {
+      "description": "Show or hide the list of pending config paths and the validated TOML.",
+      "label": "Changes"
+    },
+    "ui.action.clear_points": {
+      "description": "Remove all custom response points and use the curve exponent again.",
+      "label": "Clear"
+    },
+    "ui.action.convert_curve": {
+      "description": "Replace the curve exponent with editable points sampled from it.",
+      "label": "Convert curve"
+    },
+    "ui.action.copy_toml": {
+      "description": "Copy the validated TOML to the clipboard.",
+      "label": "Copy TOML"
+    },
+    "ui.action.delete": {
+      "description": "Delete this entry. The change is only written on Save.",
+      "label": "Delete"
+    },
+    "ui.action.delete_point": {
+      "description": "Remove this response point from the graph.",
+      "label": "Delete point"
+    },
+    "ui.action.dismiss": {
+      "description": "Hide this error message. The error itself is not fixed by dismissing it.",
+      "label": "Dismiss"
+    },
+    "ui.action.linear": {
+      "description": "Reset the trigger response to a straight line (curve 1.0, no custom points).",
+      "label": "Linear"
+    },
+    "ui.action.load": {
+      "description": "Load the TOML file at the path above, discarding the in-memory model.",
+      "label": "Load"
+    },
+    "ui.action.preview": {
+      "description": "Go to the Preview section with the live popup render.",
+      "label": "Preview"
+    },
+    "ui.action.remove": {
+      "description": "Remove this button from the list.",
+      "label": "Remove"
+    },
+    "ui.action.reset_sim": {
+      "description": "Reset the simulated trigger pedals to rest.",
+      "label": "Reset"
+    },
+    "ui.action.revert": {
+      "description": "Discard all edits and restore the last loaded or saved config.",
+      "label": "Revert"
+    },
+    "ui.action.save": {
+      "description": "Validate and write the config file. Does not restart the daemon.",
+      "label": "Save"
+    },
+    "ui.action.save_restart": {
+      "description": "Save, then restart the daemon so the new config takes effect.",
+      "label": "Save & Restart"
+    },
+    "ui.action.validate": {
+      "description": "Check the edited config with the daemon's config checker without saving.",
+      "label": "Validate"
+    },
+    "ui.action.view_toml": {
+      "description": "Show the validated TOML that Save would write.",
+      "label": "View TOML"
+    },
+    "ui.app.config": {
+      "description": "Short subtitle of the config studio window.",
+      "label": "Config"
+    },
+    "ui.app.config_studio": {
+      "description": "Name of this editor, shown in the navigation rail.",
+      "label": "Config studio"
+    },
+    "ui.app.name": {
+      "description": "Application name. Do not translate.",
+      "label": "niri-xmb"
+    },
+    "ui.bindings.layer": {
+      "description": "Bindings in this layer, used instead of Navi base while the layer is held.",
+      "label": "Bindings"
+    },
+    "ui.bindings.navi_base": {
+      "description": "Bindings used on the desktop in navi mode when no hold layer is active: pointer clicks, scroll, xmb.open, and niri.* actions.",
+      "label": "Navi base"
+    },
+    "ui.bindings.xmb": {
+      "description": "Bindings used while the XMB popup is open: up/down/left/right/tab/back/confirm/close/open.",
+      "label": "XMB buttons"
+    },
+    "ui.card.animation": {
+      "description": "Popup animation durations and opening scale.",
+      "label": "Animation"
+    },
+    "ui.card.bars": {
+      "description": "Built-in per-output workspace bars. Disabled in many setups, where the Noctalia dock plugin draws the strip instead.",
+      "label": "Bars"
+    },
+    "ui.card.behavior": {
+      "description": "Popup input, closing, and drag-and-drop behaviour.",
+      "label": "Behavior"
+    },
+    "ui.card.bindings": {
+      "description": "Button-to-action maps. XMB buttons apply while the popup is open; Navi base applies on the desktop.",
+      "label": "Bindings"
+    },
+    "ui.card.colors": {
+      "description": "Style colours as hex values. The square shows the parsed colour.",
+      "label": "Colors"
+    },
+    "ui.card.controller_map": {
+      "description": "Click a control on the controller picture to edit its binding in the inspector.",
+      "label": "Controller map"
+    },
+    "ui.card.detected_controller": {
+      "description": "Controllers the running daemon currently sees. This is live status, not config.",
+      "label": "Detected controller"
+    },
+    "ui.card.device": {
+      "description": "Which controllers are read and how game/navi mode works.",
+      "label": "Device"
+    },
+    "ui.card.geometry": {
+      "description": "Style sizes, gaps, and radii in logical pixels unless an entry says otherwise.",
+      "label": "Geometry"
+    },
+    "ui.card.layers": {
+      "description": "Extra binding maps active only while their hold buttons or axes are held, like a modifier key.",
+      "label": "Layers"
+    },
+    "ui.card.model": {
+      "description": "Counts from the edited config model.",
+      "label": "Model"
+    },
+    "ui.card.panel": {
+      "description": "Popup size, position, and which outputs it covers.",
+      "label": "Panel"
+    },
+    "ui.card.peek": {
+      "description": "Passive overlay shown during Niri keybind navigation.",
+      "label": "Peek"
+    },
+    "ui.card.placements": {
+      "description": "Per-output anchored positions, overriding Position for listed outputs.",
+      "label": "Placements"
+    },
+    "ui.card.pointer": {
+      "description": "Stick-driven pointer motion and scrolling in navi mode.",
+      "label": "Pointer"
+    },
+    "ui.card.response": {
+      "description": "Trigger response graph: pull on the horizontal axis, shaped output on the vertical. Double-click to add a point, drag to move, right-click to delete.",
+      "label": "Response"
+    },
+    "ui.card.theme": {
+      "description": "External theme file merged over the built-in style.",
+      "label": "Theme"
+    },
+    "ui.card.tune": {
+      "description": "Trigger pedals simulation and numeric speed-accel settings.",
+      "label": "Tune"
+    },
+    "ui.card.xmb_panel": {
+      "description": "Live popup render using the edited config. Hover previews emphasis; clicking a window or workspace focuses it.",
+      "label": "XMB panel"
+    },
+    "ui.dialog.confirm": {
+      "description": "Title of the save confirmation dialog.",
+      "label": "Confirm"
+    },
+    "ui.graph.hint": {
+      "description": "Response graph editing. Points must stay at least 10% of pull apart and outputs must not decrease.",
+      "label": "Double-click the graph to add a point; drag points; right-click to delete."
+    },
+    "ui.graph.lt_brake_rt_gas": {
+      "description": "Left trigger slows (brake), right trigger speeds up (gas); 1.0× is the unmodulated baseline speed.",
+      "label": "LT brake · RT gas · 1.0× baseline"
+    },
+    "ui.heading.close_when": {
+      "description": "Events that close the manual popup.",
+      "label": "Close when"
+    },
+    "ui.heading.drop_behavior": {
+      "description": "What happens when a window is dropped in the popup.",
+      "label": "Drop behavior"
+    },
+    "ui.heading.input": {
+      "description": "How popup navigation and dragging behave.",
+      "label": "Input"
+    },
+    "ui.heading.motion": {
+      "description": "Settings for moving the pointer with an analog stick.",
+      "label": "Motion"
+    },
+    "ui.heading.pointer_accel": {
+      "description": "Trigger speed modulation for pointer motion.",
+      "label": "Pointer accel"
+    },
+    "ui.heading.scroll": {
+      "description": "Settings for scrolling with an analog stick.",
+      "label": "Scroll"
+    },
+    "ui.heading.scroll_accel": {
+      "description": "Trigger speed modulation for scrolling.",
+      "label": "Scroll accel"
+    },
+    "ui.heading.trigger": {
+      "description": "Shared LT/RT trigger shaping used by both pointer and scroll speed modulation.",
+      "label": "Trigger"
+    },
+    "ui.inspector.action": {
+      "description": "What the selected button does in this context. unbound removes the binding.",
+      "label": "Action"
+    },
+    "ui.inspector.bindings_in_context": {
+      "description": "All bindings in the selected context, button → action.",
+      "label": "Bindings in context"
+    },
+    "ui.inspector.context": {
+      "description": "Which binding map the Action below edits: base (desktop navi), xmb (popup open), or a named hold layer.",
+      "label": "Context"
+    },
+    "ui.inspector.selected": {
+      "description": "The controller control selected on the map. Click another control to edit it.",
+      "label": "Selected"
+    },
+    "ui.layer.hold_axes": {
+      "description": "Analog axis and pull threshold (0–1) that must also be held to activate this layer, e.g. ABS_Z at 0.35 for a half-pulled trigger.",
+      "label": "Hold axis"
+    },
+    "ui.preset.precise": {
+      "description": "Trigger preset: very gentle early response for fine speed control, still reaching full pull.",
+      "label": "Precise"
+    },
+    "ui.preset.snappy": {
+      "description": "Trigger preset: stays gentle briefly, then rises fast to near-full output.",
+      "label": "Snappy"
+    },
+    "ui.preset.soft_start": {
+      "description": "Trigger preset: gentle response early, catching up later. Two points at 35%→10% and 65%→40%.",
+      "label": "Soft start"
+    },
+    "ui.section.appearance": {
+      "description": "Theme, colours, geometry, and bars.",
+      "label": "Appearance"
+    },
+    "ui.section.controller": {
+      "description": "Gamepad device, pointer, bindings, and layers.",
+      "label": "Controller"
+    },
+    "ui.section.popup": {
+      "description": "XMB popup panel, behaviour, peek, and animation.",
+      "label": "Popup"
+    },
+    "ui.section.preview": {
+      "description": "Live daemon snapshot rendered with the edited config.",
+      "label": "Preview"
+    },
+    "ui.section.trigger": {
+      "description": "Analog-trigger response curve and LT/RT speed tuning.",
+      "label": "Trigger Lab"
+    },
+    "ui.sim.offline": {
+      "description": "These pedals simulate trigger pull locally. They are not live controller input.",
+      "label": "Simulated pull · offline"
+    },
+    "ui.status.all_buttons_bound": {
+      "description": "Every standard button already has a binding in this map.",
+      "label": "All standard buttons are bound"
+    },
+    "ui.status.bars_disabled": {
+      "description": "The built-in bars are off (Appearance → Bars → Enabled). This preview section follows that setting.",
+      "label": "Bars disabled"
+    },
+    "ui.status.confirm_restart": {
+      "description": "Saving writes the file; restarting replaces the running daemon with the new config.",
+      "label": "Save and restart niri-xmb?"
+    },
+    "ui.status.confirm_save": {
+      "description": "The file is validated again and replaced atomically.",
+      "label": "Save this TOML?"
+    },
+    "ui.status.connected": {
+      "description": "A controller is connected and visible to the daemon.",
+      "label": "connected"
+    },
+    "ui.status.daemon_offline": {
+      "description": "The daemon is not answering status requests.",
+      "label": "daemon offline"
+    },
+    "ui.status.error": {
+      "description": "Heading of the error banner. The message below it is a daemon or validation error, shown untranslated.",
+      "label": "Error"
+    },
+    "ui.status.no_bars": {
+      "description": "No built-in bars defined.",
+      "label": "No bars"
+    },
+    "ui.status.no_bindings": {
+      "description": "This map is empty. Add a binding below.",
+      "label": "No bindings"
+    },
+    "ui.status.no_changes": {
+      "description": "The edited model matches the loaded file.",
+      "label": "No changes"
+    },
+    "ui.status.no_controller": {
+      "description": "The daemon is running but no controller is connected.",
+      "label": "no controller"
+    },
+    "ui.status.no_controller_connected": {
+      "description": "Connect a controller to test navi bindings and pointer settings live.",
+      "label": "No controller connected"
+    },
+    "ui.status.no_layers": {
+      "description": "No hold layers defined. Add one below.",
+      "label": "No layers"
+    },
+    "ui.status.no_outputs": {
+      "description": "The daemon snapshot lists no monitors, so there is nothing to render.",
+      "label": "No outputs in live snapshot"
+    },
+    "ui.status.no_placements": {
+      "description": "No per-output placements. The popup uses Position for every output.",
+      "label": "No placements"
+    },
+    "ui.status.not_detected": {
+      "description": "No controller was found by the daemon.",
+      "label": "not detected"
+    },
+    "ui.status.off": {
+      "description": "Shown next to a disabled trigger-accel group: its multipliers are not applied.",
+      "label": "off"
+    },
+    "ui.status.pending_changes": {
+      "description": "Config paths changed since load. set means written on Save; remove means deleted from the file.",
+      "label": "Pending changes"
+    },
+    "ui.status.popup_render_failed": {
+      "description": "The offline renderer returned no frame for the current config and snapshot.",
+      "label": "Popup could not be rendered"
+    },
+    "ui.status.preview_config_error": {
+      "description": "The edited model does not parse as a valid config, so the preview cannot render. Validate shows the error.",
+      "label": "Preview cannot read the current config"
+    },
+    "ui.status.waiting_snapshot": {
+      "description": "The preview polls the daemon about once a second.",
+      "label": "Waiting for niri-xmb live snapshot"
+    },
+    "ui.trigger.shape": {
+      "description": "Trigger response shaping presets. + Point edits the graph freely; the named presets set ready-made point sets.",
+      "label": "Shape"
+    }
+  }
+}
