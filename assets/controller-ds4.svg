@@ -74,13 +74,11 @@
   <circle id="LStickWell" class="well" cx="166" cy="238" r="37.5"/>
   <circle id="LStickCap" class="stick-cap" cx="166" cy="238" r="28"/>
   <circle class="stick-ring" cx="166" cy="238" r="18"/>
-  <text x="166" y="238" class="label-sm">L3</text>
 
   <!-- Right Stick (R3) Well & Cap (Bottom-Right: cx=278, cy=238) -->
   <circle id="RStickWell" class="well" cx="278" cy="238" r="37.5"/>
   <circle id="RStickCap" class="stick-cap" cx="278" cy="238" r="28"/>
   <circle class="stick-ring" cx="278" cy="238" r="18"/>
-  <text x="278" y="238" class="label-sm">R3</text>
 
   <!-- Face Buttons Well & 4 Buttons (Top-Right: cx=329, cy=160) -->
   <circle id="FaceButtonsWell" class="well" cx="329" cy="160" r="37.5"/>

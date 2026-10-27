@@ -46,13 +46,11 @@
   <circle id="LStickWell" class="well" cx="113" cy="160" r="37.5"/>
   <circle id="LStickCap" class="stick-cap" cx="113" cy="160" r="28"/>
   <circle class="stick-ring" cx="113" cy="160" r="18"/>
-  <text x="113" y="160" class="label-sm">LS</text>
 
   <!-- Right Stick Well & Cap (Bottom-Right) -->
   <circle id="RStickWell" class="well" cx="278" cy="238" r="37.5"/>
   <circle id="RStickCap" class="stick-cap" cx="278" cy="238" r="28"/>
   <circle class="stick-ring" cx="278" cy="238" r="18"/>
-  <text x="278" y="238" class="label-sm">RS</text>
 
   <!-- D-pad Well & 4 Distinct Directional Buttons (Bottom-Left) -->
   <circle id="DpadWell" class="well" cx="166" cy="238" r="37.5"/>

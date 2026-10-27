@@ -2056,28 +2056,28 @@ impl StudioApp {
         let hh = hit.height() * 0.5;
         let pts = match shape {
             HotspotShape::DpadUp => vec![
-                Pos2::new(center.x - hw * 0.7, center.y - hh),
-                Pos2::new(center.x + hw * 0.7, center.y - hh),
-                Pos2::new(center.x + hw, center.y + hh),
-                Pos2::new(center.x - hw, center.y + hh),
+                Pos2::new(center.x - hw * 0.85, center.y - hh),
+                Pos2::new(center.x + hw * 0.85, center.y - hh),
+                Pos2::new(center.x + hw * 0.40, center.y + hh),
+                Pos2::new(center.x - hw * 0.40, center.y + hh),
             ],
             HotspotShape::DpadDown => vec![
-                Pos2::new(center.x - hw, center.y - hh),
-                Pos2::new(center.x + hw, center.y - hh),
-                Pos2::new(center.x + hw * 0.7, center.y + hh),
-                Pos2::new(center.x - hw * 0.7, center.y + hh),
+                Pos2::new(center.x - hw * 0.40, center.y - hh),
+                Pos2::new(center.x + hw * 0.40, center.y - hh),
+                Pos2::new(center.x + hw * 0.85, center.y + hh),
+                Pos2::new(center.x - hw * 0.85, center.y + hh),
             ],
             HotspotShape::DpadLeft => vec![
-                Pos2::new(center.x - hw, center.y - hh * 0.7),
-                Pos2::new(center.x + hw, center.y - hh),
-                Pos2::new(center.x + hw, center.y + hh),
-                Pos2::new(center.x - hw, center.y + hh * 0.7),
+                Pos2::new(center.x - hw, center.y - hh * 0.85),
+                Pos2::new(center.x + hw, center.y - hh * 0.40),
+                Pos2::new(center.x + hw, center.y + hh * 0.40),
+                Pos2::new(center.x - hw, center.y + hh * 0.85),
             ],
             HotspotShape::DpadRight => vec![
-                Pos2::new(center.x - hw, center.y - hh),
-                Pos2::new(center.x + hw, center.y - hh * 0.7),
-                Pos2::new(center.x + hw, center.y + hh * 0.7),
-                Pos2::new(center.x - hw, center.y + hh),
+                Pos2::new(center.x - hw, center.y - hh * 0.40),
+                Pos2::new(center.x + hw, center.y - hh * 0.85),
+                Pos2::new(center.x + hw, center.y + hh * 0.85),
+                Pos2::new(center.x - hw, center.y + hh * 0.40),
             ],
             _ => return None,
         };
@@ -2127,9 +2127,18 @@ impl StudioApp {
                 center,
                 Vec2::new(hotspot.w * rect.width(), hotspot.h * rect.width()),
             );
+            let interact_rect = if hotspot.label {
+                let well_radius = rect.height() * (37.5 / 403.0);
+                hit.union(Rect::from_min_max(
+                    Pos2::new(center.x - 30.0, center.y + well_radius),
+                    Pos2::new(center.x + 30.0, center.y + well_radius + 20.0),
+                ))
+            } else {
+                hit
+            };
             let selected = self.selected == hotspot.control;
             let response = ui.interact(
-                hit,
+                interact_rect,
                 ui.id().with(("hotspot", template.label(), hotspot.control)),
                 Sense::click(),
             );
@@ -2144,7 +2153,7 @@ impl StudioApp {
 
             match hotspot.shape {
                 HotspotShape::Circle => {
-                    let r = hit.width().min(hit.height()) / 2.0;
+                    let r = (hotspot.w * rect.width()).min(hotspot.h * rect.width()) / 2.0;
                     if selected {
                         ui.painter().circle_filled(
                             center,
@@ -2197,12 +2206,16 @@ impl StudioApp {
                         } else if selected {
                             Color32::from_rgba_unmultiplied(116, 162, 255, 30)
                         } else {
-                            Color32::TRANSPARENT
+                            Color32::from_rgba_unmultiplied(193, 215, 238, 46)
                         };
                         let shape_stroke = if is_pressed {
                             Stroke::new(1.8_f32, Color32::WHITE)
+                        } else if selected {
+                            Stroke::new(2.0_f32, ACCENT)
+                        } else if response.hovered() {
+                            Stroke::new(1.5_f32, Color32::from_rgb(220, 230, 245))
                         } else {
-                            stroke
+                            Stroke::new(2.0_f32, Color32::from_rgb(193, 215, 238))
                         };
                         ui.painter()
                             .add(egui::Shape::convex_polygon(pts, fill, shape_stroke));
@@ -2230,22 +2243,38 @@ impl StudioApp {
                     },
                 );
             } else if hotspot.label {
-                let pos = Pos2::new(center.x, hit.max.y + 3.0);
-                let font = FontId::monospace(label_size);
-                ui.painter().text(
-                    pos + Vec2::new(0.0, 1.0),
-                    Align2::CENTER_TOP,
-                    hotspot.control,
-                    font.clone(),
-                    Color32::from_rgba_unmultiplied(12, 14, 18, 200),
+                let well_radius = rect.height() * (37.5 / 403.0);
+                let pos = Pos2::new(center.x, center.y + well_radius + 4.0);
+                let stick_font = FontId::monospace((rect.width() * 0.022).clamp(9.0, 11.5));
+                let text_color = if selected {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgb(193, 215, 238)
+                };
+                let galley = ui.painter().layout_no_wrap(
+                    hotspot.control.to_string(),
+                    stick_font,
+                    text_color,
                 );
-                ui.painter().text(
-                    pos,
-                    Align2::CENTER_TOP,
-                    hotspot.control,
-                    font,
-                    Color32::from_gray(166),
-                );
+                let text_pos = Pos2::new(center.x - galley.size().x * 0.5, pos.y);
+                let pill_rect =
+                    Rect::from_min_size(text_pos, galley.size()).expand2(Vec2::new(4.0, 2.0));
+                let pill_fill = if selected {
+                    Color32::from_rgba_unmultiplied(28, 38, 54, 230)
+                } else {
+                    Color32::from_rgba_unmultiplied(16, 20, 26, 220)
+                };
+                let pill_stroke = if selected {
+                    Stroke::new(1.5_f32, ACCENT)
+                } else if response.hovered() {
+                    Stroke::new(1.0_f32, Color32::from_rgb(220, 230, 245))
+                } else {
+                    Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(193, 215, 238, 70))
+                };
+                ui.painter().rect_filled(pill_rect, 3.0, pill_fill);
+                ui.painter()
+                    .rect_stroke(pill_rect, 3.0, pill_stroke, StrokeKind::Inside);
+                ui.painter().galley(text_pos, galley, text_color);
             }
             if response.clicked() {
                 self.selected = hotspot.control;
@@ -8365,6 +8394,30 @@ unknown_gamepad_field = 7
             assert!(ds4_svg.contains(id), "ds4 svg missing {id}");
         }
 
+        assert!(
+            !xbox_svg.contains(">LS<"),
+            "xbox svg should not have clashing LS text"
+        );
+        assert!(
+            !xbox_svg.contains(">RS<"),
+            "xbox svg should not have clashing RS text"
+        );
+        assert!(
+            !ds4_svg.contains(">L3<"),
+            "ds4 svg should not have clashing L3 text"
+        );
+        assert!(
+            !ds4_svg.contains(">R3<"),
+            "ds4 svg should not have clashing R3 text"
+        );
+
+        let xbox_hs = Template::Xbox.hotspots();
+        let ds4_hs = Template::Ds4.hotspots();
+        assert!(xbox_hs.iter().any(|h| h.control == "L STICK" && h.label));
+        assert!(xbox_hs.iter().any(|h| h.control == "R STICK" && h.label));
+        assert!(ds4_hs.iter().any(|h| h.control == "L3" && h.label));
+        assert!(ds4_hs.iter().any(|h| h.control == "R3" && h.label));
+
         for template in [Template::Xbox, Template::Ds4] {
             let hotspots = template.hotspots();
             let dpad_directions = ["D-pad up", "D-pad down", "D-pad left", "D-pad right"];
@@ -8383,6 +8436,47 @@ unknown_gamepad_field = 7
                 );
             }
         }
+    }
+
+    #[test]
+    fn dpad_polygon_tapers_inward_to_center() {
+        let center = Pos2::new(100.0, 100.0);
+        let hit = Rect::from_center_size(center, Vec2::new(40.0, 40.0));
+        let up = StudioApp::dpad_polygon(center, hit, HotspotShape::DpadUp).unwrap();
+        assert_eq!(up.len(), 4);
+        let outer_width = (up[1].x - up[0].x).abs();
+        let inner_width = (up[2].x - up[3].x).abs();
+        assert!(
+            outer_width > inner_width,
+            "DpadUp must taper inward toward center"
+        );
+
+        let down = StudioApp::dpad_polygon(center, hit, HotspotShape::DpadDown).unwrap();
+        assert_eq!(down.len(), 4);
+        let inner_width_down = (down[1].x - down[0].x).abs();
+        let outer_width_down = (down[2].x - down[3].x).abs();
+        assert!(
+            outer_width_down > inner_width_down,
+            "DpadDown must taper inward toward center"
+        );
+
+        let left = StudioApp::dpad_polygon(center, hit, HotspotShape::DpadLeft).unwrap();
+        assert_eq!(left.len(), 4);
+        let outer_height_left = (left[3].y - left[0].y).abs();
+        let inner_height_left = (left[2].y - left[1].y).abs();
+        assert!(
+            outer_height_left > inner_height_left,
+            "DpadLeft must taper inward toward center"
+        );
+
+        let right = StudioApp::dpad_polygon(center, hit, HotspotShape::DpadRight).unwrap();
+        assert_eq!(right.len(), 4);
+        let inner_height_right = (right[3].y - right[0].y).abs();
+        let outer_height_right = (right[2].y - right[1].y).abs();
+        assert!(
+            outer_height_right > inner_height_right,
+            "DpadRight must taper inward toward center"
+        );
     }
 
     #[test]
