@@ -5260,7 +5260,21 @@ impl StudioApp {
         let mut next_code = code.to_string();
         let mut next_action = action.to_string();
         let mut remove = false;
+        let mut row_interacted = false;
         let selected = highlight == Some(code);
+        // Register the row's background target before creating its children.
+        // Egui resolves overlapping widgets in creation order, so the later
+        // combo boxes and remove button remain above this target.
+        let row_rect = Rect::from_min_size(
+            ui.next_widget_position(),
+            Vec2::new(ui.available_width(), ui.spacing().interact_size.y + 4.0),
+        );
+        let row_response = ui.interact(
+            row_rect,
+            egui::Id::new(("binding-row", path, code)),
+            Sense::click(),
+        );
+        row_interacted |= row_response.clicked();
         // Every other row's code, so the dropdown only offers free buttons.
         let used = get_path(&self.model, path)
             .and_then(Value::as_object)
@@ -5287,7 +5301,7 @@ impl StudioApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let mut code_changed = false;
-                    ComboBox::from_id_salt(("binding-code", path, code))
+                    let code_response = ComboBox::from_id_salt(("binding-code", path, code))
                         .width(120.0)
                         .selected_text(RichText::new(&next_code).monospace())
                         .show_ui(ui, |ui| {
@@ -5312,8 +5326,9 @@ impl StudioApp {
                                     .changed();
                             }
                         });
+                    row_interacted |= code_response.response.clicked() || code_changed;
                     let mut action_changed = false;
-                    ComboBox::from_id_salt(("binding", path, code))
+                    let action_response = ComboBox::from_id_salt(("binding", path, code))
                         .width((ui.available_width() - 34.0).clamp(100.0, 300.0))
                         .selected_text(&next_action)
                         .show_ui(ui, |ui| {
@@ -5327,16 +5342,23 @@ impl StudioApp {
                                     .changed();
                             }
                         });
+                    row_interacted |= action_response.response.clicked() || action_changed;
                     remove = ui
                         .small_button("x")
                         .on_hover_text("Remove binding")
                         .clicked();
+                    row_interacted |= remove;
                     code_changed || action_changed
                 })
                 .inner
             });
-        let row_clicked = frame.response.interact(Sense::click()).clicked();
-        if row_clicked
+        // Do not call `frame.response.interact` here. `Frame::show` returns a
+        // response after its children have been created, and `interact` adds
+        // another full-row widget at that point. Egui gives the last widget
+        // priority, so that invisible overlay consumed clicks intended for
+        // both combo boxes and the remove button. Child responses above keep
+        // row selection without covering those controls.
+        if row_interacted
             && let Some(control) = self
                 .template
                 .hotspots()
