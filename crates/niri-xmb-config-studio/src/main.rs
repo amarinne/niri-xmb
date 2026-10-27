@@ -645,6 +645,7 @@ struct StudioApp {
     sim_lt: f32,
     sim_rt: f32,
     sim_last_left: bool,
+    sim_first_left: bool,
     selected_point: Option<usize>,
     live: Arc<Mutex<LiveState>>,
     live_stop: Arc<AtomicBool>,
@@ -674,6 +675,7 @@ impl StudioApp {
             sim_lt: 0.0,
             sim_rt: 0.0,
             sim_last_left: true,
+            sim_first_left: true,
             selected_point: None,
             live: Arc::new(Mutex::new(LiveState::default())),
             live_stop: Arc::new(AtomicBool::new(false)),
@@ -2086,20 +2088,21 @@ impl StudioApp {
             .size(10.0)
             .color(TEXT_DIM),
         );
-        let socd = get_path(&self.model, "gamepad.navi.pointer.trigger_socd")
+        let socd = get_path(&self.model, "gamepad.navi.pointer.speed_socd")
             .and_then(Value::as_str)
             .unwrap_or("multiply");
+        let socd_label = match socd {
+            "last" => "last pressed wins",
+            "first" => "first held wins",
+            "cancel" => "both cancel",
+            "prio_decel" => "brake wins",
+            "prio_accel" => "gas wins",
+            _ => "brake × gas",
+        };
         ui.label(
-            RichText::new(format!(
-                "LT+RT: {}",
-                if socd == "last" {
-                    "last pressed wins"
-                } else {
-                    "multiply brake × gas"
-                }
-            ))
-            .size(10.0)
-            .color(TEXT_DIM),
+            RichText::new(format!("Speed conflict: {socd_label}"))
+                .size(10.0)
+                .color(TEXT_DIM),
         );
         self.trigger_presets(ui);
         ui.add_space(6.0);
@@ -2626,6 +2629,7 @@ impl StudioApp {
                     self.sim_lt = 0.0;
                     self.sim_rt = 0.0;
                     self.sim_last_left = true;
+                    self.sim_first_left = true;
                 }
             });
         });
@@ -2654,25 +2658,44 @@ impl StudioApp {
         if (self.sim_rt - before_rt).abs() > 1e-6 {
             self.sim_last_left = false;
         }
-        let socd = get_path(&self.model, "gamepad.navi.pointer.trigger_socd")
-            .and_then(Value::as_str)
-            .unwrap_or("multiply");
+        let before_lt_active = before_lt > deadzone;
+        let before_rt_active = before_rt > deadzone;
         let lt_active = self.sim_lt > deadzone;
         let rt_active = self.sim_rt > deadzone;
-        let (effective_lt, effective_rt) = if socd == "last" {
-            let selected_left = match (lt_active, rt_active) {
-                (true, true) => self.sim_last_left,
-                (true, false) => true,
-                (false, true) => false,
-                (false, false) => true,
-            };
-            if selected_left {
-                (self.sim_lt, 0.0)
-            } else {
-                (0.0, self.sim_rt)
-            }
-        } else {
-            (self.sim_lt, self.sim_rt)
+        if !before_lt_active && lt_active && !before_rt_active {
+            self.sim_first_left = true;
+        }
+        if !before_rt_active && rt_active && !before_lt_active {
+            self.sim_first_left = false;
+        }
+        if lt_active && !rt_active {
+            self.sim_first_left = true;
+        } else if !lt_active && rt_active {
+            self.sim_first_left = false;
+        } else if !lt_active && !rt_active {
+            self.sim_first_left = true;
+        }
+        let socd = get_path(&self.model, "gamepad.navi.pointer.speed_socd")
+            .and_then(Value::as_str)
+            .unwrap_or("multiply");
+        let pick = |prefer_left: bool| match (lt_active, rt_active) {
+            (true, true) => Some(prefer_left),
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+        };
+        let side_inputs = |left: Option<bool>| match left {
+            Some(true) => (self.sim_lt, 0.0),
+            Some(false) => (0.0, self.sim_rt),
+            None => (0.0, 0.0),
+        };
+        let (effective_lt, effective_rt) = match socd {
+            "last" => side_inputs(pick(self.sim_last_left)),
+            "first" => side_inputs(pick(self.sim_first_left)),
+            "cancel" if lt_active && rt_active => (0.0, 0.0),
+            "prio_decel" if lt_active => (self.sim_lt, 0.0),
+            "prio_accel" if rt_active => (0.0, self.sim_rt),
+            _ => (self.sim_lt, self.sim_rt),
         };
         let points = self.trigger_points();
         let lt_shape = trigger_shape(effective_lt, deadzone, curve, &points);
@@ -2705,7 +2728,7 @@ impl StudioApp {
         };
         ui.label(
             RichText::new(format!(
-                "Target speed vs baseline (no smoothing · LT+RT {socd})"
+                "Target speed vs baseline (no smoothing · speed {socd})"
             ))
             .size(9.5)
             .color(TEXT_DIM),
@@ -2774,9 +2797,16 @@ impl StudioApp {
                 );
                 self.combo_field(
                     &mut cols[0],
-                    &format!("{pointer}.trigger_socd"),
-                    "LT+RT",
-                    &["multiply", "last"],
+                    &format!("{pointer}.speed_socd"),
+                    "Speed SOCD",
+                    &[
+                        "last",
+                        "first",
+                        "cancel",
+                        "multiply",
+                        "prio_decel",
+                        "prio_accel",
+                    ],
                 );
                 self.f32_field(
                     &mut cols[0],
@@ -2810,9 +2840,16 @@ impl StudioApp {
             );
             self.combo_field(
                 ui,
-                &format!("{pointer}.trigger_socd"),
-                "LT+RT",
-                &["multiply", "last"],
+                &format!("{pointer}.speed_socd"),
+                "Speed SOCD",
+                &[
+                    "last",
+                    "first",
+                    "cancel",
+                    "multiply",
+                    "prio_decel",
+                    "prio_accel",
+                ],
             );
             self.f32_field(
                 ui,

@@ -9,8 +9,8 @@
 
 use crate::config::{
     GamepadAction, GamepadConfig, GamepadMode, GamepadNaviConfig, GamepadPointerAccelConfig,
-    GamepadPointerStick, GamepadPreset, GamepadTriggerPoint, NaviAction, PointerButton,
-    TriggerSocd, gamepad_axis_code, gamepad_button_code, parse_navi_action,
+    GamepadPointerStick, GamepadPreset, GamepadTriggerPoint, NaviAction, PointerButton, SpeedSocd,
+    gamepad_axis_code, gamepad_button_code, parse_navi_action,
 };
 use crate::wayland::WakeHandle;
 use anyhow::{Context, Result};
@@ -62,9 +62,16 @@ pub enum GamepadEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TriggerSide {
+enum SpeedSide {
     Left,
     Right,
+}
+
+fn selected_inputs(side: SpeedSide, lt: f32, rt: f32) -> (f32, f32) {
+    match side {
+        SpeedSide::Left => (lt, 0.0),
+        SpeedSide::Right => (0.0, rt),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,7 +108,7 @@ struct PointerRuntime {
     trigger_deadzone: f32,
     trigger_curve: f32,
     trigger_points: Vec<GamepadTriggerPoint>,
-    trigger_socd: TriggerSocd,
+    speed_socd: SpeedSocd,
     accel: AccelRuntime,
     scroll_accel: AccelRuntime,
 }
@@ -147,7 +154,7 @@ impl NaviRuntime {
                 trigger_deadzone: pointer.trigger_deadzone,
                 trigger_curve: pointer.trigger_curve,
                 trigger_points: pointer.trigger_points.clone(),
-                trigger_socd: pointer.trigger_socd,
+                speed_socd: pointer.speed_socd,
                 accel: AccelRuntime::from_config(&pointer.accel),
                 scroll_accel: AccelRuntime::from_config(&pointer.scroll_accel),
             },
@@ -784,7 +791,8 @@ struct NaviTracker {
     hat_y: i32,
     hat_active: [bool; 4],
     key_down: [bool; 4],
-    last_trigger: Option<TriggerSide>,
+    last_speed_side: Option<SpeedSide>,
+    first_speed_side: Option<SpeedSide>,
     last_tick: Instant,
     scroll_remainder: f32,
     pointer_accel: TriggerAccel,
@@ -809,7 +817,8 @@ impl NaviTracker {
             hat_y: 0,
             hat_active: [false; 4],
             key_down: [false; 4],
-            last_trigger: None,
+            last_speed_side: None,
+            first_speed_side: None,
             last_tick: Instant::now(),
             scroll_remainder: 0.0,
             pointer_accel,
@@ -829,7 +838,8 @@ impl NaviTracker {
         self.scroll_remainder = 0.0;
         self.pointer_accel.reset();
         self.scroll_accel.reset();
-        self.last_trigger = None;
+        self.last_speed_side = None;
+        self.first_speed_side = None;
     }
 
     fn update(&mut self, event: &InputEvent) -> Vec<GamepadEvent> {
@@ -895,11 +905,13 @@ impl NaviTracker {
             let deadzone = self.navi.pointer.trigger_deadzone;
             let previous = self.axes.get(&code).copied().unwrap_or(0.0);
             if normalized > deadzone && previous <= deadzone {
-                self.last_trigger = Some(if code == AbsoluteAxisCode::ABS_Z.0 {
-                    TriggerSide::Left
+                let side = if code == AbsoluteAxisCode::ABS_Z.0 {
+                    SpeedSide::Left
                 } else {
-                    TriggerSide::Right
-                });
+                    SpeedSide::Right
+                };
+                self.last_speed_side = Some(side);
+                self.first_speed_side.get_or_insert(side);
             }
             self.axes.insert(code, normalized);
         } else if code == AbsoluteAxisCode::ABS_X.0
@@ -1015,42 +1027,54 @@ impl NaviTracker {
         })
     }
 
-    fn socd_inputs(&mut self, lt: f32, rt: f32) -> (f32, f32) {
-        if self.navi.pointer.trigger_socd == TriggerSocd::Multiply {
-            return (lt, rt);
-        }
+    fn speed_socd_inputs(&mut self, lt: f32, rt: f32) -> (f32, f32) {
         let deadzone = self.navi.pointer.trigger_deadzone;
         let lt_active = lt > deadzone;
         let rt_active = rt > deadzone;
-        let selected = match (lt_active, rt_active) {
-            (false, false) => None,
-            (true, false) => Some(TriggerSide::Left),
-            (false, true) => Some(TriggerSide::Right),
-            (true, true) => self
-                .last_trigger
-                .filter(|side| match side {
-                    TriggerSide::Left => lt_active,
-                    TriggerSide::Right => rt_active,
-                })
-                .or(Some(if lt >= rt {
-                    TriggerSide::Left
-                } else {
-                    TriggerSide::Right
-                })),
+        if !lt_active && !rt_active {
+            self.last_speed_side = None;
+            self.first_speed_side = None;
+            return (0.0, 0.0);
+        }
+        if lt_active != rt_active {
+            let side = if lt_active {
+                SpeedSide::Left
+            } else {
+                SpeedSide::Right
+            };
+            self.last_speed_side = Some(side);
+            self.first_speed_side = Some(side);
+            return if lt_active { (lt, 0.0) } else { (0.0, rt) };
+        }
+
+        let active = |side: SpeedSide| match side {
+            SpeedSide::Left => lt_active,
+            SpeedSide::Right => rt_active,
         };
-        self.last_trigger = selected;
-        (
-            if selected == Some(TriggerSide::Left) {
-                lt
-            } else {
-                0.0
-            },
-            if selected == Some(TriggerSide::Right) {
-                rt
-            } else {
-                0.0
-            },
-        )
+        let fallback = if lt >= rt {
+            SpeedSide::Left
+        } else {
+            SpeedSide::Right
+        };
+        let last = self
+            .last_speed_side
+            .filter(|side| active(*side))
+            .unwrap_or(fallback);
+        let first = self
+            .first_speed_side
+            .filter(|side| active(*side))
+            .unwrap_or(last);
+        self.last_speed_side = Some(last);
+        self.first_speed_side = Some(first);
+
+        match self.navi.pointer.speed_socd {
+            SpeedSocd::Last => selected_inputs(last, lt, rt),
+            SpeedSocd::First => selected_inputs(first, lt, rt),
+            SpeedSocd::Cancel => (0.0, 0.0),
+            SpeedSocd::Multiply => (lt, rt),
+            SpeedSocd::PrioDecel => (lt, 0.0),
+            SpeedSocd::PrioAccel => (0.0, rt),
+        }
     }
 
     fn tick(&mut self) -> Vec<GamepadEvent> {
@@ -1080,7 +1104,7 @@ impl NaviTracker {
             .unwrap_or(0.0);
         let trigger_deadzone = self.navi.pointer.trigger_deadzone;
         let trigger_curve = self.navi.pointer.trigger_curve;
-        let (lt, rt) = self.socd_inputs(lt, rt);
+        let (lt, rt) = self.speed_socd_inputs(lt, rt);
         let pointer_multiplier =
             self.pointer_accel
                 .step(lt, rt, trigger_deadzone, trigger_curve, dt);
@@ -1687,9 +1711,9 @@ mod tests {
         )
     }
 
-    fn navi_tracker_with_socd(trigger_socd: TriggerSocd) -> NaviTracker {
+    fn navi_tracker_with_socd(speed_socd: SpeedSocd) -> NaviTracker {
         let mut config = GamepadConfig::default();
-        config.navi.pointer.trigger_socd = trigger_socd;
+        config.navi.pointer.speed_socd = speed_socd;
         NaviTracker::new(
             Arc::new(NaviRuntime::from_config(&config).unwrap()),
             HashMap::new(),
@@ -2166,20 +2190,37 @@ mod tests {
     }
 
     #[test]
-    fn trigger_socd_last_and_multiply() {
-        let mut multiply = navi_tracker_with_socd(TriggerSocd::Multiply);
-        assert_eq!(multiply.socd_inputs(0.8, 0.6), (0.8, 0.6));
+    fn speed_socd_modes_resolve_simultaneous_inputs() {
+        let mut multiply = navi_tracker_with_socd(SpeedSocd::Multiply);
+        assert_eq!(multiply.speed_socd_inputs(0.8, 0.6), (0.8, 0.6));
 
-        let mut last = navi_tracker_with_socd(TriggerSocd::Last);
+        let mut last = navi_tracker_with_socd(SpeedSocd::Last);
         last.update(&abs(AbsoluteAxisCode::ABS_Z, 255));
-        assert_eq!(last.socd_inputs(1.0, 0.7), (1.0, 0.0));
-
         last.update(&abs(AbsoluteAxisCode::ABS_RZ, 255));
-        assert_eq!(last.socd_inputs(1.0, 1.0), (0.0, 1.0));
+        assert_eq!(last.speed_socd_inputs(1.0, 1.0), (0.0, 1.0));
+
+        let mut first = navi_tracker_with_socd(SpeedSocd::First);
+        first.update(&abs(AbsoluteAxisCode::ABS_Z, 255));
+        first.update(&abs(AbsoluteAxisCode::ABS_RZ, 255));
+        assert_eq!(first.speed_socd_inputs(1.0, 1.0), (1.0, 0.0));
+        first.update(&abs(AbsoluteAxisCode::ABS_Z, 0));
+        assert_eq!(first.speed_socd_inputs(0.0, 1.0), (0.0, 1.0));
+
+        let mut cancel = navi_tracker_with_socd(SpeedSocd::Cancel);
+        assert_eq!(cancel.speed_socd_inputs(1.0, 1.0), (0.0, 0.0));
+        assert_eq!(cancel.speed_socd_inputs(1.0, 0.0), (1.0, 0.0));
+
+        let mut prio_decel = navi_tracker_with_socd(SpeedSocd::PrioDecel);
+        assert_eq!(prio_decel.speed_socd_inputs(1.0, 1.0), (1.0, 0.0));
+        assert_eq!(prio_decel.speed_socd_inputs(1.0, 0.0), (1.0, 0.0));
+
+        let mut prio_accel = navi_tracker_with_socd(SpeedSocd::PrioAccel);
+        assert_eq!(prio_accel.speed_socd_inputs(1.0, 1.0), (0.0, 1.0));
+        assert_eq!(prio_accel.speed_socd_inputs(0.0, 1.0), (0.0, 1.0));
 
         last.update(&abs(AbsoluteAxisCode::ABS_RZ, 0));
-        assert_eq!(last.socd_inputs(1.0, 0.0), (1.0, 0.0));
-        assert_eq!(last.socd_inputs(0.0, 0.0), (0.0, 0.0));
+        assert_eq!(last.speed_socd_inputs(1.0, 0.0), (1.0, 0.0));
+        assert_eq!(last.speed_socd_inputs(0.0, 0.0), (0.0, 0.0));
     }
 
     #[test]

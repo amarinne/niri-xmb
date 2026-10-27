@@ -1234,13 +1234,21 @@ pub struct GamepadTriggerPoint {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TriggerSocd {
-    /// LT and RT multiply, preserving the original behavior.
+#[serde(rename_all = "snake_case")]
+pub enum SpeedSocd {
+    /// The most recently pressed speed input wins.
+    Last,
+    /// The earliest still-held speed input wins.
+    First,
+    /// Both speed inputs cancel: holding both produces no speed change.
+    Cancel,
+    /// Both speed inputs multiply, preserving the original behavior.
     #[default]
     Multiply,
-    /// The most recently pressed trigger wins while both are held.
-    Last,
+    /// Deceleration (LT/brake) wins while both are held.
+    PrioDecel,
+    /// Acceleration (RT/gas) wins while both are held.
+    PrioAccel,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1269,8 +1277,11 @@ pub struct GamepadPointerConfig {
     /// Optional bounded piecewise-linear response points. Empty uses
     /// `trigger_curve` exactly as before.
     pub trigger_points: Vec<GamepadTriggerPoint>,
-    /// Simultaneous LT/RT resolution: `multiply` or `last`.
-    pub trigger_socd: TriggerSocd,
+    /// Simultaneous speed-control resolution: `last`, `first`, `cancel`,
+    /// `multiply`, `prio_decel`, or `prio_accel`. Only affects pointer/scroll
+    /// speed, not trigger bindings or layers.
+    #[serde(alias = "trigger_socd")]
+    pub speed_socd: SpeedSocd,
     pub accel: GamepadPointerAccelConfig,
     pub scroll_accel: GamepadPointerAccelConfig,
 }
@@ -1292,7 +1303,7 @@ impl Default for GamepadPointerConfig {
             trigger_deadzone: 0.08,
             trigger_curve: 1.35,
             trigger_points: Vec::new(),
-            trigger_socd: TriggerSocd::Multiply,
+            speed_socd: SpeedSocd::Multiply,
             accel: GamepadPointerAccelConfig::default(),
             scroll_accel: GamepadPointerAccelConfig {
                 decel_floor: 0.35,
@@ -2348,22 +2359,30 @@ mod tests {
     }
 
     #[test]
-    fn gamepad_trigger_socd_parses() {
-        let config = load_source(
-            r#"
-            [gamepad]
-            enabled = true
-            preset = "auto"
-            [gamepad.navi.pointer]
-            trigger_socd = "last"
-            "#,
-            None,
-        )
-        .unwrap();
-        assert_eq!(config.gamepad.navi.pointer.trigger_socd, TriggerSocd::Last);
+    fn gamepad_speed_socd_parses_all_modes() {
+        for (name, expected) in [
+            ("last", SpeedSocd::Last),
+            ("first", SpeedSocd::First),
+            ("cancel", SpeedSocd::Cancel),
+            ("multiply", SpeedSocd::Multiply),
+            ("prio_decel", SpeedSocd::PrioDecel),
+            ("prio_accel", SpeedSocd::PrioAccel),
+        ] {
+            let source = format!(
+                r#"
+                [gamepad]
+                enabled = true
+                preset = "auto"
+                [gamepad.navi.pointer]
+                speed_socd = "{name}"
+                "#
+            );
+            let config = load_source(&source, None).unwrap();
+            assert_eq!(config.gamepad.navi.pointer.speed_socd, expected);
+        }
         assert_eq!(
-            GamepadPointerConfig::default().trigger_socd,
-            TriggerSocd::Multiply
+            GamepadPointerConfig::default().speed_socd,
+            SpeedSocd::Multiply
         );
     }
 

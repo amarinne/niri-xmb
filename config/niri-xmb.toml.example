@@ -184,7 +184,7 @@ scroll_speed = 6.0
 trigger_threshold = 0.35  # layer hold_axes only
 trigger_deadzone = 0.08   # analog trigger speed curve
 trigger_curve = 1.35      # fallback when trigger_points is empty
-trigger_socd = "multiply" # "multiply" or "last" when LT+RT are both held
+speed_socd = "multiply" # last|first|cancel|multiply|prio_decel|prio_accel
 
 # Optional bounded response curve. Pull is absolute 0-1 trigger travel;
 # output is the shaped 0-1 result. Points must be ordered, at least 0.10

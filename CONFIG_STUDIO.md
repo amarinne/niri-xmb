@@ -44,9 +44,10 @@ entry appears as **niri-xmb Config**.
 - Trigger Lab contains the shared piecewise-linear response curve: add/drag/
   delete up to five points, edit exact pull/shape values, choose a preset or
   convert the legacy curve, and inspect the resulting LT/RT multiplier and
-  percent. The compact pedals use the same points and LT+RT policy; they are
-  simulation, not live controller input. `trigger_socd="multiply"` combines
-  both triggers; `"last"` lets the most recently pressed trigger win.
+  percent. The compact pedals use the same points and speed-SOCD policy; they are
+  simulation, not live controller input. `speed_socd` selects `last`,
+  `first`, `cancel`, `multiply`, `prio_decel`, or `prio_accel` for simultaneous
+  speed inputs. This does not alter trigger bindings or layer hold_axes.
 
 ## Save
 
