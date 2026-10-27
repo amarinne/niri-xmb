@@ -706,15 +706,13 @@ impl Template {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
     Controller,
-    Trigger,
     Popup,
     Keyboard,
 }
 
 impl Section {
-    const ALL: [(Section, &'static str); 4] = [
+    const ALL: [(Section, &'static str); 3] = [
         (Self::Controller, "Controller"),
-        (Self::Trigger, "Trigger Lab"),
         (Self::Popup, "Popup"),
         (Self::Keyboard, "Keyboard"),
     ];
@@ -722,7 +720,6 @@ impl Section {
     fn title(self) -> &'static str {
         match self {
             Self::Controller => "Controller",
-            Self::Trigger => "Trigger Lab",
             Self::Popup => "Popup",
             Self::Keyboard => "Keyboard",
         }
@@ -731,17 +728,10 @@ impl Section {
     fn hint(self) -> &'static str {
         match self {
             Self::Controller => "Device, pointer, bindings, layers",
-            Self::Trigger => "Response curve and speed tuning",
             Self::Popup => "Panel, behavior, peek, animation, theme, colors, bars",
             Self::Keyboard => "Niri keybinds and live input",
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum Confirm {
-    Save,
-    Restart,
 }
 
 #[derive(Clone, Default)]
@@ -770,6 +760,7 @@ struct LiveState {
 /// status is `Reconnecting`, and only a dead stream with no status at all
 /// is `Offline`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
 enum TelemetryState {
     Offline,
     Reconnecting,
@@ -782,6 +773,7 @@ enum TelemetryState {
 /// thread owns `stream_alive`, the daemon owns the device list, and frame
 /// age only separates recent input (`Live`) from a connected-but-quiet
 /// controller (`Idle`).
+#[allow(dead_code)]
 fn telemetry_state(
     status_seeded: bool,
     stream_alive: bool,
@@ -1019,17 +1011,15 @@ struct StudioApp {
     status: String,
     error: String,
     candidate: String,
-    confirm: Option<Confirm>,
-    sim_lt: f32,
-    sim_rt: f32,
-    sim_last_left: bool,
-    sim_first_left: bool,
-    sim_override_live: bool,
+    hot_save: bool,
     /// The live telemetry disclosure is user-controlled and must not change
     /// when pushed controller frames or window resizing cause a redraw.
     controller_telemetry_expanded: bool,
+    #[allow(dead_code)]
     display_pointer_multiplier: f32,
+    #[allow(dead_code)]
     display_scroll_multiplier: f32,
+    #[allow(dead_code)]
     display_multiplier_at: Instant,
     selected_point: Option<usize>,
     live: Arc<Mutex<LiveState>>,
@@ -1396,12 +1386,7 @@ impl StudioApp {
             status: String::new(),
             error: String::new(),
             candidate: String::new(),
-            confirm: None,
-            sim_lt: 0.0,
-            sim_rt: 0.0,
-            sim_last_left: true,
-            sim_first_left: true,
-            sim_override_live: false,
+            hot_save: false,
             // Keep the high-volume diagnostic readout out of the way until
             // the user explicitly opens it from the chevron header.
             controller_telemetry_expanded: false,
@@ -1483,15 +1468,8 @@ impl StudioApp {
     }
 
     fn revert(&mut self) {
-        self.model = self.loaded.clone();
-        self.history_undo.clear();
-        self.history_redo.clear();
-        self.history_cursor = self.model.clone();
-        self.error.clear();
-        self.candidate.clear();
-        self.status = "Reverted".to_string();
-        self.show_changes = false;
-        self.show_candidate = false;
+        self.undo();
+        self.status = "Reverted previous change".to_string();
     }
 
     fn dirty(&self) -> bool {
@@ -1590,8 +1568,14 @@ impl StudioApp {
     fn sync_history(&mut self) {
         if self.model != self.history_cursor {
             self.history_undo.push(self.history_cursor.clone());
+            if self.history_undo.len() > 50 {
+                self.history_undo.remove(0);
+            }
             self.history_cursor = self.model.clone();
             self.history_redo.clear();
+            if self.hot_save {
+                self.save(true);
+            }
         }
     }
 
@@ -1719,24 +1703,6 @@ impl StudioApp {
                 self.status = "Saved; restart failed".to_string();
             }
         }
-    }
-
-    fn request_save(&mut self, restart_after: bool) {
-        if let Some(error) = self.inline_error() {
-            self.error = error;
-            self.status = "Invalid".to_string();
-            return;
-        }
-        if let Some(error) = self.trigger_points_error() {
-            self.error = error;
-            self.status = "Invalid".to_string();
-            return;
-        }
-        self.confirm = Some(if restart_after {
-            Confirm::Restart
-        } else {
-            Confirm::Save
-        });
     }
 
     fn command_bar(&mut self, ctx: &egui::Context) {
@@ -1876,12 +1842,6 @@ impl StudioApp {
             .size(11.0)
             .color(TEXT),
         );
-        ui.label(
-            RichText::new(format!("sha {}", self.short_sha()))
-                .monospace()
-                .size(9.5)
-                .color(TEXT_DIM),
-        );
         if !self.status.is_empty() {
             ui.label(
                 RichText::new(&self.status)
@@ -1943,24 +1903,23 @@ impl StudioApp {
         {
             self.validate();
         }
-        if tt(
-            ui.add_enabled(dirty, egui::Button::new("⭳ Save")),
-            "ui.action.save",
-        )
-        .clicked()
-        {
-            self.request_save(false);
+        let hot_save_changed = ui
+            .checkbox(&mut self.hot_save, "Hot save")
+            .on_hover_text("Automatically save and restart after each valid edit")
+            .changed();
+        if hot_save_changed && self.hot_save && dirty {
+            self.save(true);
         }
         if tt(
-            ui.add_enabled(dirty, egui::Button::new("⟳ Save & Restart")),
+            ui.add_enabled(dirty, egui::Button::new("Save & Restart / Apply")),
             "ui.action.save_restart",
         )
         .clicked()
         {
-            self.request_save(true);
+            self.save(true);
         }
         if tt(
-            ui.add_enabled(self.dirty(), egui::Button::new("↩ Revert")),
+            ui.add_enabled(can_undo, egui::Button::new("↩ Revert")),
             "ui.action.revert",
         )
         .clicked()
@@ -2068,15 +2027,6 @@ impl StudioApp {
             });
     }
 
-    fn short_sha(&self) -> &str {
-        let sha = self.sha256.as_str();
-        if sha.is_empty() {
-            "-"
-        } else {
-            sha.get(..10).unwrap_or(sha)
-        }
-    }
-
     fn error_banner(&mut self, ui: &mut Ui) {
         if self.error.is_empty() {
             return;
@@ -2125,7 +2075,6 @@ impl StudioApp {
                         ui.set_width(ui.available_width());
                         match self.section {
                             Section::Controller => self.controller_section(ui),
-                            Section::Trigger => self.trigger_section(ui),
                             Section::Popup => self.popup_section(ui),
                             Section::Keyboard => self.keyboard_section(ui),
                         }
@@ -2290,14 +2239,10 @@ impl StudioApp {
             );
         }
         ui.add_space(6.0);
-        let age = live
-            .gamepad_at
-            .map(|at| format!("{} ms ago", at.elapsed().as_millis()))
-            .unwrap_or_else(|| "no frames yet".to_string());
         let rate = if live.gamepad_hz > 0.5 {
-            format!("{:.0} Hz · {age}", live.gamepad_hz)
+            format!("{:.0} Hz", live.gamepad_hz)
         } else {
-            age
+            "idle".to_string()
         };
         ui.horizontal_wrapped(|ui| {
             metric_chip(ui, "MAPPING", &view.preset);
@@ -2354,31 +2299,6 @@ impl StudioApp {
             ui.add_space(6.0);
             diagnostics_label(ui, "Axes & triggers");
             axes_list(ui, view);
-        }
-    }
-
-    fn trigger_section(&mut self, ui: &mut Ui) {
-        self.section_header(ui);
-        if ui.available_width() >= 900.0 {
-            ui.columns(2, |cols| {
-                section_card(&mut cols[0], "Response", |ui| self.trigger_response(ui));
-                section_card(&mut cols[1], "Tune", |ui| {
-                    self.pedal_simulation(ui);
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                    self.accel_fields(ui);
-                });
-            });
-        } else {
-            section_card(ui, "Response", |ui| self.trigger_response(ui));
-            section_card(ui, "Tune", |ui| {
-                self.pedal_simulation(ui);
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(6.0);
-                self.accel_fields(ui);
-            });
         }
     }
 
@@ -2454,6 +2374,13 @@ impl StudioApp {
             );
             ui.add_space(4.0);
             self.layers_ui(ui);
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
+            mini_heading(ui, "Trigger speed: brake / gas");
+            self.trigger_response(ui);
+            ui.add_space(8.0);
+            self.accel_fields(ui);
         } else {
             self.controller_map_body(ui, live);
             ui.separator();
@@ -2466,6 +2393,10 @@ impl StudioApp {
             ui.separator();
             mini_heading(ui, "Hold layers and chords");
             self.layers_ui(ui);
+            ui.separator();
+            mini_heading(ui, "Trigger speed: brake / gas");
+            self.trigger_response(ui);
+            self.accel_fields(ui);
         }
     }
 
@@ -3331,7 +3262,7 @@ impl StudioApp {
 
     fn trigger_response(&mut self, ui: &mut Ui) {
         ui.label(
-            RichText::new("LT brake · RT gas · 1.0× baseline")
+            RichText::new("LT brake (decel) · RT gas (accel) · 1.0× baseline")
                 .size(10.0)
                 .color(TEXT_DIM),
         );
@@ -3799,7 +3730,7 @@ impl StudioApp {
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(format!(
-                    "LT full brake {:.2}× ({:.0}% speed)",
+                    "LT decel {:.2}× ({:.0}% speed)",
                     decel_floor,
                     decel_floor * 100.0
                 ))
@@ -3809,7 +3740,7 @@ impl StudioApp {
             );
             ui.label(
                 RichText::new(format!(
-                    "RT full gas {:.2}× ({:.0}% speed)",
+                    "RT accel {:.2}× ({:.0}% speed)",
                     boost_cap,
                     boost_cap * 100.0
                 ))
@@ -3828,327 +3759,6 @@ impl StudioApp {
                 .color(TEXT_DIM),
             );
         });
-    }
-
-    fn pedal_simulation(&mut self, ui: &mut Ui) {
-        ui.ctx().request_repaint_after(Duration::from_millis(50));
-        let pointer = "gamepad.navi.pointer";
-        let live_state = self
-            .live
-            .lock()
-            .map(|live| live.clone())
-            .unwrap_or_default();
-        let live_view = GamepadLiveView::from_status(&live_state.status);
-        // Input recency comes from gamepad frames only: snapshots and other
-        // stream traffic must not mark controller input as live.
-        let gamepad_age_ms = live_state.gamepad_at.map(|at| at.elapsed().as_millis());
-        let telemetry = telemetry_state(
-            !live_state.status.is_null(),
-            live_state.stream_alive,
-            live_view.connected,
-            gamepad_age_ms,
-            !live_view.axes.is_empty() || !live_view.buttons.is_empty(),
-        );
-        let live_active = !self.sim_override_live && telemetry == TelemetryState::Live;
-        let deadzone = get_path(&self.model, &format!("{pointer}.trigger_deadzone"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.08) as f32;
-        let deadzone = deadzone.clamp(0.0, 0.9);
-        let curve = get_path(&self.model, &format!("{pointer}.trigger_curve"))
-            .and_then(Value::as_f64)
-            .unwrap_or(1.35) as f32;
-        let curve = curve.clamp(0.05, 5.0);
-        let pointer_floor = get_path(&self.model, &format!("{pointer}.accel.decel_floor"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.3) as f32;
-        let pointer_floor = pointer_floor.clamp(0.01, 1.0);
-        let pointer_cap = get_path(&self.model, &format!("{pointer}.accel.boost_cap"))
-            .and_then(Value::as_f64)
-            .unwrap_or(2.5) as f32;
-        let pointer_cap = pointer_cap.clamp(1.0, 10.0);
-        let pointer_enabled = get_path(&self.model, &format!("{pointer}.accel.enabled"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let scroll_floor = get_path(&self.model, &format!("{pointer}.scroll_accel.decel_floor"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.3) as f32;
-        let scroll_floor = scroll_floor.clamp(0.01, 1.0);
-        let scroll_cap = get_path(&self.model, &format!("{pointer}.scroll_accel.boost_cap"))
-            .and_then(Value::as_f64)
-            .unwrap_or(2.5) as f32;
-        let scroll_cap = scroll_cap.clamp(1.0, 10.0);
-        let scroll_enabled = get_path(&self.model, &format!("{pointer}.scroll_accel.enabled"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-
-        ui.horizontal_wrapped(|ui| {
-            let device = if live_view.device_name.is_empty() {
-                "controller"
-            } else {
-                live_view.device_name.as_str()
-            };
-            let (status, color) = match telemetry {
-                TelemetryState::Live => (
-                    format!("● LIVE · {device} · {} ms ago", gamepad_age_ms.unwrap_or(0)),
-                    OK,
-                ),
-                TelemetryState::Idle => (
-                    format!("○ IDLE · {device} · connected, waiting for input"),
-                    TEXT_DIM,
-                ),
-                TelemetryState::Reconnecting => (
-                    format!(
-                        "○ RECONNECTING · stream lost (attempt {})",
-                        live_state.reconnects
-                    ),
-                    WARN,
-                ),
-                TelemetryState::Offline => ("○ OFFLINE · daemon unreachable".to_string(), ERROR),
-                TelemetryState::NoController => {
-                    ("○ NO CONTROLLER · simulated input".to_string(), TEXT_DIM)
-                }
-            };
-            ui.label(RichText::new(status).size(10.0).color(color));
-            ui.checkbox(&mut self.sim_override_live, "Use simulated input");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.small_button("Reset").clicked() {
-                    self.sim_lt = 0.0;
-                    self.sim_rt = 0.0;
-                    self.sim_last_left = true;
-                    self.sim_first_left = true;
-                }
-            });
-        });
-        ui.add_space(4.0);
-        let (mut lt_input, mut rt_input) = if live_active {
-            (
-                live_view.trigger("ABS_Z", "BTN_TL2"),
-                live_view.trigger("ABS_RZ", "BTN_TR2"),
-            )
-        } else {
-            (self.sim_lt, self.sim_rt)
-        };
-        let points_for_display = self.trigger_points();
-        let before_lt = self.sim_lt;
-        let before_rt = self.sim_rt;
-        if live_active {
-            ui.columns(2, |cols| {
-                live_pedal_meter(
-                    &mut cols[0],
-                    "LT brake",
-                    lt_input,
-                    deadzone,
-                    curve,
-                    &points_for_display,
-                    WARN,
-                );
-                live_pedal_meter(
-                    &mut cols[1],
-                    "RT gas",
-                    rt_input,
-                    deadzone,
-                    curve,
-                    &points_for_display,
-                    OK,
-                );
-            });
-        } else {
-            ui.columns(2, |cols| {
-                pedal_control(
-                    &mut cols[0],
-                    "LT brake (decel)",
-                    &mut self.sim_lt,
-                    WARN,
-                    deadzone,
-                );
-                pedal_control(
-                    &mut cols[1],
-                    "RT gas (accel)",
-                    &mut self.sim_rt,
-                    OK,
-                    deadzone,
-                );
-            });
-            lt_input = self.sim_lt;
-            rt_input = self.sim_rt;
-        }
-        if (self.sim_lt - before_lt).abs() > 1e-6 {
-            self.sim_last_left = true;
-        }
-        if (self.sim_rt - before_rt).abs() > 1e-6 {
-            self.sim_last_left = false;
-        }
-        let before_lt_active = before_lt > deadzone;
-        let before_rt_active = before_rt > deadzone;
-        let lt_active = lt_input > deadzone;
-        let rt_active = rt_input > deadzone;
-        if !before_lt_active && lt_active && !before_rt_active {
-            self.sim_first_left = true;
-        }
-        if !before_rt_active && rt_active && !before_lt_active {
-            self.sim_first_left = false;
-        }
-        if lt_active && !rt_active {
-            self.sim_first_left = true;
-        } else if !lt_active && rt_active {
-            self.sim_first_left = false;
-        } else if !lt_active && !rt_active {
-            self.sim_first_left = true;
-        }
-        let socd = get_path(&self.model, "gamepad.navi.pointer.speed_socd")
-            .and_then(Value::as_str)
-            .unwrap_or("multiply");
-        let pick = |prefer_left: bool| match (lt_active, rt_active) {
-            (true, true) => Some(prefer_left),
-            (true, false) => Some(true),
-            (false, true) => Some(false),
-            (false, false) => None,
-        };
-        let side_inputs = |left: Option<bool>| match left {
-            Some(true) => (lt_input, 0.0),
-            Some(false) => (0.0, rt_input),
-            None => (0.0, 0.0),
-        };
-        let (effective_lt, effective_rt) = match socd {
-            "last" => side_inputs(pick(self.sim_last_left)),
-            "first" => side_inputs(pick(self.sim_first_left)),
-            "cancel" if lt_active && rt_active => (0.0, 0.0),
-            "prio_decel" if lt_active => (lt_input, 0.0),
-            "prio_accel" if rt_active => (0.0, rt_input),
-            _ => (lt_input, rt_input),
-        };
-        let points = self.trigger_points();
-        let lt_shape = trigger_shape(effective_lt, deadzone, curve, &points);
-        let rt_shape = trigger_shape(effective_rt, deadzone, curve, &points);
-        let pointer_multiplier = if pointer_enabled {
-            trigger_multiplier(
-                pointer_floor,
-                pointer_cap,
-                effective_lt,
-                effective_rt,
-                deadzone,
-                curve,
-                &points,
-            )
-        } else {
-            1.0
-        };
-        let scroll_multiplier = if scroll_enabled {
-            trigger_multiplier(
-                scroll_floor,
-                scroll_cap,
-                effective_lt,
-                effective_rt,
-                deadzone,
-                curve,
-                &points,
-            )
-        } else {
-            1.0
-        };
-        let now = Instant::now();
-        let dt = now
-            .duration_since(self.display_multiplier_at)
-            .as_secs_f32()
-            .min(0.25);
-        self.display_multiplier_at = now;
-        self.display_pointer_multiplier = smooth_display_multiplier(
-            self.display_pointer_multiplier,
-            pointer_multiplier,
-            get_path(&self.model, &format!("{pointer}.accel.smoothing_ms"))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0) as f32,
-            dt,
-        );
-        self.display_scroll_multiplier = smooth_display_multiplier(
-            self.display_scroll_multiplier,
-            scroll_multiplier,
-            get_path(&self.model, &format!("{pointer}.scroll_accel.smoothing_ms"))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0) as f32,
-            dt,
-        );
-        let (pointer_stick, scroll_stick) = (
-            live_view.stick(
-                get_path(&self.model, &format!("{pointer}.stick"))
-                    .and_then(Value::as_str)
-                    .map(|stick| stick == "left")
-                    .unwrap_or(true),
-            ),
-            live_view.stick(
-                get_path(&self.model, &format!("{pointer}.scroll_stick"))
-                    .and_then(Value::as_str)
-                    .map(|stick| stick == "left")
-                    .unwrap_or(false),
-            ),
-        );
-        let stick_deadzone = get_path(&self.model, &format!("{pointer}.deadzone"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.15) as f32;
-        let stick_curve = get_path(&self.model, &format!("{pointer}.curve"))
-            .and_then(Value::as_f64)
-            .unwrap_or(1.0) as f32;
-        live_stick_summary(
-            ui,
-            "Pointer stick",
-            pointer_stick,
-            stick_deadzone,
-            stick_curve,
-            get_path(&self.model, &format!("{pointer}.speed"))
-                .and_then(Value::as_f64)
-                .unwrap_or(900.0) as f32,
-            "px/s",
-            self.display_pointer_multiplier,
-            false,
-            live_active,
-        );
-        live_stick_summary(
-            ui,
-            "Scroll stick",
-            scroll_stick,
-            get_path(&self.model, &format!("{pointer}.scroll_deadzone"))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.2) as f32,
-            1.0,
-            get_path(&self.model, &format!("{pointer}.scroll_speed"))
-                .and_then(Value::as_f64)
-                .unwrap_or(12.0) as f32,
-            "steps/s",
-            self.display_scroll_multiplier,
-            true,
-            live_active,
-        );
-        ui.label(
-            RichText::new(format!(
-                "Target vs actual speed · {socd} · smoothing included"
-            ))
-            .size(9.5)
-            .color(TEXT_DIM),
-        );
-        multiplier_pair_row(
-            ui,
-            "Pointer",
-            pointer_multiplier,
-            self.display_pointer_multiplier,
-            pointer_enabled,
-        );
-        multiplier_pair_row(
-            ui,
-            "Scroll",
-            scroll_multiplier,
-            self.display_scroll_multiplier,
-            scroll_enabled,
-        );
-        ui.label(
-            RichText::new(format!(
-                "After deadzone/curve: LT {:.0}% · RT {:.0}%",
-                lt_shape * 100.0,
-                rt_shape * 100.0
-            ))
-            .monospace()
-            .size(9.5)
-            .color(TEXT_DIM),
-        );
     }
 
     fn accel_settings_group(&mut self, ui: &mut Ui, base: &str, title: &str) {
@@ -5938,44 +5548,6 @@ impl StudioApp {
             painter.circle_filled(Pos2::new(rect.max.x - 18.0, rect.center().y), 3.0, accent);
         }
     }
-
-    fn confirm_modal(&mut self, ctx: &egui::Context) {
-        let Some(confirm) = self.confirm else {
-            return;
-        };
-        let mut action = None;
-        egui::Window::new("Confirm")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label(if matches!(confirm, Confirm::Restart) {
-                    "Save and restart niri-xmb?"
-                } else {
-                    "Save this TOML?"
-                });
-                ui.monospace(&self.config_path);
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        action = Some(None);
-                    }
-                    let label = if matches!(confirm, Confirm::Restart) {
-                        "Save & Restart"
-                    } else {
-                        "Save"
-                    };
-                    if ui.button(label).clicked() {
-                        action = Some(Some(matches!(confirm, Confirm::Restart)));
-                    }
-                });
-            });
-        if let Some(restart) = action {
-            self.confirm = None;
-            if let Some(restart) = restart {
-                self.save(restart);
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6871,7 +6443,7 @@ impl eframe::App for StudioApp {
         } else if undo {
             self.undo();
         } else if save && self.dirty() {
-            self.request_save(false);
+            self.save(true);
         }
         self.refresh_validation();
         self.ensure_textures(ctx);
@@ -6885,7 +6457,6 @@ impl eframe::App for StudioApp {
         self.pinned_preview_panel(ctx);
         self.content(ctx);
         self.sync_history();
-        self.confirm_modal(ctx);
         // Live frames wake egui from the stream thread as they arrive.
         // This slow tick only ages the "last frame" readout and covers the
         // popup/keyboard views, which have no pushed feed of their own.
@@ -7361,6 +6932,7 @@ fn paint_handle(painter: &egui::Painter, center: Pos2, color: Color32, active: b
     );
 }
 
+#[allow(dead_code)]
 fn multiplier_pair_row(ui: &mut Ui, label: &str, target: f32, actual: f32, enabled: bool) {
     ui.horizontal(|ui| {
         ui.label(
@@ -7382,6 +6954,7 @@ fn multiplier_pair_row(ui: &mut Ui, label: &str, target: f32, actual: f32, enabl
     });
 }
 
+#[allow(dead_code)]
 fn smooth_display_multiplier(previous: f32, target: f32, smoothing_ms: f32, dt: f32) -> f32 {
     if smoothing_ms <= 0.0 || dt <= 0.0 {
         target
@@ -7392,6 +6965,7 @@ fn smooth_display_multiplier(previous: f32, target: f32, smoothing_ms: f32, dt: 
     }
 }
 
+#[allow(dead_code)]
 fn live_pedal_meter(
     ui: &mut Ui,
     label: &str,
@@ -7441,7 +7015,7 @@ fn live_pedal_meter(
     });
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 fn live_stick_summary(
     ui: &mut Ui,
     label: &str,
@@ -7536,90 +7110,6 @@ fn live_stick_summary(
             );
         });
     });
-}
-
-fn pedal_control(ui: &mut Ui, label: &str, value: &mut f32, color: Color32, deadzone: f32) {
-    let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 136.0), Sense::click_and_drag());
-    let top = rect.min.y + 26.0;
-    let bottom = rect.max.y - 20.0;
-    if (response.clicked() || response.dragged())
-        && let Some(position) = response.interact_pointer_pos()
-    {
-        *value = ((bottom - position.y) / (bottom - top).max(1.0)).clamp(0.0, 1.0);
-    }
-    let painter = ui.painter().clone();
-    painter.text(
-        Pos2::new(rect.min.x, rect.min.y + 2.0),
-        Align2::LEFT_TOP,
-        label,
-        FontId::proportional(11.0),
-        TEXT,
-    );
-    let center = rect.center().x;
-    let track = Rect::from_min_max(
-        Pos2::new(center - 21.0, top),
-        Pos2::new(center + 21.0, bottom),
-    );
-    painter.rect_filled(track, 6.0, FIELD_BG);
-    painter.rect_stroke(track, 6.0, Stroke::new(1.0_f32, BORDER), StrokeKind::Inside);
-    let travel = bottom - top;
-    let fill_top = bottom - travel * *value;
-    if *value > 0.0 {
-        let fill = Rect::from_min_max(
-            Pos2::new(track.min.x + 3.0, fill_top),
-            Pos2::new(track.max.x - 3.0, bottom - 3.0),
-        );
-        painter.rect_filled(
-            fill,
-            4.0,
-            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 180),
-        );
-    }
-    for step in 0..=4 {
-        let y = bottom - travel * step as f32 / 4.0;
-        painter.line_segment(
-            [
-                Pos2::new(track.max.x - 6.0, y),
-                Pos2::new(track.max.x - 2.0, y),
-            ],
-            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 45)),
-        );
-    }
-    let deadzone_y = bottom - travel * deadzone.clamp(0.0, 1.0);
-    painter.line_segment(
-        [
-            Pos2::new(track.min.x - 7.0, deadzone_y),
-            Pos2::new(track.max.x + 7.0, deadzone_y),
-        ],
-        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 70)),
-    );
-    painter.text(
-        Pos2::new(track.max.x + 9.0, deadzone_y),
-        Align2::LEFT_CENTER,
-        "dz",
-        FontId::monospace(8.0),
-        TEXT_DIM,
-    );
-    let plate = Rect::from_center_size(Pos2::new(center, fill_top), Vec2::new(62.0, 10.0));
-    painter.rect_filled(plate, 3.0, color);
-    painter.rect_stroke(
-        plate,
-        3.0,
-        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 120)),
-        StrokeKind::Inside,
-    );
-    painter.circle_filled(Pos2::new(center, bottom + 5.0), 3.0, TEXT_DIM);
-    painter.text(
-        Pos2::new(center, rect.max.y - 2.0),
-        Align2::CENTER_BOTTOM,
-        format!("{:.0}%", *value * 100.0),
-        FontId::monospace(10.0),
-        TEXT_MUTED,
-    );
-    if response.hovered() {
-        response.on_hover_cursor(egui::CursorIcon::ResizeVertical);
-    }
 }
 
 fn nav_item(ui: &mut Ui, selected: bool, label: &str) -> egui::Response {
@@ -7879,6 +7369,7 @@ fn trigger_shape(value: f32, deadzone: f32, curve: f32, points: &[CurvePoint]) -
     previous_output + (1.0 - previous_output) * ((value - previous_pull) / span).clamp(0.0, 1.0)
 }
 
+#[allow(dead_code)]
 fn trigger_multiplier(
     decel_floor: f32,
     boost_cap: f32,
