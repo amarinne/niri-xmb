@@ -1684,8 +1684,7 @@ impl StudioApp {
 
     fn controller_section(&mut self, ui: &mut Ui) {
         self.section_header(ui);
-        self.gamepad_diagnostics_card(ui);
-        self.controller_map_card(ui);
+        self.controller_unified_card(ui);
         if ui.available_width() >= 900.0 {
             ui.columns(2, |cols| {
                 section_card(&mut cols[0], "Device", |ui| self.device_fields(ui));
@@ -1698,134 +1697,145 @@ impl StudioApp {
         section_card(ui, "Layers", |ui| self.layers_ui(ui));
     }
 
-    /// Tester-style live readout: device identity, every button value,
-    /// both stick reticles with raw axis numbers, and the stream rate.
-    /// Fed by pushed gamepad frames; renders identically at any width by
-    /// wrapping button cells and stacking the stick row when narrow.
-    fn gamepad_diagnostics_card(&self, ui: &mut Ui) {
+    /// One controller surface: the live tester and binding editor share one
+    /// visual hierarchy, so the device identity, telemetry, and mapping are
+    /// read as one screen instead of two stacked tools.
+    fn controller_unified_card(&mut self, ui: &mut Ui) {
         let live = self
             .live
             .lock()
             .map(|live| live.clone())
             .unwrap_or_default();
         let view = GamepadLiveView::from_status(&live.status);
-        let is_connected = view.connected > 0;
         card(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(if view.device_name.is_empty() {
-                        "No controller"
-                    } else {
-                        &view.device_name
-                    })
-                    .size(17.0)
-                    .strong(),
-                );
-                let dot = if is_connected { OK } else { WARN };
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                ui.painter().circle_filled(rect.center(), 3.0, dot);
-                ui.label(
-                    RichText::new(if is_connected {
-                        "connected"
-                    } else {
-                        "not detected"
-                    })
-                    .size(10.0)
-                    .color(dot),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let Some(error) = live.status["error"].as_str() {
-                        ui.label(RichText::new(error).size(9.5).color(ERROR));
-                    } else if !live.error.is_empty() {
-                        ui.label(RichText::new(&live.error).size(9.5).color(ERROR));
-                    }
-                });
+            self.gamepad_diagnostics_body(ui, &live, &view);
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+            self.controller_mapping_body(ui, &view);
+        });
+    }
+
+    /// Tester-style live readout: device identity, every button value,
+    /// both stick reticles with raw axis numbers, and the stream rate.
+    /// Fed by pushed gamepad frames; renders identically at any width by
+    /// wrapping button cells and stacking the stick row when narrow.
+    fn gamepad_diagnostics_body(&self, ui: &mut Ui, live: &LiveState, view: &GamepadLiveView) {
+        let is_connected = view.connected > 0;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(if view.device_name.is_empty() {
+                    "No controller"
+                } else {
+                    &view.device_name
+                })
+                .size(17.0)
+                .strong(),
+            );
+            let dot = if is_connected { OK } else { WARN };
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+            ui.painter().circle_filled(rect.center(), 3.0, dot);
+            ui.label(
+                RichText::new(if is_connected {
+                    "connected"
+                } else {
+                    "not detected"
+                })
+                .size(10.0)
+                .color(dot),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if let Some(error) = live.status["error"].as_str() {
+                    ui.label(RichText::new(error).size(9.5).color(ERROR));
+                } else if !live.error.is_empty() {
+                    ui.label(RichText::new(&live.error).size(9.5).color(ERROR));
+                }
             });
-            if is_connected && (view.vendor != 0 || view.product != 0) {
-                ui.label(
-                    RichText::new(format!(
-                        "Vendor: {:04x}  Product: {:04x}  ·  {}",
-                        view.vendor, view.product, view.device_path
-                    ))
+        });
+        if is_connected && (view.vendor != 0 || view.product != 0) {
+            ui.label(
+                RichText::new(format!(
+                    "Vendor: {:04x}  Product: {:04x}  ·  {}",
+                    view.vendor, view.product, view.device_path
+                ))
+                .monospace()
+                .size(9.5)
+                .color(TEXT_DIM),
+            );
+        } else if is_connected && !view.device_path.is_empty() {
+            ui.label(
+                RichText::new(&view.device_path)
                     .monospace()
                     .size(9.5)
                     .color(TEXT_DIM),
-                );
-            } else if is_connected && !view.device_path.is_empty() {
-                ui.label(
-                    RichText::new(&view.device_path)
-                        .monospace()
-                        .size(9.5)
-                        .color(TEXT_DIM),
-                );
-            }
+            );
+        }
+        ui.add_space(6.0);
+        let age = live
+            .gamepad_at
+            .map(|at| format!("{} ms ago", at.elapsed().as_millis()))
+            .unwrap_or_else(|| "no frames yet".to_string());
+        let rate = if live.gamepad_hz > 0.5 {
+            format!("{:.0} Hz · {age}", live.gamepad_hz)
+        } else {
+            age
+        };
+        ui.horizontal_wrapped(|ui| {
+            metric_chip(ui, "MAPPING", &view.preset);
+            metric_chip(ui, "MODE", self.gamepad_mode_name());
+            metric_chip(ui, "DEVICES", view.connected);
+            metric_chip(ui, "STREAM", rate);
+            metric_chip(ui, "FRAMES", live.gamepad_frames);
+        });
+        if !is_connected {
             ui.add_space(6.0);
-            let age = live
-                .gamepad_at
-                .map(|at| format!("{} ms ago", at.elapsed().as_millis()))
-                .unwrap_or_else(|| "no frames yet".to_string());
-            let rate = if live.gamepad_hz > 0.5 {
-                format!("{:.0} Hz · {age}", live.gamepad_hz)
-            } else {
-                age
-            };
-            ui.horizontal_wrapped(|ui| {
-                metric_chip(ui, "MAPPING", &view.preset);
-                metric_chip(ui, "MODE", self.gamepad_mode_name());
-                metric_chip(ui, "DEVICES", view.connected);
-                metric_chip(ui, "STREAM", rate);
-                metric_chip(ui, "FRAMES", live.gamepad_frames);
-            });
-            if !is_connected {
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new("Connect a controller to see live buttons, sticks and triggers.")
-                        .size(11.0)
-                        .color(TEXT_MUTED),
-                );
-                return;
-            }
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(6.0);
-            diagnostics_label(ui, "Buttons");
-            ui.horizontal_wrapped(|ui| {
-                for (code, friendly) in BUTTONS {
-                    // D-pad may arrive as hat axes rather than BTN_DPAD_*.
-                    let pressed = match *code {
-                        "BTN_DPAD_UP" => view.dpad("up"),
-                        "BTN_DPAD_DOWN" => view.dpad("down"),
-                        "BTN_DPAD_LEFT" => view.dpad("left"),
-                        "BTN_DPAD_RIGHT" => view.dpad("right"),
-                        _ => view.button(code),
-                    };
-                    let short = friendly.split(" / ").next().unwrap_or(friendly);
-                    button_cell(ui, short, pressed);
-                }
-            });
-            ui.add_space(8.0);
-            let (lx, ly) = view.stick(true);
-            let (rx, ry) = view.stick(false);
-            if ui.available_width() >= 680.0 {
-                ui.horizontal_top(|ui| {
-                    stick_reticle(ui, "L STICK", "AXIS 0", lx, "AXIS 1", ly);
-                    ui.add_space(18.0);
-                    stick_reticle(ui, "R STICK", "AXIS 2", rx, "AXIS 3", ry);
-                    ui.add_space(18.0);
-                    ui.vertical(|ui| {
-                        diagnostics_label(ui, "Axes & triggers");
-                        axes_list(ui, &view);
-                    });
-                });
-            } else {
-                stick_reticle(ui, "L STICK", "AXIS 0", lx, "AXIS 1", ly);
-                ui.add_space(6.0);
-                stick_reticle(ui, "R STICK", "AXIS 2", rx, "AXIS 3", ry);
-                ui.add_space(6.0);
-                diagnostics_label(ui, "Axes & triggers");
-                axes_list(ui, &view);
+            ui.label(
+                RichText::new("Connect a controller to see live buttons, sticks and triggers.")
+                    .size(11.0)
+                    .color(TEXT_MUTED),
+            );
+            return;
+        }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        diagnostics_label(ui, "Buttons");
+        ui.horizontal_wrapped(|ui| {
+            for (code, friendly) in BUTTONS {
+                // D-pad may arrive as hat axes rather than BTN_DPAD_*.
+                let pressed = match *code {
+                    "BTN_DPAD_UP" => view.dpad("up"),
+                    "BTN_DPAD_DOWN" => view.dpad("down"),
+                    "BTN_DPAD_LEFT" => view.dpad("left"),
+                    "BTN_DPAD_RIGHT" => view.dpad("right"),
+                    _ => view.button(code),
+                };
+                let short = friendly.split(" / ").next().unwrap_or(friendly);
+                button_cell(ui, short, pressed);
             }
         });
+        ui.add_space(8.0);
+        let (lx, ly) = view.stick(true);
+        let (rx, ry) = view.stick(false);
+        if ui.available_width() >= 680.0 {
+            ui.horizontal_top(|ui| {
+                stick_reticle(ui, "L STICK", "AXIS 0", lx, "AXIS 1", ly);
+                ui.add_space(18.0);
+                stick_reticle(ui, "R STICK", "AXIS 2", rx, "AXIS 3", ry);
+                ui.add_space(18.0);
+                ui.vertical(|ui| {
+                    diagnostics_label(ui, "Axes & triggers");
+                    axes_list(ui, view);
+                });
+            });
+        } else {
+            stick_reticle(ui, "L STICK", "AXIS 0", lx, "AXIS 1", ly);
+            ui.add_space(6.0);
+            stick_reticle(ui, "R STICK", "AXIS 2", rx, "AXIS 3", ry);
+            ui.add_space(6.0);
+            diagnostics_label(ui, "Axes & triggers");
+            axes_list(ui, view);
+        }
     }
 
     fn trigger_section(&mut self, ui: &mut Ui) {
@@ -1853,119 +1863,67 @@ impl StudioApp {
         }
     }
 
-    fn controller_map_card(&mut self, ui: &mut Ui) {
-        let live = self
-            .live
-            .lock()
-            .map(|live| GamepadLiveView::from_status(&live.status))
-            .unwrap_or_default();
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Controller map").size(12.0).strong());
-                ui.add_space(6.0);
-                for template in [Template::Xbox, Template::Ds4] {
-                    if ui
-                        .selectable_label(self.template == template, template.label())
-                        .clicked()
-                    {
-                        self.switch_template(template);
-                    }
+    fn controller_mapping_body(&mut self, ui: &mut Ui, live: &GamepadLiveView) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Mapping").size(12.0).strong());
+            ui.add_space(6.0);
+            for template in [Template::Xbox, Template::Ds4] {
+                if ui
+                    .selectable_label(self.template == template, template.label())
+                    .clicked()
+                {
+                    self.switch_template(template);
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} connected · {}",
-                            self.connected_count(),
-                            self.gamepad_mode_name()
-                        ))
-                        .monospace()
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{} connected · {}",
+                        self.connected_count(),
+                        self.gamepad_mode_name()
+                    ))
+                    .monospace()
+                    .size(9.5)
+                    .color(TEXT_DIM),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new("live presses highlight · bindings follow selection")
                         .size(9.5)
                         .color(TEXT_DIM),
-                    );
-                    ui.add_space(10.0);
-                    ui.label(
-                        RichText::new("live presses highlight · bindings follow selection")
-                            .size(9.5)
-                            .color(TEXT_DIM),
-                    );
+                );
+            });
+        });
+        ui.add_space(5.0);
+        ui.add_space(2.0);
+        let width = ui.available_width();
+        if width >= 900.0 {
+            let map_width = (width * 0.46).clamp(400.0, 560.0);
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(map_width);
+                    self.controller_map_body(ui, live);
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    self.inspector_body(ui);
+                });
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    self.merged_bindings(ui);
                 });
             });
-            ui.add_space(5.0);
-            self.controller_live_summary(ui, &live);
-            ui.add_space(6.0);
-            let mut hotspot = None;
-            let mut row = None;
-            let width = ui.available_width();
-            if width >= 900.0 {
-                let map_width = (width * 0.46).clamp(400.0, 560.0);
-                ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(map_width);
-                        hotspot = self.controller_map_body(ui, &live);
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-                        self.inspector_body(ui);
-                    });
-                    ui.add_space(12.0);
-                    ui.vertical(|ui| {
-                        ui.set_width(ui.available_width());
-                        row = self.merged_bindings(ui);
-                    });
-                });
-            } else {
-                hotspot = self.controller_map_body(ui, &live);
-                ui.separator();
-                self.inspector_body(ui);
-                ui.separator();
-                self.merged_bindings(ui);
-            }
-            if let (Some(from), Some(to)) = (hotspot, row) {
-                paint_binding_link(ui, from, to);
-            }
-        });
+        } else {
+            self.controller_map_body(ui, live);
+            ui.separator();
+            self.inspector_body(ui);
+            ui.separator();
+            self.merged_bindings(ui);
+        }
     }
 
-    fn controller_live_summary(&self, ui: &mut Ui, live: &GamepadLiveView) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Live input")
-                    .size(10.0)
-                    .strong()
-                    .color(TEXT_MUTED),
-            );
-            for (label, axis, button) in [("LT", "ABS_Z", "BTN_TL2"), ("RT", "ABS_RZ", "BTN_TR2")] {
-                ui.label(RichText::new(label).monospace().size(9.0).color(TEXT_DIM));
-                let value = live.trigger(axis, button);
-                let width = (ui.available_width() * 0.28).clamp(58.0, 150.0);
-                let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 5.0), Sense::hover());
-                ui.painter().rect_filled(bar, 2.5, FIELD_BG);
-                ui.painter().rect_filled(
-                    Rect::from_min_size(
-                        bar.min,
-                        Vec2::new(bar.width() * value.clamp(0.0, 1.0), bar.height()),
-                    ),
-                    2.5,
-                    if value > 0.05 { ACCENT } else { BORDER },
-                );
-                ui.label(
-                    RichText::new(format!("{:>3.0}%", value * 100.0))
-                        .monospace()
-                        .size(9.0)
-                        .color(TEXT_DIM),
-                );
-            }
-            if self.connected_count() == 0 {
-                ui.label(
-                    RichText::new("connect a controller to see presses")
-                        .size(9.0)
-                        .color(TEXT_DIM),
-                );
-            }
-        });
-    }
-
-    fn controller_map_body(&mut self, ui: &mut Ui, live: &GamepadLiveView) -> Option<Rect> {
+    fn controller_map_body(&mut self, ui: &mut Ui, live: &GamepadLiveView) {
         let template = self.template;
         let width = ui.available_width().min(560.0);
         let height = (width * 0.56).clamp(210.0, 330.0);
@@ -1999,7 +1957,6 @@ impl StudioApp {
             );
         }
         let label_size = (rect.width() * 0.016).clamp(7.0, 10.0);
-        let mut selected_rect = None;
         for hotspot in template.hotspots() {
             let center = Pos2::new(
                 rect.min.x + hotspot.x * rect.width(),
@@ -2023,7 +1980,6 @@ impl StudioApp {
                 Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(116, 162, 255, 110))
             };
             if selected {
-                selected_rect = Some(hit);
                 ui.painter().rect_filled(
                     hit,
                     7.0,
@@ -2079,7 +2035,6 @@ impl StudioApp {
                 self.selected = hotspot.control;
             }
         }
-        selected_rect
     }
 
     fn hotspot_pressed(&self, hotspot: &Hotspot, live: &GamepadLiveView) -> bool {
@@ -6496,33 +6451,6 @@ fn button_menu(ui: &mut Ui, title: &str, used: &[String]) -> Option<&'static str
     })
     .inner
     .flatten()
-}
-
-/// Soft curve from the selected control on the controller image to its row in
-/// the binding lists, with a dot at each end.
-fn paint_binding_link(ui: &Ui, from: Rect, to: Rect) {
-    let clip = ui.clip_rect();
-    if !clip.contains(from.center()) || !clip.contains(to.center()) || to.left() <= from.right() {
-        return;
-    }
-    let start = Pos2::new(from.right() + 4.0, from.center().y);
-    let end = Pos2::new(to.left() - 6.0, to.center().y);
-    let reach = ((end.x - start.x) * 0.45).clamp(20.0, 90.0);
-    let color = Color32::from_rgba_unmultiplied(116, 162, 255, 150);
-    let painter = ui.painter();
-    painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
-        [
-            start,
-            Pos2::new(start.x + reach, start.y),
-            Pos2::new(end.x - reach, end.y),
-            end,
-        ],
-        false,
-        Color32::TRANSPARENT,
-        Stroke::new(1.5_f32, color),
-    ));
-    painter.circle_filled(start, 2.5, color);
-    painter.circle_filled(end, 3.0, color);
 }
 
 fn mini_heading(ui: &mut Ui, text: &str) {
