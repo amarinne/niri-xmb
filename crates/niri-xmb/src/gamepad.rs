@@ -665,7 +665,7 @@ fn record_controller(_path: &Path, device: &Device, preset: GamepadPreset) {
             preset,
         });
     }
-    profiles.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    profiles.sort_by_key(|profile| std::cmp::Reverse(profile.last_seen));
     let Ok(bytes) = serde_json::to_vec_pretty(&profiles) else {
         return;
     };

@@ -78,6 +78,23 @@ entry appears as **niri-xmb Config**.
 - Below 700 px the rail becomes a top strip; below 900/1000 px the controller,
   trigger, and appearance grids stack.
 
+## Inline validation
+
+- Every field is validated as it is edited, under the input itself.
+  The checks call the daemon's `Config::validate_all`, so messages and
+  limits match `config-check` exactly; free-text fields (output names,
+  colours, lengths, device paths, axis names, theme file) are checked
+  directly so one bad field never hides another.
+- Widget ranges match the daemon ranges (bar size depends on edge,
+  `scroll_repeat_ms` ≤ 5000, `animation.open_scale` 0.1–2.0, …).
+- `Add bar` / `Add placement` seed an unused live output name (falling
+  back to `eDP-1`, `HDMI-A-1`, …), `Add layer` seeds a hold axis, and
+  `Add hold axis` picks an unused axis, so new items are valid on
+  creation instead of failing at save time.
+- While any field is invalid, Save and Save & Restart are disabled and
+  the action bar counts the invalid fields. Clearing the Theme field
+  removes the theme instead of writing an empty path.
+
 ## Save
 
 - `Load` reads the TOML and gets the real model from

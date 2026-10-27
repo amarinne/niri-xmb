@@ -1,8 +1,9 @@
 //! Native editor for niri-xmb TOML.
 //!
 //! Left navigation selects a section, the command bar loads, validates and
-//! saves, and a persistent live dock shows the popup render, controller state,
-//! and the Niri keybind map. The editor loads the real schema through
+//! saves, and a persistent live dock shows the popup render and Niri keybind
+//! map. The controller editor map also reflects live input when available. The
+//! editor loads the real schema through
 //! `niri-xmb config-json`, writes only changed paths through `toml_edit`,
 //! validates with `config-check`, and saves atomically. It does not talk to the
 //! daemon except through the existing `restart` command after an explicit Save
@@ -10,12 +11,13 @@
 
 mod i18n;
 mod keymap;
+mod validation;
 
 use anyhow::{Context, Result};
 use eframe::egui;
 use egui::{
-    Align, Align2, Color32, ColorImage, ComboBox, CursorIcon, FontId, Layout, Pos2, Rect, RichText,
-    ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2,
+    Align, Align2, Color32, ColorImage, ComboBox, CursorIcon, FontId, Key, Layout, Modifiers, Pos2,
+    Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2,
 };
 use niri_xmb::config::Config;
 use niri_xmb::preview::{
@@ -598,17 +600,15 @@ impl Section {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DockTab {
     Popup,
-    Controller,
     Keyboard,
 }
 
 impl DockTab {
-    const ALL: [DockTab; 3] = [Self::Popup, Self::Controller, Self::Keyboard];
+    const ALL: [DockTab; 2] = [Self::Popup, Self::Keyboard];
 
     fn label(self) -> &'static str {
         match self {
             Self::Popup => "Popup",
-            Self::Controller => "Controller",
             Self::Keyboard => "Keyboard",
         }
     }
@@ -616,8 +616,9 @@ impl DockTab {
     /// The tab that best matches an editor section for auto-follow.
     fn for_section(section: Section) -> Self {
         match section {
-            Section::Controller | Section::Trigger => Self::Controller,
-            Section::Popup | Section::Appearance => Self::Popup,
+            Section::Controller | Section::Trigger | Section::Popup | Section::Appearance => {
+                Self::Popup
+            }
         }
     }
 }
@@ -697,6 +698,9 @@ struct StudioApp {
     config_path: String,
     model: Value,
     loaded: Value,
+    history_undo: Vec<Value>,
+    history_redo: Vec<Value>,
+    history_cursor: Value,
     sha256: String,
     section: Section,
     show_changes: bool,
@@ -734,6 +738,9 @@ struct StudioApp {
     keymap_at: Instant,
     keymap_search: String,
     keymap_selected: Option<String>,
+    field_errors: Vec<validation::FieldError>,
+    validated_model: Value,
+    validated_path: String,
 }
 
 impl StudioApp {
@@ -744,6 +751,9 @@ impl StudioApp {
             config_path: config.display().to_string(),
             model: Value::Null,
             loaded: Value::Null,
+            history_undo: Vec::new(),
+            history_redo: Vec::new(),
+            history_cursor: Value::Null,
             sha256: String::new(),
             section: Section::Controller,
             show_changes: false,
@@ -781,6 +791,9 @@ impl StudioApp {
             keymap_at: Instant::now(),
             keymap_search: String::new(),
             keymap_selected: None,
+            field_errors: Vec::new(),
+            validated_model: Value::Null,
+            validated_path: String::new(),
         };
         app.live_thread = Some(spawn_live(
             niri_xmb,
@@ -818,6 +831,9 @@ impl StudioApp {
         }
         self.model = result["config"].clone();
         self.loaded = self.model.clone();
+        self.history_undo.clear();
+        self.history_redo.clear();
+        self.history_cursor = self.model.clone();
         self.sha256 = result["sha256"].as_str().unwrap_or("").to_string();
         self.config_path = result["path"]
             .as_str()
@@ -832,6 +848,9 @@ impl StudioApp {
 
     fn revert(&mut self) {
         self.model = self.loaded.clone();
+        self.history_undo.clear();
+        self.history_redo.clear();
+        self.history_cursor = self.model.clone();
         self.error.clear();
         self.candidate.clear();
         self.status = "Reverted".to_string();
@@ -843,12 +862,134 @@ impl StudioApp {
         self.model != Value::Null && self.model != self.loaded
     }
 
+    /// Recompute inline field errors from the current model. Runs once per
+    /// frame; the daemon validator is the single source of truth.
+    fn refresh_validation(&mut self) {
+        if self.validated_model == self.model && self.validated_path == self.config_path {
+            return;
+        }
+        self.validated_model = self.model.clone();
+        self.validated_path = self.config_path.clone();
+        self.field_errors = validation::field_errors(&self.model);
+        if let Some(theme) = get_path(&self.model, "theme").and_then(Value::as_str)
+            && let Some(message) = validation::theme_error(theme, &self.config_path)
+            && !self.field_errors.iter().any(|error| error.path == "theme")
+        {
+            self.field_errors.push(validation::FieldError {
+                path: "theme".to_string(),
+                message,
+            });
+        }
+    }
+
+    fn field_error(&self, path: &str) -> Option<&str> {
+        self.field_errors
+            .iter()
+            .find(|error| error.path == path || error.path.starts_with(&format!("{path}.")))
+            .map(|error| error.message.as_str())
+    }
+
+    fn show_field_error(&self, ui: &mut Ui, path: &str) {
+        if let Some(message) = self.field_error(path) {
+            ui.label(RichText::new(message).size(10.0).color(ERROR));
+        }
+    }
+
+    fn show_exact_field_error(&self, ui: &mut Ui, path: &str) {
+        if let Some(error) = self.field_errors.iter().find(|error| error.path == path) {
+            ui.label(RichText::new(&error.message).size(10.0).color(ERROR));
+        }
+    }
+
+    fn show_errors_for_prefix(&self, ui: &mut Ui, path: &str) {
+        for error in &self.field_errors {
+            if error.path == path || error.path.starts_with(&format!("{path}.")) {
+                ui.label(RichText::new(&error.message).size(10.0).color(ERROR));
+            }
+        }
+    }
+
+    /// Gate Validate/Save on inline errors so the daemon validator is a
+    /// backstop, not the first place a bad field is reported.
+    fn inline_error(&mut self) -> Option<String> {
+        self.refresh_validation();
+        if self.field_errors.is_empty() {
+            return None;
+        }
+        let first = self.field_errors[0].message.clone();
+        Some(if self.field_errors.len() > 1 {
+            format!(
+                "{first} (+{} more invalid fields)",
+                self.field_errors.len() - 1
+            )
+        } else {
+            first
+        })
+    }
+
+    fn output_seed(&self, list_path: &str) -> String {
+        let used = get_path(&self.model, list_path)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("output").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let live_outputs = self
+            .live
+            .lock()
+            .ok()
+            .and_then(|live| snapshot_from_json(&live.snapshot))
+            .map(|snapshot| snapshot.outputs.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        validation::output_seed(&used, &live_outputs)
+    }
+
+    /// Capture one completed UI edit. Field editors mutate `model` directly;
+    /// comparing once per frame keeps history centralized and groups a drag
+    /// or text edit into a single useful step.
+    fn sync_history(&mut self) {
+        if self.model != self.history_cursor {
+            self.history_undo.push(self.history_cursor.clone());
+            self.history_cursor = self.model.clone();
+            self.history_redo.clear();
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(previous) = self.history_undo.pop() {
+            self.history_redo.push(self.model.clone());
+            self.model = previous;
+            self.history_cursor = self.model.clone();
+            self.candidate.clear();
+            self.status = "Undid change".to_string();
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.history_redo.pop() {
+            self.history_undo.push(self.model.clone());
+            self.model = next;
+            self.history_cursor = self.model.clone();
+            self.candidate.clear();
+            self.status = "Redid change".to_string();
+        }
+    }
+
     fn patch(&self) -> Patch {
         compute_patch(&self.loaded, &self.model)
     }
 
     fn validate(&mut self) {
         if self.model == Value::Null {
+            return;
+        }
+        if let Some(error) = self.inline_error() {
+            self.error = error;
+            self.status = "Invalid".to_string();
             return;
         }
         if let Some(error) = self.trigger_points_error() {
@@ -888,6 +1029,11 @@ impl StudioApp {
 
     fn save(&mut self, restart_after: bool) {
         if self.model == Value::Null {
+            return;
+        }
+        if let Some(error) = self.inline_error() {
+            self.error = error;
+            self.status = "Invalid".to_string();
             return;
         }
         if let Some(error) = self.trigger_points_error() {
@@ -940,6 +1086,11 @@ impl StudioApp {
     }
 
     fn request_save(&mut self, restart_after: bool) {
+        if let Some(error) = self.inline_error() {
+            self.error = error;
+            self.status = "Invalid".to_string();
+            return;
+        }
         if let Some(error) = self.trigger_points_error() {
             self.error = error;
             self.status = "Invalid".to_string();
@@ -1069,7 +1220,7 @@ impl StudioApp {
 
     fn action_status(&self, ui: &mut Ui) {
         let patch = self.patch();
-        let dot = if !self.error.is_empty() {
+        let dot = if !self.error.is_empty() || !self.field_errors.is_empty() {
             ERROR
         } else if !patch.is_empty() {
             WARN
@@ -1104,25 +1255,52 @@ impl StudioApp {
                     }),
             );
         }
+        if !self.field_errors.is_empty() {
+            ui.label(
+                RichText::new(format!("{} invalid field(s)", self.field_errors.len()))
+                    .size(10.5)
+                    .color(ERROR),
+            )
+            .on_hover_text(&self.field_errors[0].message);
+        }
     }
 
     fn action_buttons(&mut self, ui: &mut Ui) {
-        let dirty = self.dirty();
+        let dirty = self.dirty() && self.field_errors.is_empty();
+        let can_undo = !self.history_undo.is_empty();
+        let can_redo = !self.history_redo.is_empty();
         if tt(
-            ui.selectable_label(self.show_changes, "Changes"),
+            ui.add_enabled(can_undo, egui::Button::new("↶")),
+            "ui.action.undo",
+        )
+        .clicked()
+        {
+            self.undo();
+        }
+        if tt(
+            ui.add_enabled(can_redo, egui::Button::new("↷")),
+            "ui.action.redo",
+        )
+        .clicked()
+        {
+            self.redo();
+        }
+        ui.separator();
+        if tt(
+            ui.selectable_label(self.show_changes, "☷ Changes"),
             "ui.action.changes",
         )
         .clicked()
         {
             self.show_changes = !self.show_changes;
         }
-        if tt(ui.button("Preview"), "ui.action.preview").clicked() {
+        if tt(ui.button("▣ Preview"), "ui.action.preview").clicked() {
             self.dock_tab = DockTab::Popup;
             self.dock_collapsed = false;
             self.dock_follow = true;
         }
         if tt(
-            ui.add_enabled(self.model != Value::Null, egui::Button::new("Validate")),
+            ui.add_enabled(self.model != Value::Null, egui::Button::new("✓ Validate")),
             "ui.action.validate",
         )
         .clicked()
@@ -1130,7 +1308,7 @@ impl StudioApp {
             self.validate();
         }
         if tt(
-            ui.add_enabled(dirty, egui::Button::new("Save")),
+            ui.add_enabled(dirty, egui::Button::new("⭳ Save")),
             "ui.action.save",
         )
         .clicked()
@@ -1138,7 +1316,7 @@ impl StudioApp {
             self.request_save(false);
         }
         if tt(
-            ui.add_enabled(dirty, egui::Button::new("Save & Restart")),
+            ui.add_enabled(dirty, egui::Button::new("⟳ Save & Restart")),
             "ui.action.save_restart",
         )
         .clicked()
@@ -1146,7 +1324,7 @@ impl StudioApp {
             self.request_save(true);
         }
         if tt(
-            ui.add_enabled(dirty, egui::Button::new("Revert")),
+            ui.add_enabled(self.dirty(), egui::Button::new("↩ Revert")),
             "ui.action.revert",
         )
         .clicked()
@@ -1434,6 +1612,11 @@ impl StudioApp {
     }
 
     fn controller_map_card(&mut self, ui: &mut Ui) {
+        let live = self
+            .live
+            .lock()
+            .map(|live| GamepadLiveView::from_status(&live.status))
+            .unwrap_or_default();
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Controller map").size(12.0).strong());
@@ -1448,12 +1631,25 @@ impl StudioApp {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
-                        RichText::new("bindings follow the selected control")
+                        RichText::new(format!(
+                            "{} connected · {}",
+                            self.connected_count(),
+                            self.gamepad_mode_name()
+                        ))
+                        .monospace()
+                        .size(9.5)
+                        .color(TEXT_DIM),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new("live presses highlight · bindings follow selection")
                             .size(9.5)
                             .color(TEXT_DIM),
                     );
                 });
             });
+            ui.add_space(5.0);
+            self.controller_live_summary(ui, &live);
             ui.add_space(6.0);
             let mut hotspot = None;
             let mut row = None;
@@ -1463,7 +1659,7 @@ impl StudioApp {
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| {
                         ui.set_width(map_width);
-                        hotspot = self.controller_map_body(ui);
+                        hotspot = self.controller_map_body(ui, &live);
                         ui.add_space(6.0);
                         ui.separator();
                         ui.add_space(4.0);
@@ -1476,7 +1672,7 @@ impl StudioApp {
                     });
                 });
             } else {
-                hotspot = self.controller_map_body(ui);
+                hotspot = self.controller_map_body(ui, &live);
                 ui.separator();
                 self.inspector_body(ui);
                 ui.separator();
@@ -1488,7 +1684,46 @@ impl StudioApp {
         });
     }
 
-    fn controller_map_body(&mut self, ui: &mut Ui) -> Option<Rect> {
+    fn controller_live_summary(&self, ui: &mut Ui, live: &GamepadLiveView) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Live input")
+                    .size(10.0)
+                    .strong()
+                    .color(TEXT_MUTED),
+            );
+            for (label, axis, button) in [("LT", "ABS_Z", "BTN_TL2"), ("RT", "ABS_RZ", "BTN_TR2")] {
+                ui.label(RichText::new(label).monospace().size(9.0).color(TEXT_DIM));
+                let value = live.trigger(axis, button);
+                let width = (ui.available_width() * 0.28).clamp(58.0, 150.0);
+                let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 5.0), Sense::hover());
+                ui.painter().rect_filled(bar, 2.5, FIELD_BG);
+                ui.painter().rect_filled(
+                    Rect::from_min_size(
+                        bar.min,
+                        Vec2::new(bar.width() * value.clamp(0.0, 1.0), bar.height()),
+                    ),
+                    2.5,
+                    if value > 0.05 { ACCENT } else { BORDER },
+                );
+                ui.label(
+                    RichText::new(format!("{:>3.0}%", value * 100.0))
+                        .monospace()
+                        .size(9.0)
+                        .color(TEXT_DIM),
+                );
+            }
+            if self.connected_count() == 0 {
+                ui.label(
+                    RichText::new("connect a controller to see presses")
+                        .size(9.0)
+                        .color(TEXT_DIM),
+                );
+            }
+        });
+    }
+
+    fn controller_map_body(&mut self, ui: &mut Ui, live: &GamepadLiveView) -> Option<Rect> {
         let template = self.template;
         let width = ui.available_width().min(560.0);
         let height = (width * 0.56).clamp(210.0, 330.0);
@@ -1553,6 +1788,26 @@ impl StudioApp {
                     Color32::from_rgba_unmultiplied(116, 162, 255, 30),
                 );
             }
+            if self.hotspot_pressed(hotspot, live) {
+                let color = Color32::from_rgba_unmultiplied(116, 162, 255, 72);
+                if hotspot.circle {
+                    ui.painter()
+                        .circle_filled(center, hit.width().min(hit.height()) / 2.0, color);
+                    ui.painter().circle_stroke(
+                        center,
+                        hit.width().min(hit.height()) / 2.0,
+                        Stroke::new(1.8_f32, Color32::WHITE),
+                    );
+                } else {
+                    ui.painter().rect_filled(hit, 7.0, color);
+                    ui.painter().rect_stroke(
+                        hit,
+                        7.0,
+                        Stroke::new(1.8_f32, Color32::WHITE),
+                        StrokeKind::Inside,
+                    );
+                }
+            }
             if hotspot.circle {
                 ui.painter()
                     .circle_stroke(center, hit.width().min(hit.height()) / 2.0, stroke);
@@ -1583,6 +1838,19 @@ impl StudioApp {
             }
         }
         selected_rect
+    }
+
+    fn hotspot_pressed(&self, hotspot: &Hotspot, live: &GamepadLiveView) -> bool {
+        match hotspot.control {
+            "LT" | "L2" => live.trigger("ABS_Z", "BTN_TL2") > 0.05,
+            "RT" | "R2" => live.trigger("ABS_RZ", "BTN_TR2") > 0.05,
+            "L STICK" | "L3" => live.button("BTN_THUMBL"),
+            "R STICK" | "R3" => live.button("BTN_THUMBR"),
+            "D-PAD" => ["up", "down", "left", "right"]
+                .iter()
+                .any(|direction| live.dpad(direction)),
+            _ => hotspot.code.is_some_and(|code| live.button(code)),
+        }
     }
 
     fn switch_template(&mut self, template: Template) {
@@ -1691,6 +1959,7 @@ impl StudioApp {
     }
 
     fn device_fields(&mut self, ui: &mut Ui) {
+        self.show_exact_field_error(ui, "gamepad");
         if ui.available_width() >= 480.0 {
             ui.columns(2, |cols| {
                 self.bool_field(&mut cols[0], "gamepad.enabled", "Enabled");
@@ -3190,8 +3459,8 @@ impl StudioApp {
                         &mut cols[1],
                         "animation.open_scale",
                         "Open scale",
-                        0.0,
-                        1.0,
+                        0.1,
+                        2.0,
                         0.01,
                     );
                 });
@@ -3207,7 +3476,7 @@ impl StudioApp {
                     1.0,
                 );
                 self.f32_field(ui, "animation.scroll_ms", "Scroll ms", 0.0, 60_000.0, 1.0);
-                self.f32_field(ui, "animation.open_scale", "Open scale", 0.0, 1.0, 0.01);
+                self.f32_field(ui, "animation.open_scale", "Open scale", 0.1, 2.0, 0.01);
             }
         });
     }
@@ -3306,6 +3575,12 @@ impl StudioApp {
                 });
                 ui.add_space(4.0);
                 let base = format!("bars.{index}");
+                let edge = self.model["bars"][index]["edge"].as_str().unwrap_or("top");
+                let (max_width, max_height) = if matches!(edge, "left" | "right") {
+                    (512, 8192)
+                } else {
+                    (8192, 512)
+                };
                 if ui.available_width() >= 480.0 {
                     ui.columns(2, |cols| {
                         self.text_field(&mut cols[0], &format!("{base}.output"), "Output");
@@ -3321,16 +3596,28 @@ impl StudioApp {
                             "Align",
                             &["start", "center", "end"],
                         );
-                        self.u64_field(&mut cols[0], &format!("{base}.width"), "Width", 1, 100_000);
+                        self.u64_field(
+                            &mut cols[0],
+                            &format!("{base}.width"),
+                            "Width",
+                            1,
+                            max_width,
+                        );
                         self.u64_field(
                             &mut cols[0],
                             &format!("{base}.height"),
                             "Height",
                             1,
-                            100_000,
+                            max_height,
                         );
-                        self.i64_field(&mut cols[0], &format!("{base}.margin"), "Margin");
-                        self.i64_field(&mut cols[0], &format!("{base}.offset"), "Offset");
+                        self.i64_field(&mut cols[0], &format!("{base}.margin"), "Margin", 0, 8192);
+                        self.i64_field(
+                            &mut cols[0],
+                            &format!("{base}.offset"),
+                            "Offset",
+                            -8192,
+                            8192,
+                        );
                         self.bool_field(
                             &mut cols[0],
                             &format!("{base}.allow_column_join"),
@@ -3373,7 +3660,7 @@ impl StudioApp {
                             &format!("{base}.scroll_repeat_ms"),
                             "Wheel repeat ms",
                             0,
-                            60_000,
+                            5_000,
                         );
                     });
                 } else {
@@ -3390,10 +3677,10 @@ impl StudioApp {
                         "Align",
                         &["start", "center", "end"],
                     );
-                    self.u64_field(ui, &format!("{base}.width"), "Width", 1, 100_000);
-                    self.u64_field(ui, &format!("{base}.height"), "Height", 1, 100_000);
-                    self.i64_field(ui, &format!("{base}.margin"), "Margin");
-                    self.i64_field(ui, &format!("{base}.offset"), "Offset");
+                    self.u64_field(ui, &format!("{base}.width"), "Width", 1, max_width);
+                    self.u64_field(ui, &format!("{base}.height"), "Height", 1, max_height);
+                    self.i64_field(ui, &format!("{base}.margin"), "Margin", 0, 8192);
+                    self.i64_field(ui, &format!("{base}.offset"), "Offset", -8192, 8192);
                     self.bool_field(ui, &format!("{base}.allow_column_join"), "Column join");
                     self.bool_field(
                         ui,
@@ -3415,7 +3702,7 @@ impl StudioApp {
                         &format!("{base}.scroll_repeat_ms"),
                         "Wheel repeat ms",
                         0,
-                        60_000,
+                        5_000,
                     );
                 }
                 ui.add_space(6.0);
@@ -3426,10 +3713,11 @@ impl StudioApp {
             {
                 bars.remove(index);
             }
-            if tt(ui.button("Add bar"), "ui.action.add_bar").clicked()
-                && let Some(bars) = self.model["bars"].as_array_mut()
-            {
-                bars.push(default_bar());
+            if tt(ui.button("Add bar"), "ui.action.add_bar").clicked() {
+                let seed = self.output_seed("bars");
+                if let Some(bars) = self.model["bars"].as_array_mut() {
+                    bars.push(validation::default_bar(seed));
+                }
             }
         });
     }
@@ -3444,8 +3732,14 @@ impl StudioApp {
                 .changed()
         });
         if changed {
-            set_json_path(&mut self.model, path, Value::String(value));
+            // An empty theme means "no theme", not an invalid empty path.
+            if path == "theme" && value.trim().is_empty() {
+                set_json_path(&mut self.model, path, Value::Null);
+            } else {
+                set_json_path(&mut self.model, path, Value::String(value));
+            }
         }
+        self.show_field_error(ui, path);
     }
 
     fn bool_field(&mut self, ui: &mut Ui, path: &str, label: &str) {
@@ -3475,6 +3769,7 @@ impl StudioApp {
         if changed {
             set_json_path(&mut self.model, path, json!(value));
         }
+        self.show_field_error(ui, path);
     }
 
     fn u64_field(&mut self, ui: &mut Ui, path: &str, label: &str, min: u64, max: u64) {
@@ -3488,19 +3783,21 @@ impl StudioApp {
         if changed {
             set_json_path(&mut self.model, path, json!(value));
         }
+        self.show_field_error(ui, path);
     }
 
-    fn i64_field(&mut self, ui: &mut Ui, path: &str, label: &str) {
+    fn i64_field(&mut self, ui: &mut Ui, path: &str, label: &str, min: i64, max: i64) {
         let mut value = get_path(&self.model, path)
             .and_then(Value::as_i64)
             .unwrap_or(0);
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            ui.add(egui::DragValue::new(&mut value).speed(1.0))
+            ui.add(egui::DragValue::new(&mut value).speed(1.0).range(min..=max))
                 .changed()
         });
         if changed {
             set_json_path(&mut self.model, path, json!(value));
         }
+        self.show_field_error(ui, path);
     }
 
     fn combo_field(&mut self, ui: &mut Ui, path: &str, label: &str, options: &[&str]) {
@@ -3526,6 +3823,7 @@ impl StudioApp {
         if changed || value != old {
             set_json_path(&mut self.model, path, Value::String(value));
         }
+        self.show_field_error(ui, path);
     }
 
     fn list_field(&mut self, ui: &mut Ui, path: &str, label: &str) {
@@ -3553,6 +3851,7 @@ impl StudioApp {
                 .collect::<Vec<_>>();
             set_json_path(&mut self.model, path, Value::Array(values));
         }
+        self.show_field_error(ui, path);
     }
 
     /// Multi-select for button-code lists such as the open combo, the mode
@@ -3594,6 +3893,7 @@ impl StudioApp {
         {
             items.push(json!(button));
         }
+        self.show_field_error(ui, path);
     }
 
     fn length_field(&mut self, ui: &mut Ui, path: &str, label: &str) {
@@ -3620,6 +3920,7 @@ impl StudioApp {
             };
             set_json_path(&mut self.model, path, value);
         }
+        self.show_field_error(ui, path);
     }
 
     fn color_field(&mut self, ui: &mut Ui, path: &str, label: &str) {
@@ -3640,6 +3941,7 @@ impl StudioApp {
         if changed {
             set_json_path(&mut self.model, path, Value::String(value));
         }
+        self.show_field_error(ui, path);
     }
 
     /// XMB and Navi lists, with the row for the selected control highlighted.
@@ -3722,6 +4024,7 @@ impl StudioApp {
                 }
             }
         }
+        self.show_errors_for_prefix(ui, path);
         let used = entries
             .iter()
             .map(|(code, _)| code.clone())
@@ -3901,6 +4204,7 @@ impl StudioApp {
                         remove_axis = Some(index);
                     }
                 });
+                self.show_field_error(ui, &axis_path);
             }
             if let Some(index) = remove_axis
                 && let Some(axes) =
@@ -3908,12 +4212,27 @@ impl StudioApp {
             {
                 axes.remove(index);
             }
-            if tt(ui.button("Add hold axis"), "ui.action.add_hold_axis").clicked()
-                && let Some(axes) =
+            if tt(ui.button("Add hold axis"), "ui.action.add_hold_axis").clicked() {
+                let used_axes = self.model["gamepad"]["navi"]["layers"][&name]["hold_axes"]
+                    .as_array()
+                    .map(|axes| {
+                        axes.iter()
+                            .filter_map(|axis| axis.get("axis").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let axis = ["ABS_Z", "ABS_RZ", "ABS_X", "ABS_Y", "ABS_RX", "ABS_RY"]
+                    .into_iter()
+                    .find(|candidate| !used_axes.iter().any(|used| used == candidate))
+                    .unwrap_or("ABS_Z");
+                if let Some(axes) =
                     self.model["gamepad"]["navi"]["layers"][&name]["hold_axes"].as_array_mut()
-            {
-                axes.push(json!({"axis": "ABS_Z", "threshold": 0.35}));
+                {
+                    axes.push(json!({"axis": axis, "threshold": 0.35}));
+                }
             }
+            self.show_exact_field_error(ui, &path);
             self.bindings_ui(ui, &format!("{path}.bindings"), ACTIONS, "Bindings", None);
         }
         if let Some(name) = remove_layer
@@ -3932,7 +4251,7 @@ impl StudioApp {
                 suffix += 1;
             }
             let layers = ensure_object_path(&mut self.model, "gamepad.navi.layers");
-            layers.insert(name, json!({"hold": [], "hold_axes": [], "bindings": {}}));
+            layers.insert(name, validation::default_layer());
         }
     }
 
@@ -4000,10 +4319,11 @@ impl StudioApp {
         {
             items.remove(index);
         }
-        if tt(ui.button("Add placement"), "ui.action.add_placement").clicked()
-            && let Some(items) = self.model["popup"]["placements"].as_array_mut()
-        {
-            items.push(json!({"output": "", "x": "center", "y": "center", "margin": 48.0}));
+        if tt(ui.button("Add placement"), "ui.action.add_placement").clicked() {
+            let seed = self.output_seed("popup.placements");
+            if let Some(items) = self.model["popup"]["placements"].as_array_mut() {
+                items.push(validation::default_placement(seed));
+            }
         }
     }
 
@@ -4346,14 +4666,6 @@ impl GamepadLiveView {
     }
 }
 
-struct ControllerRow {
-    label: String,
-    code: String,
-    pressed: bool,
-    trigger: Option<f32>,
-    hold_axis: Option<&'static str>,
-}
-
 impl StudioApp {
     fn live_dock(&mut self, ctx: &egui::Context) {
         let frame = egui::Frame::new()
@@ -4384,7 +4696,6 @@ impl StudioApp {
                 }
                 match self.dock_tab {
                     DockTab::Popup => self.dock_popup(ui, body),
-                    DockTab::Controller => self.dock_controller(ui, body),
                     DockTab::Keyboard => self.dock_keyboard(ui, body),
                 }
             });
@@ -4582,118 +4893,6 @@ impl StudioApp {
         });
     }
 
-    fn dock_controller(&mut self, ui: &mut Ui, body: Vec2) {
-        let live = self
-            .live
-            .lock()
-            .map(|live| GamepadLiveView::from_status(&live.status))
-            .unwrap_or_default();
-        let rows = self.controller_rows(&live);
-        let map_h = (body.y - 4.0).clamp(100.0, 300.0);
-        let map_w = (map_h / self.template.aspect()).min((body.x * 0.55).max(220.0));
-        ui.horizontal_top(|ui| {
-            self.controller_live_map(ui, Vec2::new(map_w, map_h), &live);
-            ui.add_space(10.0);
-            ui.vertical(|ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Controls").size(11.5).strong());
-                    ui.add_space(4.0);
-                    for template in [Template::Xbox, Template::Ds4] {
-                        if ui
-                            .selectable_label(self.template == template, template.label())
-                            .clicked()
-                        {
-                            self.switch_template(template);
-                        }
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} connected · {}",
-                                self.connected_count(),
-                                self.gamepad_mode_name()
-                            ))
-                            .monospace()
-                            .size(9.0)
-                            .color(TEXT_DIM),
-                        );
-                    });
-                });
-                if self.connected_count() > 0 && !self.gamepad_live_available() {
-                    ui.label(
-                        RichText::new(
-                            "Live presses unavailable: the running daemon predates gamepad.live",
-                        )
-                        .size(9.0)
-                        .color(WARN),
-                    );
-                }
-                ui.add_space(2.0);
-                for (label, axis, button) in
-                    [("LT", "ABS_Z", "BTN_TL2"), ("RT", "ABS_RZ", "BTN_TR2")]
-                {
-                    let value = live.trigger(axis, button);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(label).monospace().size(9.0).color(TEXT_DIM));
-                        let width = (ui.available_width() - 44.0).max(60.0);
-                        let (bar, _) =
-                            ui.allocate_exact_size(Vec2::new(width, 5.0), Sense::hover());
-                        ui.painter().rect_filled(bar, 2.5, FIELD_BG);
-                        let fill = Rect::from_min_size(
-                            bar.min,
-                            Vec2::new(bar.width() * value.clamp(0.0, 1.0), bar.height()),
-                        );
-                        ui.painter().rect_filled(
-                            fill,
-                            2.5,
-                            if value > 0.05 { ACCENT } else { BORDER },
-                        );
-                        ui.label(
-                            RichText::new(format!("{:>3.0}%", value * 100.0))
-                                .monospace()
-                                .size(9.0)
-                                .color(TEXT_DIM),
-                        );
-                    });
-                }
-                ui.add_space(2.0);
-                let list_w = ui.available_width();
-                let columns = controller_columns(list_w);
-                let label_w = columns.label;
-                let binding_w = columns.binding;
-                let layer_w = columns.layers;
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    ui.add_space(17.0);
-                    column_header(ui, "Control", label_w);
-                    column_header(ui, "Binding", binding_w);
-                    column_header(ui, "Layers", layer_w);
-                });
-                ui.separator();
-                ScrollArea::vertical()
-                    .id_salt("dock-controller-list")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        for row in &rows {
-                            let binding = self.controller_binding(&row.code);
-                            let layers = self.controller_layers(&row.code, row.hold_axis);
-                            controller_row(
-                                ui,
-                                row,
-                                binding.as_deref(),
-                                &layers,
-                                label_w,
-                                binding_w,
-                                layer_w,
-                            );
-                        }
-                    });
-            });
-        });
-    }
-
     fn connected_count(&self) -> usize {
         self.live
             .lock()
@@ -4703,13 +4902,6 @@ impl StudioApp {
                     .map_or(0, Vec::len)
             })
             .unwrap_or(0)
-    }
-
-    fn gamepad_live_available(&self) -> bool {
-        self.live
-            .lock()
-            .map(|live| live.status["gamepad"]["live"].is_array())
-            .unwrap_or(false)
     }
 
     fn gamepad_mode_name(&self) -> &'static str {
@@ -4722,189 +4914,6 @@ impl StudioApp {
             Some("navi") => "navi",
             Some("game") => "game",
             _ => "off",
-        }
-    }
-
-    fn controller_rows(&self, live: &GamepadLiveView) -> Vec<ControllerRow> {
-        let mut rows = Vec::new();
-        for hotspot in self.template.hotspots() {
-            match hotspot.control {
-                "D-PAD" => {
-                    for (label, code, direction) in [
-                        ("D-Pad Up", "BTN_DPAD_UP", "up"),
-                        ("D-Pad Down", "BTN_DPAD_DOWN", "down"),
-                        ("D-Pad Left", "BTN_DPAD_LEFT", "left"),
-                        ("D-Pad Right", "BTN_DPAD_RIGHT", "right"),
-                    ] {
-                        rows.push(ControllerRow {
-                            label: label.into(),
-                            code: code.into(),
-                            pressed: live.dpad(direction),
-                            trigger: None,
-                            hold_axis: None,
-                        });
-                    }
-                }
-                "LT" | "L2" => rows.push(ControllerRow {
-                    label: if hotspot.control == "LT" { "LT" } else { "L2" }.into(),
-                    code: "BTN_TL2".into(),
-                    pressed: live.trigger("ABS_Z", "BTN_TL2") > 0.05,
-                    trigger: Some(live.trigger("ABS_Z", "BTN_TL2")),
-                    hold_axis: Some("ABS_Z"),
-                }),
-                "RT" | "R2" => rows.push(ControllerRow {
-                    label: if hotspot.control == "RT" { "RT" } else { "R2" }.into(),
-                    code: "BTN_TR2".into(),
-                    pressed: live.trigger("ABS_RZ", "BTN_TR2") > 0.05,
-                    trigger: Some(live.trigger("ABS_RZ", "BTN_TR2")),
-                    hold_axis: Some("ABS_RZ"),
-                }),
-                "L STICK" => rows.push(ControllerRow {
-                    label: "L3".into(),
-                    code: "BTN_THUMBL".into(),
-                    pressed: live.button("BTN_THUMBL"),
-                    trigger: None,
-                    hold_axis: None,
-                }),
-                "R STICK" => rows.push(ControllerRow {
-                    label: "R3".into(),
-                    code: "BTN_THUMBR".into(),
-                    pressed: live.button("BTN_THUMBR"),
-                    trigger: None,
-                    hold_axis: None,
-                }),
-                control => {
-                    let Some(code) = hotspot.code else {
-                        continue;
-                    };
-                    rows.push(ControllerRow {
-                        label: control.into(),
-                        code: code.into(),
-                        pressed: live.button(code),
-                        trigger: None,
-                        hold_axis: None,
-                    });
-                }
-            }
-        }
-        rows
-    }
-
-    fn controller_binding(&self, code: &str) -> Option<String> {
-        self.model["gamepad"]["navi"]["bindings"][code]
-            .as_str()
-            .or_else(|| self.model["gamepad"]["buttons"][code].as_str())
-            .map(str::to_string)
-    }
-
-    fn controller_layers(&self, code: &str, axis: Option<&str>) -> Vec<String> {
-        let mut names = Vec::new();
-        let Some(layers) = self.model["gamepad"]["navi"]["layers"].as_object() else {
-            return names;
-        };
-        for (name, layer) in layers {
-            let holds = layer["hold"]
-                .as_array()
-                .is_some_and(|hold| hold.iter().any(|value| value.as_str() == Some(code)));
-            let holds_axis = axis.is_some_and(|axis| {
-                layer["hold_axes"].as_array().is_some_and(|holds| {
-                    holds.iter().any(|hold| hold["axis"].as_str() == Some(axis))
-                })
-            });
-            let binds = layer["bindings"][code].is_string();
-            if holds || holds_axis || binds {
-                names.push(name.clone());
-            }
-        }
-        names
-    }
-
-    fn controller_live_map(&self, ui: &mut Ui, size: Vec2, live: &GamepadLiveView) {
-        let template = self.template;
-        let (box_rect, _) = ui.allocate_exact_size(size, Sense::hover());
-        if let Some(backdrop) = template.backdrop() {
-            ui.painter().rect_filled(box_rect, 10.0, backdrop);
-            ui.painter().rect_stroke(
-                box_rect,
-                10.0,
-                Stroke::new(1.0_f32, BORDER),
-                StrokeKind::Inside,
-            );
-        }
-        let image_size = if size.x * template.aspect() <= size.y {
-            Vec2::new(size.x, size.x * template.aspect())
-        } else {
-            Vec2::new(size.y / template.aspect(), size.y)
-        };
-        let rect = Rect::from_center_size(box_rect.center(), image_size);
-        let texture_id = match template {
-            Template::Xbox => self.xbox_texture.as_ref(),
-            Template::Ds4 => self.ds4_texture.as_ref(),
-        }
-        .map(TextureHandle::id);
-        if let Some(texture_id) = texture_id {
-            ui.painter().image(
-                texture_id,
-                rect,
-                Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        }
-        for hotspot in template.hotspots() {
-            let center = Pos2::new(
-                rect.min.x + hotspot.x * rect.width(),
-                rect.min.y + hotspot.y * rect.height(),
-            );
-            let hit = Rect::from_center_size(
-                center,
-                Vec2::new(hotspot.w * rect.width(), hotspot.h * rect.width()),
-            );
-            let pressed = match hotspot.control {
-                "LT" | "L2" => live.trigger("ABS_Z", "BTN_TL2") > 0.05,
-                "RT" | "R2" => live.trigger("ABS_RZ", "BTN_TR2") > 0.05,
-                "L STICK" => live.button("BTN_THUMBL"),
-                "R STICK" => live.button("BTN_THUMBR"),
-                "D-PAD" => ["up", "down", "left", "right"]
-                    .iter()
-                    .any(|direction| live.dpad(direction)),
-                _ => hotspot.code.is_some_and(|code| live.button(code)),
-            };
-            let response = ui.interact(
-                hit,
-                ui.id()
-                    .with(("dock-hotspot", template.label(), hotspot.control)),
-                Sense::hover(),
-            );
-            if pressed {
-                let color = Color32::from_rgba_unmultiplied(116, 162, 255, 70);
-                if hotspot.circle {
-                    ui.painter()
-                        .circle_filled(center, hit.width().min(hit.height()) / 2.0, color);
-                    ui.painter().circle_stroke(
-                        center,
-                        hit.width().min(hit.height()) / 2.0,
-                        Stroke::new(1.8_f32, Color32::WHITE),
-                    );
-                } else {
-                    ui.painter().rect_filled(hit, 7.0, color);
-                    ui.painter().rect_stroke(
-                        hit,
-                        7.0,
-                        Stroke::new(1.8_f32, Color32::WHITE),
-                        StrokeKind::Inside,
-                    );
-                }
-            }
-            if response.hovered()
-                && let Some(code) = hotspot.code
-            {
-                response
-                    .clone()
-                    .on_hover_text(match self.controller_binding(code) {
-                        Some(binding) => format!("{} · {binding}", hotspot.control),
-                        None => format!("{} · unbound", hotspot.control),
-                    });
-            }
         }
     }
 
@@ -5168,30 +5177,6 @@ impl StudioApp {
                 x += cap_width;
             }
         }
-        // Legend keeps the colour language explicit instead of leaving the
-        // owner to infer what the tinted caps mean.
-        if legend_h == 0.0 {
-            return clicked;
-        }
-        let legend_y = board.max.y + 10.0;
-        let mut x = board.min.x + 2.0;
-        for (label, color) in [
-            ("Bound", Color32::from_rgb(38, 50, 70)),
-            ("Pressed", ACCENT),
-            ("Selected", Color32::from_rgb(78, 112, 166)),
-            ("Search hit", WARN),
-        ] {
-            painter.circle_filled(Pos2::new(x + 3.0, legend_y), 3.0, color);
-            let galley =
-                painter.layout_no_wrap(label.to_string(), FontId::proportional(10.0), TEXT_DIM);
-            let width = galley.size().x;
-            painter.galley(
-                Pos2::new(x + 10.0, legend_y - galley.size().y / 2.0),
-                galley,
-                TEXT_DIM,
-            );
-            x += 10.0 + width + 14.0;
-        }
         clicked
     }
 
@@ -5226,9 +5211,9 @@ const KEYBOARD_MAX_KEY: f32 = 40.0;
 /// Smallest 1u key edge that still reads as a keyboard in a short dock.
 const KEYBOARD_MIN_KEY: f32 = 9.0;
 
-/// Legend row kept under the board when the dock is tall enough to hold it.
 fn keyboard_legend_height(available: Vec2) -> f32 {
-    if available.y >= 150.0 { 18.0 } else { 0.0 }
+    let _ = available;
+    0.0
 }
 
 /// Fit the 15x6 unit board into the dock, bounded by both dimensions so keys
@@ -5237,26 +5222,6 @@ fn keyboard_cell(available: Vec2) -> f32 {
     ((available.x - 12.0) / 15.0)
         .min((available.y - keyboard_legend_height(available) - 12.0) / 6.0)
         .clamp(KEYBOARD_MIN_KEY, KEYBOARD_MAX_KEY)
-}
-
-#[derive(Clone, Copy)]
-struct ControllerColumns {
-    label: f32,
-    binding: f32,
-    layers: f32,
-}
-
-/// Pin the controller table columns so the trailing trigger gauge cannot clip
-/// at the panel edge when the dock is narrow.
-fn controller_columns(list_w: f32) -> ControllerColumns {
-    let label = 96.0_f32.min(list_w * 0.28);
-    let remaining = (list_w - label - 22.0).max(160.0);
-    let layers = remaining * 0.26;
-    ControllerColumns {
-        label,
-        binding: remaining - layers,
-        layers,
-    }
 }
 
 fn keymap_list(ui: &mut Ui, binds: &[&keymap::NiriBind], height: f32) {
@@ -5393,70 +5358,6 @@ fn keymap_row(
                 detail.on_hover_text(&hover);
             });
         });
-}
-
-fn controller_row(
-    ui: &mut Ui,
-    row: &ControllerRow,
-    binding: Option<&str>,
-    layers: &[String],
-    label_w: f32,
-    binding_w: f32,
-    layer_w: f32,
-) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        let (dot, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
-        ui.painter()
-            .circle_filled(dot.center(), 2.8, if row.pressed { ACCENT } else { BORDER });
-        text_cell(
-            ui,
-            label_w,
-            19.0,
-            RichText::new(&row.label)
-                .size(11.0)
-                .color(if row.pressed { TEXT } else { TEXT_MUTED }),
-        );
-        let text = match binding {
-            Some(binding) => binding.to_string(),
-            None => "unbound".to_string(),
-        };
-        let binding_response = text_cell(
-            ui,
-            binding_w,
-            19.0,
-            RichText::new(text)
-                .monospace()
-                .size(10.5)
-                .color(if row.pressed { ACCENT } else { TEXT_DIM }),
-        );
-        if let Some(binding) = binding {
-            binding_response.on_hover_text(binding);
-        }
-        let lane = if layers.is_empty() {
-            "—".to_string()
-        } else {
-            layers.join(", ")
-        };
-        text_cell(
-            ui,
-            layer_w,
-            19.0,
-            RichText::new(lane)
-                .size(10.0)
-                .color(if layers.is_empty() { TEXT_DIM } else { WARN }),
-        );
-        if let Some(value) = row.trigger
-            && value > 0.05
-        {
-            ui.label(
-                RichText::new(format!("{:.0}%", value * 100.0))
-                    .monospace()
-                    .size(10.0)
-                    .color(ACCENT),
-            );
-        }
-    });
 }
 
 fn metric_chip(ui: &mut Ui, label: &str, value: impl ToString) {
@@ -5614,6 +5515,23 @@ fn egui_key_id(key: egui::Key) -> Option<&'static str> {
 
 impl eframe::App for StudioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let (undo, redo, save) = ctx.input_mut(|input| {
+            let ctrl = input.modifiers.matches_logically(Modifiers::CTRL);
+            (
+                ctrl && !input.modifiers.shift && input.consume_key(Modifiers::CTRL, Key::Z),
+                ctrl && (input.consume_key(Modifiers::CTRL, Key::Y)
+                    || (input.modifiers.shift && input.consume_key(Modifiers::CTRL, Key::Z))),
+                ctrl && input.consume_key(Modifiers::CTRL, Key::S),
+            )
+        });
+        if redo {
+            self.redo();
+        } else if undo {
+            self.undo();
+        } else if save && self.dirty() {
+            self.request_save(false);
+        }
+        self.refresh_validation();
         self.ensure_textures(ctx);
         self.command_bar(ctx);
         self.action_bar(ctx);
@@ -5624,11 +5542,12 @@ impl eframe::App for StudioApp {
         }
         self.live_dock(ctx);
         self.content(ctx);
+        self.sync_history();
         self.confirm_modal(ctx);
         // The live poller updates a shared snapshot without waking egui.
-        // Repaint while the dock is open so daemon focus changes, controller
-        // presses and click feedback arrive even when the pointer is idle.
-        if !self.dock_collapsed {
+        // Keep repainting while the live map or dock is visible so controller
+        // presses and popup feedback arrive even when the pointer is idle.
+        if self.section == Section::Controller || !self.dock_collapsed {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
@@ -6177,27 +6096,6 @@ fn diff(before: &Value, after: &Value, path: &str, patch: &mut Patch) {
         return;
     }
     patch.set.insert(path.to_string(), after.clone());
-}
-
-fn default_bar() -> Value {
-    json!({
-        "output": "",
-        "edge": "top",
-        "align": "start",
-        "width": 420,
-        "height": 38,
-        "margin": 4,
-        "offset": 8,
-        "allow_column_join": false,
-        "show_workspace_labels": false,
-        "hide_empty_workspaces": false,
-        "show_capsule": true,
-        "show_active_indicator": true,
-        "scroll_to_switch": true,
-        "scroll_wrap": true,
-        "scroll_reverse": false,
-        "scroll_repeat_ms": 75
-    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -6918,20 +6816,6 @@ unknown_gamepad_field = 7
         // Width-bound docks still respect the column budget.
         let narrow = keyboard_cell(Vec2::new(240.0, 400.0));
         assert!(15.0 * narrow + 10.0 <= 240.0);
-    }
-
-    #[test]
-    fn controller_columns_stay_inside_the_table() {
-        for width in [240.0_f32, 320.0, 480.0, 760.0, 1200.0] {
-            let columns = controller_columns(width);
-            let used = columns.label + columns.binding + columns.layers;
-            assert!(used <= width, "{width}: columns overflow the table");
-            assert!(
-                columns.binding >= 110.0,
-                "{width}: binding column collapsed"
-            );
-            assert!(columns.layers > 0.0 && columns.label > 0.0);
-        }
     }
 
     #[test]

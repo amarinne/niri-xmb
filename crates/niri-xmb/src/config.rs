@@ -116,113 +116,155 @@ impl Config {
     /// 60 seconds. Percent sizes use 0-100, while signed positions use
     /// -100-100. These limits prevent accidental large buffers and timers.
     pub fn validate(&self) -> Result<()> {
+        if let Some(error) = self.validate_all().into_iter().next() {
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
+
+    /// Every validation error, in the order [`Self::validate`] would report
+    /// them. Editors use this to flag each bad field in place instead of
+    /// surfacing only the first error at save time.
+    pub fn validate_all(&self) -> Vec<String> {
+        let mut errors = Vec::new();
         let mut bar_outputs = HashSet::new();
         for (index, bar) in self.bars.iter().enumerate() {
-            validate_output_name(&bar.output, &format!("bars[{index}].output"))?;
-            if !bar_outputs.insert(&bar.output) {
-                anyhow::bail!("bars[{index}].output duplicates output {:?}", bar.output);
+            collect(
+                &mut errors,
+                validate_output_name(&bar.output, &format!("bars[{index}].output")),
+            );
+            if !bar.output.is_empty() && !bar_outputs.insert(&bar.output) {
+                errors.push(format!(
+                    "bars[{index}].output duplicates output {:?}",
+                    bar.output
+                ));
             }
             let (max_width, max_height) = match bar.edge {
                 Edge::Top | Edge::Bottom => (8192, 512),
                 Edge::Left | Edge::Right => (512, 8192),
             };
-            validate_u32_range(&format!("bars[{index}].width"), bar.width, 1, max_width)?;
-            validate_u32_range(&format!("bars[{index}].height"), bar.height, 1, max_height)?;
-            validate_i32_range(
-                &format!("bars[{index}].margin"),
-                bar.margin,
-                0,
-                MAX_OFFSET as i32,
-            )?;
-            validate_i32_range(
-                &format!("bars[{index}].offset"),
-                bar.offset,
-                -(MAX_OFFSET as i32),
-                MAX_OFFSET as i32,
-            )?;
-            validate_u64_range(
-                &format!("bars[{index}].scroll_repeat_ms"),
-                bar.scroll_repeat_ms,
-                0,
-                5_000,
-            )?;
+            collect(
+                &mut errors,
+                validate_u32_range(&format!("bars[{index}].width"), bar.width, 1, max_width),
+            );
+            collect(
+                &mut errors,
+                validate_u32_range(&format!("bars[{index}].height"), bar.height, 1, max_height),
+            );
+            collect(
+                &mut errors,
+                validate_i32_range(
+                    &format!("bars[{index}].margin"),
+                    bar.margin,
+                    0,
+                    MAX_OFFSET as i32,
+                ),
+            );
+            collect(
+                &mut errors,
+                validate_i32_range(
+                    &format!("bars[{index}].offset"),
+                    bar.offset,
+                    -(MAX_OFFSET as i32),
+                    MAX_OFFSET as i32,
+                ),
+            );
+            collect(
+                &mut errors,
+                validate_u64_range(
+                    &format!("bars[{index}].scroll_repeat_ms"),
+                    bar.scroll_repeat_ms,
+                    0,
+                    5_000,
+                ),
+            );
         }
 
-        validate_length(
-            "popup.width",
-            self.popup.width,
-            1.0,
-            MAX_LOGICAL_DIMENSION,
-            0.1,
-            100.0,
-        )?;
-        validate_length(
-            "popup.height",
-            self.popup.height,
-            1.0,
-            MAX_LOGICAL_DIMENSION,
-            0.1,
-            100.0,
-        )?;
-        validate_length(
-            "popup.canvas_width",
-            self.popup.canvas_width,
-            1.0,
-            MAX_LOGICAL_DIMENSION,
-            0.1,
-            100.0,
-        )?;
-        validate_length(
-            "popup.canvas_height",
-            self.popup.canvas_height,
-            1.0,
-            MAX_LOGICAL_DIMENSION,
-            0.1,
-            100.0,
-        )?;
-        validate_length(
-            "popup.fixed_x",
-            self.popup.fixed_x,
-            -MAX_OFFSET,
-            MAX_OFFSET,
-            -100.0,
-            100.0,
-        )?;
-        validate_length(
-            "popup.fixed_y",
-            self.popup.fixed_y,
-            -MAX_OFFSET,
-            MAX_OFFSET,
-            -100.0,
-            100.0,
-        )?;
-        validate_u64_range(
-            "popup.follow_delay_ms",
-            self.popup.follow_delay_ms,
-            0,
-            MAX_DURATION_MS,
-        )?;
+        for result in [
+            validate_length(
+                "popup.width",
+                self.popup.width,
+                1.0,
+                MAX_LOGICAL_DIMENSION,
+                0.1,
+                100.0,
+            ),
+            validate_length(
+                "popup.height",
+                self.popup.height,
+                1.0,
+                MAX_LOGICAL_DIMENSION,
+                0.1,
+                100.0,
+            ),
+            validate_length(
+                "popup.canvas_width",
+                self.popup.canvas_width,
+                1.0,
+                MAX_LOGICAL_DIMENSION,
+                0.1,
+                100.0,
+            ),
+            validate_length(
+                "popup.canvas_height",
+                self.popup.canvas_height,
+                1.0,
+                MAX_LOGICAL_DIMENSION,
+                0.1,
+                100.0,
+            ),
+            validate_length(
+                "popup.fixed_x",
+                self.popup.fixed_x,
+                -MAX_OFFSET,
+                MAX_OFFSET,
+                -100.0,
+                100.0,
+            ),
+            validate_length(
+                "popup.fixed_y",
+                self.popup.fixed_y,
+                -MAX_OFFSET,
+                MAX_OFFSET,
+                -100.0,
+                100.0,
+            ),
+            validate_u64_range(
+                "popup.follow_delay_ms",
+                self.popup.follow_delay_ms,
+                0,
+                MAX_DURATION_MS,
+            ),
+        ] {
+            collect(&mut errors, result);
+        }
 
         let mut placement_outputs = HashSet::new();
         for (index, placement) in self.popup.placements.iter().enumerate() {
-            validate_output_name(
-                &placement.output,
-                &format!("popup.placements[{index}].output"),
-            )?;
-            if !placement_outputs.insert(&placement.output) {
-                anyhow::bail!(
+            collect(
+                &mut errors,
+                validate_output_name(
+                    &placement.output,
+                    &format!("popup.placements[{index}].output"),
+                ),
+            );
+            if !placement.output.is_empty() && !placement_outputs.insert(&placement.output) {
+                errors.push(format!(
                     "popup.placements[{index}].output duplicates output {:?}",
                     placement.output
-                );
+                ));
             }
-            validate_length(
-                &format!("popup.placements[{index}].margin"),
-                placement.margin,
-                0.0,
-                MAX_OFFSET,
-                0.0,
-                100.0,
-            )?;
+            collect(
+                &mut errors,
+                validate_length(
+                    &format!("popup.placements[{index}].margin"),
+                    placement.margin,
+                    0.0,
+                    MAX_OFFSET,
+                    0.0,
+                    100.0,
+                ),
+            );
         }
 
         for (field, value) in [
@@ -230,44 +272,51 @@ impl Config {
             ("peek.arm_grace_ms", self.peek.arm_grace_ms),
             ("peek.demote_ms", self.peek.demote_ms),
         ] {
-            validate_u64_range(field, value, 0, MAX_DURATION_MS)?;
+            collect(
+                &mut errors,
+                validate_u64_range(field, value, 0, MAX_DURATION_MS),
+            );
         }
-        validate_f32_range("animation.panel_ms", self.animation.panel_ms, 0.0, 60_000.0)?;
-        validate_f32_range(
-            "animation.emphasis_ms",
-            self.animation.emphasis_ms,
-            0.0,
-            60_000.0,
-        )?;
-        validate_f32_range(
-            "animation.scroll_ms",
-            self.animation.scroll_ms,
-            0.0,
-            60_000.0,
-        )?;
-        validate_f32_range("animation.open_scale", self.animation.open_scale, 0.1, 2.0)?;
-        validate_f64_range(
-            "behavior.drag_threshold",
-            self.behavior.drag_threshold,
-            0.0,
-            MAX_LOGICAL_DIMENSION as f64,
-        )?;
-        validate_f64_range(
-            "behavior.popup_grab_region",
-            self.behavior.popup_grab_region,
-            0.0,
-            MAX_LOGICAL_DIMENSION as f64,
-        )?;
-        self.gamepad.validate()?;
-        self.style.validate()?;
+        for result in [
+            validate_f32_range("animation.panel_ms", self.animation.panel_ms, 0.0, 60_000.0),
+            validate_f32_range(
+                "animation.emphasis_ms",
+                self.animation.emphasis_ms,
+                0.0,
+                60_000.0,
+            ),
+            validate_f32_range(
+                "animation.scroll_ms",
+                self.animation.scroll_ms,
+                0.0,
+                60_000.0,
+            ),
+            validate_f32_range("animation.open_scale", self.animation.open_scale, 0.1, 2.0),
+            validate_f64_range(
+                "behavior.drag_threshold",
+                self.behavior.drag_threshold,
+                0.0,
+                MAX_LOGICAL_DIMENSION as f64,
+            ),
+            validate_f64_range(
+                "behavior.popup_grab_region",
+                self.behavior.popup_grab_region,
+                0.0,
+                MAX_LOGICAL_DIMENSION as f64,
+            ),
+        ] {
+            collect(&mut errors, result);
+        }
+        errors.extend(self.gamepad.validate_all());
+        errors.extend(self.style.validate_all());
         if self
             .theme
             .as_ref()
             .is_some_and(|theme| theme.trim().is_empty())
         {
-            anyhow::bail!("theme must not be empty");
+            errors.push("theme must not be empty".to_string());
         }
-        Ok(())
+        errors
     }
 
     pub fn default_path() -> PathBuf {
@@ -361,6 +410,12 @@ fn validate_theme(theme: &toml::Value, path: &Path) -> Result<()> {
     parsed
         .validate()
         .with_context(|| format!("invalid theme {}", path.display()))
+}
+
+fn collect(errors: &mut Vec<String>, result: Result<()>) {
+    if let Err(error) = result {
+        errors.push(format!("{error:#}"));
+    }
 }
 
 fn validate_output_name(value: &str, field: &str) -> Result<()> {
@@ -807,6 +862,14 @@ impl Default for StyleConfig {
 
 impl StyleConfig {
     fn validate(&self) -> Result<()> {
+        if let Some(error) = self.validate_all().into_iter().next() {
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
+
+    fn validate_all(&self) -> Vec<String> {
+        let mut errors = Vec::new();
         for (field, value) in [
             ("style.urgent_ring_width", self.urgent_ring_width),
             ("style.urgent_ring_padding", self.urgent_ring_padding),
@@ -824,36 +887,43 @@ impl StyleConfig {
             ("style.shadow_spread", self.shadow_spread),
             ("style.empty_dot_radius", self.empty_dot_radius),
         ] {
-            validate_f32_range(field, value, 0.0, MAX_STYLE_LENGTH)?;
+            collect(
+                &mut errors,
+                validate_f32_range(field, value, 0.0, MAX_STYLE_LENGTH),
+            );
         }
-        validate_f32_range(
-            "style.shadow_offset",
-            self.shadow_offset,
-            -MAX_STYLE_LENGTH,
-            MAX_STYLE_LENGTH,
-        )?;
-        validate_f32_range("style.dim_alpha", self.dim_alpha, 0.0, 1.0)?;
-        validate_f32_range("style.urgent_glow_alpha", self.urgent_glow_alpha, 0.0, 1.0)?;
-        validate_f32_range(
-            "style.label_font_size",
-            self.label_font_size,
-            1.0,
-            MAX_FONT_SIZE,
-        )?;
-        validate_f32_range(
-            "style.title_font_size",
-            self.title_font_size,
-            1.0,
-            MAX_FONT_SIZE,
-        )?;
-        validate_u32_range("style.icon_size", self.icon_size, 1, MAX_ICON_SIZE)?;
-        validate_u32_range(
-            "style.icon_size_focused",
-            self.icon_size_focused,
-            1,
-            MAX_ICON_SIZE,
-        )?;
-        Ok(())
+        for result in [
+            validate_f32_range(
+                "style.shadow_offset",
+                self.shadow_offset,
+                -MAX_STYLE_LENGTH,
+                MAX_STYLE_LENGTH,
+            ),
+            validate_f32_range("style.dim_alpha", self.dim_alpha, 0.0, 1.0),
+            validate_f32_range("style.urgent_glow_alpha", self.urgent_glow_alpha, 0.0, 1.0),
+            validate_f32_range(
+                "style.label_font_size",
+                self.label_font_size,
+                1.0,
+                MAX_FONT_SIZE,
+            ),
+            validate_f32_range(
+                "style.title_font_size",
+                self.title_font_size,
+                1.0,
+                MAX_FONT_SIZE,
+            ),
+            validate_u32_range("style.icon_size", self.icon_size, 1, MAX_ICON_SIZE),
+            validate_u32_range(
+                "style.icon_size_focused",
+                self.icon_size_focused,
+                1,
+                MAX_ICON_SIZE,
+            ),
+        ] {
+            collect(&mut errors, result);
+        }
+        errors
     }
 }
 
@@ -1432,7 +1502,16 @@ fn default_navi_layers() -> BTreeMap<String, GamepadLayerConfig> {
 }
 
 impl GamepadConfig {
+    #[allow(dead_code)]
     pub fn validate(&self) -> Result<()> {
+        if let Some(error) = self.validate_all().into_iter().next() {
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
+
+    fn validate_all(&self) -> Vec<String> {
+        let mut errors = Vec::new();
         let navi_has_input = self.navi.pointer.enabled
             || !self.navi.bindings.is_empty()
             || !self.navi.layers.is_empty();
@@ -1442,34 +1521,53 @@ impl GamepadConfig {
             && self.open_combo.is_empty()
             && !navi_has_input
         {
-            anyhow::bail!(
+            errors.push(
                 "gamepad must define XMB buttons, an open combo, or navi input when gamepad.enabled is true and gamepad.preset is \"none\""
+                    .to_string(),
             );
         }
         for (index, device) in self.devices.iter().enumerate() {
             let device = device.trim();
             if device.is_empty() {
-                anyhow::bail!("gamepad.devices[{index}] must not be empty");
-            }
-            if !Path::new(device).is_absolute() {
-                anyhow::bail!("gamepad.devices[{index}] must be an absolute path: {device}");
+                errors.push(format!("gamepad.devices[{index}] must not be empty"));
+            } else if !Path::new(device).is_absolute() {
+                errors.push(format!(
+                    "gamepad.devices[{index}] must be an absolute path: {device}"
+                ));
             }
         }
         let mut codes = HashSet::new();
         for name in self.buttons.keys() {
-            let code =
-                gamepad_button_code(name).with_context(|| format!("gamepad.buttons.{name}"))?;
-            if !codes.insert(code) {
-                anyhow::bail!("gamepad.buttons contains duplicate code {code:#06x} via {name:?}");
+            match gamepad_button_code(name).with_context(|| format!("gamepad.buttons.{name}")) {
+                Ok(code) => {
+                    if !codes.insert(code) {
+                        errors.push(format!(
+                            "gamepad.buttons contains duplicate code {code:#06x} via {name:?}"
+                        ));
+                    }
+                }
+                Err(error) => errors.push(format!("{error:#}")),
             }
         }
-        let open_combo = self.open_combo_codes()?;
-        let mode_toggle = self.mode_toggle_codes()?;
+        let open_combo = match self.open_combo_codes() {
+            Ok(codes) => codes,
+            Err(error) => {
+                errors.push(format!("{error:#}"));
+                HashSet::new()
+            }
+        };
+        let mode_toggle = match self.mode_toggle_codes() {
+            Ok(codes) => codes,
+            Err(error) => {
+                errors.push(format!("{error:#}"));
+                HashSet::new()
+            }
+        };
         if !open_combo.is_empty() && open_combo == mode_toggle {
-            anyhow::bail!("gamepad.mode.toggle must differ from gamepad.open_combo");
+            errors.push("gamepad.mode.toggle must differ from gamepad.open_combo".to_string());
         }
-        self.navi.validate()?;
-        Ok(())
+        errors.extend(self.navi.validate_all());
+        errors
     }
 
     /// Parse and validate the simultaneous open-combo codes.
@@ -1498,7 +1596,16 @@ fn combo_codes(names: &[String], label: &str) -> Result<HashSet<u16>> {
 }
 
 impl GamepadNaviConfig {
+    #[allow(dead_code)]
     fn validate(&self) -> Result<()> {
+        if let Some(error) = self.validate_all().into_iter().next() {
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
+
+    fn validate_all(&self) -> Vec<String> {
+        let mut errors = Vec::new();
         let pointer = &self.pointer;
         for (name, value) in [
             ("deadzone", pointer.deadzone),
@@ -1506,11 +1613,15 @@ impl GamepadNaviConfig {
             ("trigger_threshold", pointer.trigger_threshold),
         ] {
             if !(0.0..=1.0).contains(&value) {
-                anyhow::bail!("gamepad.navi.pointer.{name} must be between 0.0 and 1.0");
+                errors.push(format!(
+                    "gamepad.navi.pointer.{name} must be between 0.0 and 1.0"
+                ));
             }
         }
         if !(0.0..=0.9).contains(&pointer.trigger_deadzone) {
-            anyhow::bail!("gamepad.navi.pointer.trigger_deadzone must be between 0.0 and 0.9");
+            errors.push(
+                "gamepad.navi.pointer.trigger_deadzone must be between 0.0 and 0.9".to_string(),
+            );
         }
         for (name, value) in [
             ("curve", pointer.curve),
@@ -1520,32 +1631,41 @@ impl GamepadNaviConfig {
             ("trigger_curve", pointer.trigger_curve),
         ] {
             if !value.is_finite() || value < 0.0 || (name == "curve" && value == 0.0) {
-                anyhow::bail!("gamepad.navi.pointer.{name} is invalid");
+                errors.push(format!("gamepad.navi.pointer.{name} is invalid"));
             }
         }
         if !(0.05..=5.0).contains(&pointer.trigger_curve) {
-            anyhow::bail!("gamepad.navi.pointer.trigger_curve must be between 0.05 and 5.0");
+            errors.push(
+                "gamepad.navi.pointer.trigger_curve must be between 0.05 and 5.0".to_string(),
+            );
         }
         if pointer.trigger_points.len() > 5 {
-            anyhow::bail!("gamepad.navi.pointer.trigger_points supports at most 5 interior points");
+            errors.push(
+                "gamepad.navi.pointer.trigger_points supports at most 5 interior points"
+                    .to_string(),
+            );
         }
         let mut previous_pull = pointer.trigger_deadzone;
         let mut previous_output = 0.0_f32;
         for (index, point) in pointer.trigger_points.iter().enumerate() {
             let label = format!("gamepad.navi.pointer.trigger_points[{index}]");
             if !point.pull.is_finite() || !point.output.is_finite() {
-                anyhow::bail!("{label} must be finite");
+                errors.push(format!("{label} must be finite"));
             }
             if point.pull <= pointer.trigger_deadzone || point.pull >= 1.0 {
-                anyhow::bail!(
+                errors.push(format!(
                     "{label}.pull must be greater than trigger_deadzone and less than 1.0"
-                );
+                ));
             }
             if point.pull - previous_pull < 0.10 {
-                anyhow::bail!("{label}.pull must be at least 0.10 after the previous point");
+                errors.push(format!(
+                    "{label}.pull must be at least 0.10 after the previous point"
+                ));
             }
             if !(0.0..=1.0).contains(&point.output) || point.output < previous_output {
-                anyhow::bail!("{label}.output must be non-decreasing and between 0.0 and 1.0");
+                errors.push(format!(
+                    "{label}.output must be non-decreasing and between 0.0 and 1.0"
+                ));
             }
             previous_pull = point.pull;
             previous_output = point.output;
@@ -1559,47 +1679,67 @@ impl GamepadNaviConfig {
                 || !(0.0..=1.0).contains(&accel.decel_floor)
                 || accel.decel_floor == 0.0
             {
-                anyhow::bail!("{label}.decel_floor must be greater than 0.0 and at most 1.0");
+                errors.push(format!(
+                    "{label}.decel_floor must be greater than 0.0 and at most 1.0"
+                ));
             }
             if !accel.boost_cap.is_finite() || !(1.0..=10.0).contains(&accel.boost_cap) {
-                anyhow::bail!("{label}.boost_cap must be between 1.0 and 10.0");
+                errors.push(format!("{label}.boost_cap must be between 1.0 and 10.0"));
             }
             if !accel.smoothing_ms.is_finite() || !(0.0..=500.0).contains(&accel.smoothing_ms) {
-                anyhow::bail!("{label}.smoothing_ms must be between 0 and 500");
+                errors.push(format!("{label}.smoothing_ms must be between 0 and 500"));
             }
         }
 
-        validate_navi_bindings(&self.bindings, "gamepad.navi.bindings")?;
+        collect(
+            &mut errors,
+            validate_navi_bindings(&self.bindings, "gamepad.navi.bindings"),
+        );
         for (name, layer) in &self.layers {
             let label = format!("gamepad.navi.layers.{name}");
             if layer.hold.is_empty() && layer.hold_axes.is_empty() {
-                anyhow::bail!("{label} must define hold or hold_axes");
+                errors.push(format!("{label} must define hold or hold_axes"));
             }
             let mut hold_codes = HashSet::new();
             for button in &layer.hold {
-                let code = gamepad_button_code(button)
-                    .with_context(|| format!("{label}.hold.{button}"))?;
-                if !hold_codes.insert(code) {
-                    anyhow::bail!("{label}.hold contains duplicate code {code:#06x}");
+                match gamepad_button_code(button).with_context(|| format!("{label}.hold.{button}"))
+                {
+                    Ok(code) => {
+                        if !hold_codes.insert(code) {
+                            errors
+                                .push(format!("{label}.hold contains duplicate code {code:#06x}"));
+                        }
+                    }
+                    Err(error) => errors.push(format!("{error:#}")),
                 }
             }
             let mut axis_codes = HashSet::new();
             for axis in &layer.hold_axes {
-                let code = gamepad_axis_code(&axis.axis)
-                    .with_context(|| format!("{label}.hold_axes.{}", axis.axis))?;
-                if !axis_codes.insert(code) {
-                    anyhow::bail!("{label}.hold_axes contains duplicate axis {code:#06x}");
+                match gamepad_axis_code(&axis.axis)
+                    .with_context(|| format!("{label}.hold_axes.{}", axis.axis))
+                {
+                    Ok(code) => {
+                        if !axis_codes.insert(code) {
+                            errors.push(format!(
+                                "{label}.hold_axes contains duplicate axis {code:#06x}"
+                            ));
+                        }
+                    }
+                    Err(error) => errors.push(format!("{error:#}")),
                 }
                 if !(0.0..=1.0).contains(&axis.threshold) {
-                    anyhow::bail!(
+                    errors.push(format!(
                         "{label}.hold_axes.{}.threshold must be 0.0..=1.0",
                         axis.axis
-                    );
+                    ));
                 }
             }
-            validate_navi_bindings(&layer.bindings, &format!("{label}.bindings"))?;
+            collect(
+                &mut errors,
+                validate_navi_bindings(&layer.bindings, &format!("{label}.bindings")),
+            );
         }
-        Ok(())
+        errors
     }
 }
 
@@ -1831,6 +1971,57 @@ mod tests {
         .unwrap();
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("bars[0].width"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn validate_all_collects_every_error_and_validate_reports_the_first() {
+        let config = Config {
+            bars: vec![
+                BarConfig {
+                    output: String::new(),
+                    width: 9000,
+                    ..BarConfig::default()
+                },
+                BarConfig {
+                    output: "eDP-1".to_string(),
+                    ..BarConfig::default()
+                },
+                BarConfig {
+                    output: "eDP-1".to_string(),
+                    ..BarConfig::default()
+                },
+            ],
+            animation: AnimationConfig {
+                open_scale: 0.0,
+                ..AnimationConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let errors = config.validate_all();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("bars[0].output must be a nonempty output name")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|error| error.contains("bars[0].width")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("bars[2].output duplicates")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("animation.open_scale")),
+            "{errors:?}"
+        );
+        assert_eq!(config.validate().unwrap_err().to_string(), errors[0]);
     }
 
     #[test]

@@ -291,7 +291,8 @@ fn split_hotkey(hotkey: &str) -> (Vec<String>, String) {
 
 fn canonical_modifier(modifier: &str) -> String {
     match modifier.to_ascii_lowercase().as_str() {
-        "mod" => "Mod",
+        // Niri's Mod alias is the Super (Mod4) modifier on this keymap.
+        "mod" => "Super",
         "ctrl" | "control" => "Ctrl",
         "shift" => "Shift",
         "alt" => "Alt",
@@ -634,7 +635,7 @@ binds {
         assert_eq!(keymap.binds.len(), 2);
         let first = &keymap.binds[0];
         assert_eq!(first.hotkey, "Mod+Shift+Q");
-        assert_eq!(first.modifiers, vec!["Mod", "Shift"]);
+        assert_eq!(first.modifiers, vec!["Super", "Shift"]);
         assert_eq!(first.trigger, "q");
         assert_eq!(first.key_id, Some("q"));
         assert_eq!(first.action, "close-window");
@@ -741,7 +742,7 @@ binds {
     #[test]
     fn splits_modifiers_case_insensitively() {
         let (modifiers, trigger) = split_hotkey("mod+SHIFT+Left");
-        assert_eq!(modifiers, vec!["Mod", "Shift"]);
+        assert_eq!(modifiers, vec!["Super", "Shift"]);
         assert_eq!(trigger, "left");
     }
 }
