@@ -40,9 +40,8 @@ use std::time::{Duration, Instant};
 const DEFAULT_CONFIG: &str = "~/.config/niri-xmb/config.toml";
 const XBOX_IMAGE: &[u8] = include_bytes!("../../../assets/controller-render.png");
 const DS4_IMAGE: &[u8] = include_bytes!("../../../assets/dualshock4-render.png");
-const XBOX_ASPECT: f32 = 861.0 / 1280.0;
-const DS4_ASPECT: f32 = 750.0 / 1387.0;
-const DS4_BACKDROP: Color32 = Color32::from_rgb(226, 229, 234);
+const XBOX_ASPECT: f32 = 403.0 / 441.0;
+const DS4_ASPECT: f32 = 403.0 / 441.0;
 
 const BG: Color32 = Color32::from_rgb(16, 18, 22);
 const PANEL: Color32 = Color32::from_rgb(20, 23, 28);
@@ -167,6 +166,16 @@ const GEOMETRY_FIELDS: &[(&str, &str, f64, f64, f64)] = &[
     ),
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HotspotShape {
+    Circle,
+    Rect { corner_radius: f32 },
+    DpadUp,
+    DpadDown,
+    DpadLeft,
+    DpadRight,
+}
+
 struct Hotspot {
     control: &'static str,
     code: Option<&'static str>,
@@ -174,149 +183,195 @@ struct Hotspot {
     y: f32,
     w: f32,
     h: f32,
-    circle: bool,
+    shape: HotspotShape,
     label: bool,
+}
+
+impl Hotspot {
+    fn is_pressed(&self, live: &GamepadLiveView) -> bool {
+        match self.control {
+            "LT" | "L2" => live.trigger("ABS_Z", "BTN_TL2") > 0.05,
+            "RT" | "R2" => live.trigger("ABS_RZ", "BTN_TR2") > 0.05,
+            "L STICK" | "L3" => live.button("BTN_THUMBL"),
+            "R STICK" | "R3" => live.button("BTN_THUMBR"),
+            "D-pad up" | "D-pad Up" => live.dpad("up"),
+            "D-pad down" | "D-pad Down" => live.dpad("down"),
+            "D-pad left" | "D-pad Left" => live.dpad("left"),
+            "D-pad right" | "D-pad Right" => live.dpad("right"),
+            _ => self.code.is_some_and(|code| live.button(code)),
+        }
+    }
 }
 
 const XBOX_HOTSPOTS: &[Hotspot] = &[
     Hotspot {
         control: "LT",
         code: None,
-        x: 0.248,
-        y: 0.139,
-        w: 0.067,
-        h: 0.081,
-        circle: false,
+        x: 0.3141,
+        y: 0.0583,
+        w: 0.0680,
+        h: 0.0998,
+        shape: HotspotShape::Rect { corner_radius: 6.0 },
         label: false,
     },
     Hotspot {
         control: "RT",
         code: None,
-        x: 0.752,
-        y: 0.139,
-        w: 0.067,
-        h: 0.081,
-        circle: false,
+        x: 0.6882,
+        y: 0.0583,
+        w: 0.0680,
+        h: 0.0998,
+        shape: HotspotShape::Rect { corner_radius: 6.0 },
         label: false,
     },
     Hotspot {
         control: "LB",
         code: Some("BTN_TL"),
-        x: 0.222,
-        y: 0.238,
-        w: 0.164,
-        h: 0.067,
-        circle: false,
+        x: 0.2993,
+        y: 0.1712,
+        w: 0.0975,
+        h: 0.0385,
+        shape: HotspotShape::Rect { corner_radius: 7.0 },
         label: false,
     },
     Hotspot {
         control: "RB",
         code: Some("BTN_TR"),
-        x: 0.773,
-        y: 0.238,
-        w: 0.164,
-        h: 0.067,
-        circle: false,
+        x: 0.7029,
+        y: 0.1712,
+        w: 0.0975,
+        h: 0.0385,
+        shape: HotspotShape::Rect { corner_radius: 7.0 },
         label: false,
     },
     Hotspot {
         control: "L STICK",
         code: None,
-        x: 0.223,
-        y: 0.52,
-        w: 0.13,
-        h: 0.134,
-        circle: true,
-        label: true,
-    },
-    Hotspot {
-        control: "D-PAD",
-        code: None,
-        x: 0.356,
-        y: 0.705,
-        w: 0.145,
-        h: 0.125,
-        circle: false,
+        x: 0.2562,
+        y: 0.3970,
+        w: 0.1315,
+        h: 0.1315,
+        shape: HotspotShape::Circle,
         label: true,
     },
     Hotspot {
         control: "R STICK",
         code: None,
-        x: 0.627,
-        y: 0.715,
-        w: 0.127,
-        h: 0.128,
-        circle: true,
+        x: 0.6304,
+        y: 0.5906,
+        w: 0.1315,
+        h: 0.1315,
+        shape: HotspotShape::Circle,
+        label: true,
+    },
+    Hotspot {
+        control: "D-pad up",
+        code: Some("BTN_DPAD_UP"),
+        x: 0.3764,
+        y: 0.5459,
+        w: 0.0635,
+        h: 0.0499,
+        shape: HotspotShape::DpadUp,
+        label: true,
+    },
+    Hotspot {
+        control: "D-pad down",
+        code: Some("BTN_DPAD_DOWN"),
+        x: 0.3764,
+        y: 0.6352,
+        w: 0.0635,
+        h: 0.0499,
+        shape: HotspotShape::DpadDown,
+        label: true,
+    },
+    Hotspot {
+        control: "D-pad left",
+        code: Some("BTN_DPAD_LEFT"),
+        x: 0.3356,
+        y: 0.5906,
+        w: 0.0499,
+        h: 0.0635,
+        shape: HotspotShape::DpadLeft,
+        label: true,
+    },
+    Hotspot {
+        control: "D-pad right",
+        code: Some("BTN_DPAD_RIGHT"),
+        x: 0.4172,
+        y: 0.5906,
+        w: 0.0499,
+        h: 0.0635,
+        shape: HotspotShape::DpadRight,
         label: true,
     },
     Hotspot {
         control: "Y",
         code: Some("BTN_NORTH"),
-        x: 0.779,
-        y: 0.409,
-        w: 0.075,
-        h: 0.075,
-        circle: true,
+        x: 0.7460,
+        y: 0.3424,
+        w: 0.0590,
+        h: 0.0590,
+        shape: HotspotShape::Circle,
         label: false,
     },
     Hotspot {
         control: "X",
         code: Some("BTN_WEST"),
-        x: 0.701,
-        y: 0.501,
-        w: 0.075,
-        h: 0.075,
-        circle: true,
+        x: 0.6961,
+        y: 0.3970,
+        w: 0.0590,
+        h: 0.0590,
+        shape: HotspotShape::Circle,
         label: false,
     },
     Hotspot {
         control: "B",
         code: Some("BTN_EAST"),
-        x: 0.847,
-        y: 0.489,
-        w: 0.072,
-        h: 0.075,
-        circle: true,
+        x: 0.7959,
+        y: 0.3970,
+        w: 0.0590,
+        h: 0.0590,
+        shape: HotspotShape::Circle,
         label: false,
     },
     Hotspot {
         control: "A",
         code: Some("BTN_SOUTH"),
-        x: 0.776,
-        y: 0.59,
-        w: 0.075,
-        h: 0.075,
-        circle: true,
+        x: 0.7460,
+        y: 0.4516,
+        w: 0.0590,
+        h: 0.0590,
+        shape: HotspotShape::Circle,
         label: false,
     },
     Hotspot {
         control: "SELECT",
         code: Some("BTN_SELECT"),
-        x: 0.399,
-        y: 0.497,
-        w: 0.047,
-        h: 0.047,
-        circle: true,
+        x: 0.4195,
+        y: 0.4020,
+        w: 0.0454,
+        h: 0.0454,
+        shape: HotspotShape::Circle,
         label: false,
     },
     Hotspot {
         control: "START",
         code: Some("BTN_START"),
-        x: 0.598,
-        y: 0.497,
-        w: 0.047,
-        h: 0.047,
-        circle: true,
+        x: 0.5873,
+        y: 0.4020,
+        w: 0.0454,
+        h: 0.0454,
+        shape: HotspotShape::Circle,
         label: false,
     },
     Hotspot {
         control: "GUIDE",
         code: Some("BTN_MODE"),
-        x: 0.499,
-        y: 0.489,
-        w: 0.095,
-        h: 0.095,
-        circle: true,
+        x: 0.5000,
+        y: 0.4020,
+        w: 0.0726,
+        h: 0.0726,
+        shape: HotspotShape::Circle,
         label: false,
     },
 ];
@@ -325,151 +380,181 @@ const DS4_HOTSPOTS: &[Hotspot] = &[
     Hotspot {
         control: "Touchpad",
         code: None,
-        x: 0.499,
-        y: 0.344,
-        w: 0.324,
-        h: 0.223,
-        circle: false,
+        x: 0.5000,
+        y: 0.3127,
+        w: 0.2426,
+        h: 0.1315,
+        shape: HotspotShape::Rect { corner_radius: 6.0 },
         label: false,
     },
     Hotspot {
         control: "L2",
         code: Some("BTN_TL2"),
-        x: 0.196,
-        y: 0.060,
-        w: 0.13,
-        h: 0.072,
-        circle: false,
+        x: 0.3141,
+        y: 0.0583,
+        w: 0.0680,
+        h: 0.0998,
+        shape: HotspotShape::Rect { corner_radius: 6.0 },
         label: false,
     },
     Hotspot {
         control: "R2",
         code: Some("BTN_TR2"),
-        x: 0.803,
-        y: 0.060,
-        w: 0.13,
-        h: 0.072,
-        circle: false,
+        x: 0.6882,
+        y: 0.0583,
+        w: 0.0680,
+        h: 0.0998,
+        shape: HotspotShape::Rect { corner_radius: 6.0 },
         label: false,
     },
     Hotspot {
         control: "L1",
         code: Some("BTN_TL"),
-        x: 0.196,
-        y: 0.127,
-        w: 0.137,
-        h: 0.061,
-        circle: false,
+        x: 0.2993,
+        y: 0.1712,
+        w: 0.0975,
+        h: 0.0385,
+        shape: HotspotShape::Rect { corner_radius: 7.0 },
         label: false,
     },
     Hotspot {
         control: "R1",
         code: Some("BTN_TR"),
-        x: 0.803,
-        y: 0.127,
-        w: 0.137,
-        h: 0.061,
-        circle: false,
+        x: 0.7029,
+        y: 0.1712,
+        w: 0.0975,
+        h: 0.0385,
+        shape: HotspotShape::Rect { corner_radius: 7.0 },
         label: false,
     },
     Hotspot {
         control: "Triangle",
         code: Some("BTN_NORTH"),
-        x: 0.803,
-        y: 0.392,
-        w: 0.066,
-        h: 0.066,
-        circle: true,
+        x: 0.7460,
+        y: 0.3424,
+        w: 0.0590,
+        h: 0.0590,
+        shape: HotspotShape::Circle,
         label: false,
     },
     Hotspot {
         control: "Circle",
         code: Some("BTN_EAST"),
-        x: 0.874,
-        y: 0.508,
-        w: 0.066,
-        h: 0.066,
-        circle: true,
+        x: 0.7959,
+        y: 0.3970,
+        w: 0.0590,
+        h: 0.0590,
+        shape: HotspotShape::Circle,
         label: false,
     },
     Hotspot {
         control: "Cross",
         code: Some("BTN_SOUTH"),
-        x: 0.803,
-        y: 0.621,
-        w: 0.066,
-        h: 0.066,
-        circle: true,
+        x: 0.7460,
+        y: 0.4516,
+        w: 0.0590,
+        h: 0.0590,
+        shape: HotspotShape::Circle,
         label: false,
     },
     Hotspot {
         control: "Square",
         code: Some("BTN_WEST"),
-        x: 0.732,
-        y: 0.508,
-        w: 0.066,
-        h: 0.066,
-        circle: true,
+        x: 0.6961,
+        y: 0.3970,
+        w: 0.0590,
+        h: 0.0590,
+        shape: HotspotShape::Circle,
         label: false,
     },
     Hotspot {
-        control: "D-PAD",
-        code: None,
-        x: 0.196,
-        y: 0.500,
-        w: 0.188,
-        h: 0.188,
-        circle: false,
+        control: "D-pad up",
+        code: Some("BTN_DPAD_UP"),
+        x: 0.2562,
+        y: 0.3524,
+        w: 0.0635,
+        h: 0.0499,
+        shape: HotspotShape::DpadUp,
+        label: true,
+    },
+    Hotspot {
+        control: "D-pad down",
+        code: Some("BTN_DPAD_DOWN"),
+        x: 0.2562,
+        y: 0.4417,
+        w: 0.0635,
+        h: 0.0499,
+        shape: HotspotShape::DpadDown,
+        label: true,
+    },
+    Hotspot {
+        control: "D-pad left",
+        code: Some("BTN_DPAD_LEFT"),
+        x: 0.2154,
+        y: 0.3970,
+        w: 0.0499,
+        h: 0.0635,
+        shape: HotspotShape::DpadLeft,
+        label: true,
+    },
+    Hotspot {
+        control: "D-pad right",
+        code: Some("BTN_DPAD_RIGHT"),
+        x: 0.2971,
+        y: 0.3970,
+        w: 0.0499,
+        h: 0.0635,
+        shape: HotspotShape::DpadRight,
         label: true,
     },
     Hotspot {
         control: "L3",
         code: Some("BTN_THUMBL"),
-        x: 0.349,
-        y: 0.773,
-        w: 0.106,
-        h: 0.106,
-        circle: true,
-        label: false,
+        x: 0.3764,
+        y: 0.5906,
+        w: 0.1315,
+        h: 0.1315,
+        shape: HotspotShape::Circle,
+        label: true,
     },
     Hotspot {
         control: "R3",
         code: Some("BTN_THUMBR"),
-        x: 0.654,
-        y: 0.773,
-        w: 0.106,
-        h: 0.106,
-        circle: true,
-        label: false,
+        x: 0.6304,
+        y: 0.5906,
+        w: 0.1315,
+        h: 0.1315,
+        shape: HotspotShape::Circle,
+        label: true,
     },
     Hotspot {
         control: "Share",
         code: Some("BTN_SELECT"),
-        x: 0.312,
-        y: 0.341,
-        w: 0.033,
-        h: 0.059,
-        circle: false,
+        x: 0.3560,
+        y: 0.2903,
+        w: 0.0317,
+        h: 0.0544,
+        shape: HotspotShape::Rect { corner_radius: 4.0 },
         label: false,
     },
     Hotspot {
         control: "Options",
         code: Some("BTN_START"),
-        x: 0.700,
-        y: 0.341,
-        w: 0.033,
-        h: 0.059,
-        circle: false,
+        x: 0.6440,
+        y: 0.2903,
+        w: 0.0317,
+        h: 0.0544,
+        shape: HotspotShape::Rect { corner_radius: 4.0 },
         label: false,
     },
     Hotspot {
         control: "PS",
         code: Some("BTN_MODE"),
-        x: 0.502,
-        y: 0.692,
-        w: 0.055,
-        h: 0.055,
-        circle: true,
+        x: 0.5000,
+        y: 0.5906,
+        w: 0.0635,
+        h: 0.0635,
+        shape: HotspotShape::Circle,
         label: false,
     },
 ];
@@ -517,10 +602,7 @@ impl Template {
     }
 
     fn backdrop(self) -> Option<Color32> {
-        match self {
-            Self::Xbox => None,
-            Self::Ds4 => Some(DS4_BACKDROP),
-        }
+        None
     }
 
     fn default_control(self) -> &'static str {
@@ -558,7 +640,11 @@ impl Template {
             (Self::Ds4, "GUIDE") => Some("PS"),
             (Self::Ds4, "L STICK") => Some("L3"),
             (Self::Ds4, "R STICK") => Some("R3"),
-            (_, "D-PAD") => Some("D-PAD"),
+            (_, "D-PAD") => Some("D-pad up"),
+            (_, "D-pad up" | "D-pad Up") => Some("D-pad up"),
+            (_, "D-pad down" | "D-pad Down") => Some("D-pad down"),
+            (_, "D-pad left" | "D-pad Left") => Some("D-pad left"),
+            (_, "D-pad right" | "D-pad Right") => Some("D-pad right"),
             _ => None,
         }
     }
@@ -1923,10 +2009,43 @@ impl StudioApp {
         }
     }
 
+    fn dpad_polygon(center: Pos2, hit: Rect, shape: HotspotShape) -> Option<Vec<Pos2>> {
+        let hw = hit.width() * 0.5;
+        let hh = hit.height() * 0.5;
+        let pts = match shape {
+            HotspotShape::DpadUp => vec![
+                Pos2::new(center.x - hw * 0.7, center.y - hh),
+                Pos2::new(center.x + hw * 0.7, center.y - hh),
+                Pos2::new(center.x + hw, center.y + hh),
+                Pos2::new(center.x - hw, center.y + hh),
+            ],
+            HotspotShape::DpadDown => vec![
+                Pos2::new(center.x - hw, center.y - hh),
+                Pos2::new(center.x + hw, center.y - hh),
+                Pos2::new(center.x + hw * 0.7, center.y + hh),
+                Pos2::new(center.x - hw * 0.7, center.y + hh),
+            ],
+            HotspotShape::DpadLeft => vec![
+                Pos2::new(center.x - hw, center.y - hh * 0.7),
+                Pos2::new(center.x + hw, center.y - hh),
+                Pos2::new(center.x + hw, center.y + hh),
+                Pos2::new(center.x - hw, center.y + hh * 0.7),
+            ],
+            HotspotShape::DpadRight => vec![
+                Pos2::new(center.x - hw, center.y - hh),
+                Pos2::new(center.x + hw, center.y - hh * 0.7),
+                Pos2::new(center.x + hw, center.y + hh * 0.7),
+                Pos2::new(center.x - hw, center.y + hh),
+            ],
+            _ => return None,
+        };
+        Some(pts)
+    }
+
     fn controller_map_body(&mut self, ui: &mut Ui, live: &GamepadLiveView) {
         let template = self.template;
         let width = ui.available_width().min(560.0);
-        let height = (width * 0.56).clamp(210.0, 330.0);
+        let height = (width * 0.72).clamp(220.0, 340.0);
         let (box_rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
         if let Some(backdrop) = template.backdrop() {
             ui.painter().rect_filled(box_rect, 10.0, backdrop);
@@ -1979,41 +2098,96 @@ impl StudioApp {
             } else {
                 Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(116, 162, 255, 110))
             };
-            if selected {
-                ui.painter().rect_filled(
-                    hit,
-                    7.0,
-                    Color32::from_rgba_unmultiplied(116, 162, 255, 30),
-                );
-            }
-            if self.hotspot_pressed(hotspot, live) {
-                let color = Color32::from_rgba_unmultiplied(116, 162, 255, 72);
-                if hotspot.circle {
+            let is_pressed = self.hotspot_pressed(hotspot, live);
+
+            match hotspot.shape {
+                HotspotShape::Circle => {
+                    let r = hit.width().min(hit.height()) / 2.0;
+                    if selected {
+                        ui.painter().circle_filled(
+                            center,
+                            r,
+                            Color32::from_rgba_unmultiplied(116, 162, 255, 30),
+                        );
+                    }
+                    if is_pressed {
+                        ui.painter().circle_filled(
+                            center,
+                            r,
+                            Color32::from_rgba_unmultiplied(116, 162, 255, 72),
+                        );
+                        ui.painter()
+                            .circle_stroke(center, r, Stroke::new(1.8_f32, Color32::WHITE));
+                    }
+                    ui.painter().circle_stroke(center, r, stroke);
+                }
+                HotspotShape::Rect { corner_radius } => {
+                    if selected {
+                        ui.painter().rect_filled(
+                            hit,
+                            corner_radius,
+                            Color32::from_rgba_unmultiplied(116, 162, 255, 30),
+                        );
+                    }
+                    if is_pressed {
+                        ui.painter().rect_filled(
+                            hit,
+                            corner_radius,
+                            Color32::from_rgba_unmultiplied(116, 162, 255, 72),
+                        );
+                        ui.painter().rect_stroke(
+                            hit,
+                            corner_radius,
+                            Stroke::new(1.8_f32, Color32::WHITE),
+                            StrokeKind::Inside,
+                        );
+                    }
                     ui.painter()
-                        .circle_filled(center, hit.width().min(hit.height()) / 2.0, color);
-                    ui.painter().circle_stroke(
-                        center,
-                        hit.width().min(hit.height()) / 2.0,
-                        Stroke::new(1.8_f32, Color32::WHITE),
-                    );
-                } else {
-                    ui.painter().rect_filled(hit, 7.0, color);
-                    ui.painter().rect_stroke(
-                        hit,
-                        7.0,
-                        Stroke::new(1.8_f32, Color32::WHITE),
-                        StrokeKind::Inside,
-                    );
+                        .rect_stroke(hit, corner_radius, stroke, StrokeKind::Inside);
+                }
+                HotspotShape::DpadUp
+                | HotspotShape::DpadDown
+                | HotspotShape::DpadLeft
+                | HotspotShape::DpadRight => {
+                    if let Some(pts) = Self::dpad_polygon(center, hit, hotspot.shape) {
+                        let fill = if is_pressed {
+                            Color32::from_rgba_unmultiplied(116, 162, 255, 72)
+                        } else if selected {
+                            Color32::from_rgba_unmultiplied(116, 162, 255, 30)
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let shape_stroke = if is_pressed {
+                            Stroke::new(1.8_f32, Color32::WHITE)
+                        } else {
+                            stroke
+                        };
+                        ui.painter()
+                            .add(egui::Shape::convex_polygon(pts, fill, shape_stroke));
+                    }
                 }
             }
-            if hotspot.circle {
-                ui.painter()
-                    .circle_stroke(center, hit.width().min(hit.height()) / 2.0, stroke);
-            } else {
-                ui.painter()
-                    .rect_stroke(hit, 6.0, stroke, StrokeKind::Inside);
-            }
-            if hotspot.label {
+
+            let dpad_arrow = match hotspot.shape {
+                HotspotShape::DpadUp => Some("▲"),
+                HotspotShape::DpadDown => Some("▼"),
+                HotspotShape::DpadLeft => Some("◀"),
+                HotspotShape::DpadRight => Some("▶"),
+                _ => None,
+            };
+            if let Some(arrow) = dpad_arrow {
+                ui.painter().text(
+                    center,
+                    Align2::CENTER_CENTER,
+                    arrow,
+                    FontId::monospace((label_size * 1.1).clamp(8.0, 11.0)),
+                    if selected || is_pressed {
+                        Color32::WHITE
+                    } else {
+                        Color32::from_rgb(193, 215, 238)
+                    },
+                );
+            } else if hotspot.label {
                 let pos = Pos2::new(center.x, hit.max.y + 3.0);
                 let font = FontId::monospace(label_size);
                 ui.painter().text(
@@ -2038,16 +2212,7 @@ impl StudioApp {
     }
 
     fn hotspot_pressed(&self, hotspot: &Hotspot, live: &GamepadLiveView) -> bool {
-        match hotspot.control {
-            "LT" | "L2" => live.trigger("ABS_Z", "BTN_TL2") > 0.05,
-            "RT" | "R2" => live.trigger("ABS_RZ", "BTN_TR2") > 0.05,
-            "L STICK" | "L3" => live.button("BTN_THUMBL"),
-            "R STICK" | "R3" => live.button("BTN_THUMBR"),
-            "D-PAD" => ["up", "down", "left", "right"]
-                .iter()
-                .any(|direction| live.dpad(direction)),
-            _ => hotspot.code.is_some_and(|code| live.button(code)),
-        }
+        hotspot.is_pressed(live)
     }
 
     fn switch_template(&mut self, template: Template) {
@@ -6791,7 +6956,10 @@ fn control_hint(template: Template, control: &str) -> Option<&'static str> {
         "LT" | "RT" | "L2" | "R2" => {
             Some("Curves and pedals are under Trigger response and Trigger settings.")
         }
-        "D-PAD" => Some("D-pad actions resolve through the active layer or XMB."),
+        "D-PAD" | "D-pad up" | "D-pad down" | "D-pad left" | "D-pad right" | "D-pad Up"
+        | "D-pad Down" | "D-pad Left" | "D-pad Right" => {
+            Some("D-pad actions resolve through the active layer or XMB.")
+        }
         "Touchpad" if template == Template::Ds4 => Some("Touchpad has no gamepad binding."),
         _ => None,
     }
@@ -8081,6 +8249,10 @@ unknown_gamepad_field = 7
             ("PS", "BTN_MODE"),
             ("L3", "BTN_THUMBL"),
             ("R3", "BTN_THUMBR"),
+            ("D-pad up", "BTN_DPAD_UP"),
+            ("D-pad down", "BTN_DPAD_DOWN"),
+            ("D-pad left", "BTN_DPAD_LEFT"),
+            ("D-pad right", "BTN_DPAD_RIGHT"),
         ] {
             let hotspot = hotspots
                 .iter()
@@ -8096,6 +8268,32 @@ unknown_gamepad_field = 7
     }
 
     #[test]
+    fn xbox_hotspots_map_linux_button_codes_and_separate_dpad() {
+        let hotspots = Template::Xbox.hotspots();
+        for (control, code) in [
+            ("A", "BTN_SOUTH"),
+            ("B", "BTN_EAST"),
+            ("X", "BTN_WEST"),
+            ("Y", "BTN_NORTH"),
+            ("LB", "BTN_TL"),
+            ("RB", "BTN_TR"),
+            ("SELECT", "BTN_SELECT"),
+            ("START", "BTN_START"),
+            ("GUIDE", "BTN_MODE"),
+            ("D-pad up", "BTN_DPAD_UP"),
+            ("D-pad down", "BTN_DPAD_DOWN"),
+            ("D-pad left", "BTN_DPAD_LEFT"),
+            ("D-pad right", "BTN_DPAD_RIGHT"),
+        ] {
+            let hotspot = hotspots
+                .iter()
+                .find(|hotspot| hotspot.control == control)
+                .unwrap_or_else(|| panic!("missing {control}"));
+            assert_eq!(hotspot.code, Some(code), "{control}");
+        }
+    }
+
+    #[test]
     fn template_switch_maps_equivalent_controls() {
         assert_eq!(Template::Xbox.default_control(), "A");
         assert_eq!(Template::Ds4.default_control(), "Cross");
@@ -8103,7 +8301,75 @@ unknown_gamepad_field = 7
         assert_eq!(Template::Xbox.counterpart("L3"), Some("L STICK"));
         assert_eq!(Template::Ds4.counterpart("A"), Some("Cross"));
         assert_eq!(Template::Ds4.counterpart("L STICK"), Some("L3"));
-        assert_eq!(Template::Ds4.counterpart("D-PAD"), Some("D-PAD"));
+        assert_eq!(Template::Ds4.counterpart("D-pad up"), Some("D-pad up"));
+        assert_eq!(Template::Xbox.counterpart("D-pad down"), Some("D-pad down"));
+        assert_eq!(Template::Ds4.counterpart("D-pad left"), Some("D-pad left"));
+        assert_eq!(
+            Template::Xbox.counterpart("D-pad right"),
+            Some("D-pad right")
+        );
+    }
+
+    #[test]
+    fn vector_assets_and_dpad_hotspot_coverage() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let xbox_svg = fs::read_to_string(manifest_dir.join("../../assets/controller-xbox.svg"))
+            .expect("controller-xbox.svg missing");
+        let ds4_svg = fs::read_to_string(manifest_dir.join("../../assets/controller-ds4.svg"))
+            .expect("controller-ds4.svg missing");
+
+        for id in ["dpad-up", "dpad-down", "dpad-left", "dpad-right"] {
+            assert!(xbox_svg.contains(id), "xbox svg missing {id}");
+            assert!(ds4_svg.contains(id), "ds4 svg missing {id}");
+        }
+
+        for template in [Template::Xbox, Template::Ds4] {
+            let hotspots = template.hotspots();
+            let dpad_directions = ["D-pad up", "D-pad down", "D-pad left", "D-pad right"];
+            for dir in dpad_directions {
+                let hs = hotspots
+                    .iter()
+                    .find(|h| h.control == dir)
+                    .unwrap_or_else(|| panic!("{:?} missing {}", template.label(), dir));
+                assert!(
+                    hs.code.is_some(),
+                    "dpad hotspot {dir} must have a button code"
+                );
+                assert!(
+                    hs.w > 0.02 && hs.h > 0.02,
+                    "dpad hotspot {dir} must have non-zero size"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dpad_live_view_highlights_individual_directions() {
+        let mut live = GamepadLiveView::default();
+        let up_hs = Template::Xbox
+            .hotspots()
+            .iter()
+            .find(|h| h.control == "D-pad up")
+            .unwrap();
+        let down_hs = Template::Xbox
+            .hotspots()
+            .iter()
+            .find(|h| h.control == "D-pad down")
+            .unwrap();
+
+        assert!(!up_hs.is_pressed(&live));
+        assert!(!down_hs.is_pressed(&live));
+
+        // Button press
+        live.buttons.insert("BTN_DPAD_UP".to_string());
+        assert!(up_hs.is_pressed(&live));
+        assert!(!down_hs.is_pressed(&live));
+
+        // Hat axis press
+        live.buttons.clear();
+        live.axes.insert("ABS_HAT0Y".to_string(), 1.0); // down
+        assert!(!up_hs.is_pressed(&live));
+        assert!(down_hs.is_pressed(&live));
     }
 
     #[test]
