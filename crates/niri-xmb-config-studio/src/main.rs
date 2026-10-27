@@ -1911,7 +1911,7 @@ impl StudioApp {
             self.save(true);
         }
         if tt(
-            ui.add_enabled(dirty, egui::Button::new("Save & Restart / Apply")),
+            ui.add_enabled(dirty, egui::Button::new("Save")),
             "ui.action.save_restart",
         )
         .clicked()
