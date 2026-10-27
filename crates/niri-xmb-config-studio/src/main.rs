@@ -2110,9 +2110,8 @@ impl StudioApp {
         section_card(ui, "Layers", |ui| self.layers_ui(ui));
     }
 
-    /// One controller surface: the live tester and binding editor share one
-    /// visual hierarchy, so the device identity, telemetry, and mapping are
-    /// read as one screen instead of two stacked tools.
+    /// Keep live diagnostics in their own disclosure card so the mapping
+    /// controls remain compact and stable while telemetry updates arrive.
     fn controller_unified_card(&mut self, ui: &mut Ui) {
         let live = self
             .live
@@ -2122,15 +2121,14 @@ impl StudioApp {
         let view = GamepadLiveView::from_status(&live.status);
         card(ui, |ui| {
             self.controller_telemetry_header(ui, &live, &view);
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(8.0);
             if self.controller_telemetry_expanded {
-                self.gamepad_diagnostics_body(ui, &live, &view);
-                ui.add_space(10.0);
+                ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(8.0);
+                self.gamepad_diagnostics_body(ui, &live, &view);
             }
+        });
+        card(ui, |ui| {
             self.controller_mapping_body(ui, &view);
         });
     }
@@ -2147,29 +2145,20 @@ impl StudioApp {
         let expanded = self.controller_telemetry_expanded;
         let mut toggle = false;
         ui.horizontal(|ui| {
-            let chevron = if expanded { "▾" } else { "▸" };
-            if ui
-                .add(
-                    egui::Button::new(RichText::new(chevron).size(16.0).color(TEXT_MUTED))
-                        .frame(false)
-                        .min_size(Vec2::splat(22.0)),
-                )
-                .on_hover_text(if expanded {
-                    "Collapse live controller telemetry"
-                } else {
-                    "Expand live controller telemetry"
-                })
-                .clicked()
-            {
-                toggle = true;
-            }
+            ui.label(
+                RichText::new("Live controller telemetry")
+                    .size(12.5)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.add_space(8.0);
             ui.label(
                 RichText::new(if view.device_name.is_empty() {
                     "No controller"
                 } else {
                     &view.device_name
                 })
-                .size(17.0)
+                .size(14.0)
                 .strong(),
             );
             let dot = if view.connected > 0 { OK } else { WARN };
@@ -2189,6 +2178,42 @@ impl StudioApp {
                     ui.label(RichText::new(error).size(9.5).color(ERROR));
                 } else if !live.error.is_empty() {
                     ui.label(RichText::new(&live.error).size(9.5).color(ERROR));
+                }
+                let (chevron_rect, response) =
+                    ui.allocate_exact_size(Vec2::new(28.0, 24.0), Sense::click());
+                let center = chevron_rect.center();
+                let points = if expanded {
+                    [
+                        Pos2::new(center.x - 5.0, center.y - 2.0),
+                        Pos2::new(center.x, center.y + 3.0),
+                        Pos2::new(center.x + 5.0, center.y - 2.0),
+                    ]
+                } else {
+                    [
+                        Pos2::new(center.x - 2.0, center.y - 5.0),
+                        Pos2::new(center.x + 3.0, center.y),
+                        Pos2::new(center.x - 2.0, center.y + 5.0),
+                    ]
+                };
+                let stroke = Stroke::new(
+                    1.8_f32,
+                    if response.hovered() {
+                        ACCENT
+                    } else {
+                        TEXT_MUTED
+                    },
+                );
+                ui.painter().line_segment([points[0], points[1]], stroke);
+                ui.painter().line_segment([points[1], points[2]], stroke);
+                if response
+                    .on_hover_text(if expanded {
+                        "Collapse live controller telemetry"
+                    } else {
+                        "Expand live controller telemetry"
+                    })
+                    .clicked()
+                {
+                    toggle = true;
                 }
             });
         });
