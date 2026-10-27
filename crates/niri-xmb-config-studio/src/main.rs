@@ -972,6 +972,9 @@ struct StudioApp {
     sim_last_left: bool,
     sim_first_left: bool,
     sim_override_live: bool,
+    /// The live telemetry disclosure is user-controlled and must not change
+    /// when pushed controller frames or window resizing cause a redraw.
+    controller_telemetry_expanded: bool,
     display_pointer_multiplier: f32,
     display_scroll_multiplier: f32,
     display_multiplier_at: Instant,
@@ -1026,6 +1029,7 @@ impl StudioApp {
             sim_last_left: true,
             sim_first_left: true,
             sim_override_live: false,
+            controller_telemetry_expanded: true,
             display_pointer_multiplier: 1.0,
             display_scroll_multiplier: 1.0,
             display_multiplier_at: Instant::now(),
@@ -1794,21 +1798,48 @@ impl StudioApp {
             .unwrap_or_default();
         let view = GamepadLiveView::from_status(&live.status);
         card(ui, |ui| {
-            self.gamepad_diagnostics_body(ui, &live, &view);
+            self.controller_telemetry_header(ui, &live, &view);
             ui.add_space(10.0);
             ui.separator();
             ui.add_space(8.0);
+            if self.controller_telemetry_expanded {
+                self.gamepad_diagnostics_body(ui, &live, &view);
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+            }
             self.controller_mapping_body(ui, &view);
         });
     }
 
-    /// Tester-style live readout: device identity, every button value,
-    /// both stick reticles with raw axis numbers, and the stream rate.
-    /// Fed by pushed gamepad frames; renders identically at any width by
-    /// wrapping button cells and stacking the stick row when narrow.
-    fn gamepad_diagnostics_body(&self, ui: &mut Ui, live: &LiveState, view: &GamepadLiveView) {
-        let is_connected = view.connected > 0;
-        ui.horizontal_wrapped(|ui| {
+    /// Stable disclosure row for live telemetry. Its open state is owned by
+    /// the app, so pushed frames and ordinary redraws never toggle or resize
+    /// the section without an explicit click on the chevron.
+    fn controller_telemetry_header(
+        &mut self,
+        ui: &mut Ui,
+        live: &LiveState,
+        view: &GamepadLiveView,
+    ) {
+        let expanded = self.controller_telemetry_expanded;
+        let mut toggle = false;
+        ui.horizontal(|ui| {
+            let chevron = if expanded { "▾" } else { "▸" };
+            if ui
+                .add(
+                    egui::Button::new(RichText::new(chevron).size(16.0).color(TEXT_MUTED))
+                        .frame(false)
+                        .min_size(Vec2::splat(22.0)),
+                )
+                .on_hover_text(if expanded {
+                    "Collapse live controller telemetry"
+                } else {
+                    "Expand live controller telemetry"
+                })
+                .clicked()
+            {
+                toggle = true;
+            }
             ui.label(
                 RichText::new(if view.device_name.is_empty() {
                     "No controller"
@@ -1818,11 +1849,11 @@ impl StudioApp {
                 .size(17.0)
                 .strong(),
             );
-            let dot = if is_connected { OK } else { WARN };
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-            ui.painter().circle_filled(rect.center(), 3.0, dot);
+            let dot = if view.connected > 0 { OK } else { WARN };
+            let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+            ui.painter().circle_filled(dot_rect.center(), 3.0, dot);
             ui.label(
-                RichText::new(if is_connected {
+                RichText::new(if view.connected > 0 {
                     "connected"
                 } else {
                     "not detected"
@@ -1838,6 +1869,17 @@ impl StudioApp {
                 }
             });
         });
+        if toggle {
+            self.controller_telemetry_expanded = !expanded;
+        }
+    }
+
+    /// Tester-style live readout: device identity, every button value,
+    /// both stick reticles with raw axis numbers, and the stream rate.
+    /// Fed by pushed gamepad frames; renders identically at any width by
+    /// wrapping button cells and stacking the stick row when narrow.
+    fn gamepad_diagnostics_body(&self, ui: &mut Ui, live: &LiveState, view: &GamepadLiveView) {
+        let is_connected = view.connected > 0;
         if is_connected && (view.vendor != 0 || view.product != 0) {
             ui.label(
                 RichText::new(format!(
