@@ -26,28 +26,29 @@ entry appears as **niri-xmb Config**.
 
 ## Behavior
 
-- Controller tab: device/preset/autodetect, device paths, open/mode combos,
-  pointer/scroll, trigger acceleration, XMB buttons, navi bindings, layers.
-- XMB tab: panel outputs, surface/position/size, per-output placements,
-  behavior/outside-click, border drag, peek, animation.
-- Style tab: theme path, colors, borders, shadows, icon/panel geometry.
-- Bars tab: current `BarConfig` fields, including wheel behavior.
-- Preview tab: controller-adjacent XMB and bar previews drawn from the same
-  model. This is a geometry/style preview, not a renderer pixel match.
+- **Controller:** slim detected-controller status, the controller map with
+  hotspots and the selected-binding inspector, then Device/Pointer/Bindings/
+  Layers in a two-column grid.
+- **Trigger Lab:** Response (graphs, presets, point inspector) beside Tune
+  (pedals, speed multipliers, deadzone/curve/SOCD, pointer/scroll accel).
+- **Popup:** panel, placements, behavior grouped into Input / Close when / Drop
+  behavior, peek, and animation.
+- **Appearance:** theme, colors, geometry, and bar configuration.
+- **Preview:** the single live XMB/bar/model surface. It uses the daemon's live
+  status/snapshot, not a static mock; clicking a window sends the existing
+  `focus-window` command.
+- The top command bar holds the config path, Load, and live daemon status. A
+  persistent bottom action bar holds change count/SHA, Changes, Preview,
+  Validate, Save, Save & Restart, and Revert. Changes opens the patch-path
+  drawer and the validated TOML view.
 - Controller hotspots select a control; the inspector edits the active Navi
-  base, XMB, or layer binding. A **Detected controller** card shows the daemon's
-  live mode, preset, and connected device names/paths. Both controller templates
-  use the same display box.
-- **Preview** uses the daemon's live status/snapshot, not a static mock. It draws
-  current workspaces/windows and selection; clicking a window sends the existing
-  `focus-window` command. The pane is toggleable and collapsed by default.
-- Trigger Lab contains the shared piecewise-linear response curve: add/drag/
-  delete up to five points, edit exact pull/shape values, choose a preset or
-  convert the legacy curve, and inspect the resulting LT/RT multiplier and
-  percent. The compact pedals use the same points and speed-SOCD policy; they are
-  simulation, not live controller input. `speed_socd` selects `last`,
+  base, XMB, or layer binding. Both templates use the same display box.
+- Trigger Lab's compact pedals use the same points and speed-SOCD policy; they
+  are simulation, not live controller input. `speed_socd` selects `last`,
   `first`, `cancel`, `multiply`, `prio_decel`, or `prio_accel` for simultaneous
   speed inputs. This does not alter trigger bindings or layer hold_axes.
+- Below 700 px the rail becomes a top strip; below 900/1000 px the controller,
+  trigger, and appearance grids stack.
 
 ## Save
 
