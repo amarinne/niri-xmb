@@ -9,9 +9,16 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT HUP INT TERM
 
 cd "$root"
-cargo build --locked --release --target "$target" -p niri-xmb
+cargo build --locked --release --target "$target" \
+    -p niri-xmb -p niri-xmb-config-studio
 
 install -Dm755 "target/$target/release/niri-xmb" "$stage/niri-xmb"
+install -Dm755 "target/$target/release/niri-xmb-config-studio" \
+    "$stage/bin/niri-xmb-config-studio"
+install -Dm644 assets/niri-xmb-config-studio.svg \
+    "$stage/share/icons/hicolor/scalable/apps/niri-xmb-config-studio.svg"
+install -Dm644 niri-xmb-config-studio.desktop \
+    "$stage/share/applications/niri-xmb-config-studio.desktop"
 install -Dm644 config/niri-xmb.toml.example \
     "$stage/config/niri-xmb.toml.example"
 install -Dm644 themes/dank.toml "$stage/themes/dank.toml"

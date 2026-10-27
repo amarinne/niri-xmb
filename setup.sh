@@ -4,6 +4,7 @@ set -eu
 REPOSITORY="${NIRI_XMB_REPOSITORY:-amarinne/niri-xmb}"
 VERSION="${NIRI_XMB_VERSION:-latest}"
 INSTALL_DIR="${NIRI_XMB_INSTALL_DIR:-${HOME}/.local/bin}"
+DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/niri-xmb"
 SYSTEMD_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
 NIRI_CONFIG_PATH="${NIRI_CONFIG:-${XDG_CONFIG_HOME:-${HOME}/.config}/niri/config.kdl}"
@@ -125,7 +126,10 @@ if [ "$action" = uninstall ]; then
     if command -v systemctl >/dev/null 2>&1; then
         systemctl --user disable --now niri-xmb.service >/dev/null 2>&1 || true
     fi
-    rm -f "$INSTALL_DIR/niri-xmb" "$SYSTEMD_DIR/niri-xmb.service"
+    rm -f "$INSTALL_DIR/niri-xmb" "$INSTALL_DIR/niri-xmb-config-studio" \
+        "$SYSTEMD_DIR/niri-xmb.service" \
+        "$DATA_DIR/applications/niri-xmb-config-studio.desktop" \
+        "$DATA_DIR/icons/hicolor/scalable/apps/niri-xmb-config-studio.svg"
     if [ "$manage_niri_config" = true ]; then
         remove_niri_config_entry
     fi
@@ -211,6 +215,19 @@ fi
 binary_tmp=$(mktemp "$INSTALL_DIR/.niri-xmb.XXXXXX")
 install -m 0755 "$tmp_dir/package/niri-xmb" "$binary_tmp"
 mv "$binary_tmp" "$INSTALL_DIR/niri-xmb"
+
+if [ -x "$tmp_dir/package/bin/niri-xmb-config-studio" ]; then
+    install -d "$DATA_DIR/applications" \
+        "$DATA_DIR/icons/hicolor/scalable/apps"
+    studio_tmp=$(mktemp "$INSTALL_DIR/.niri-xmb-config-studio.XXXXXX")
+    install -m 0755 "$tmp_dir/package/bin/niri-xmb-config-studio" "$studio_tmp"
+    mv "$studio_tmp" "$INSTALL_DIR/niri-xmb-config-studio"
+    install -m 0644 "$tmp_dir/package/share/applications/niri-xmb-config-studio.desktop" \
+        "$DATA_DIR/applications/niri-xmb-config-studio.desktop"
+    install -m 0644 "$tmp_dir/package/share/icons/hicolor/scalable/apps/niri-xmb-config-studio.svg" \
+        "$DATA_DIR/icons/hicolor/scalable/apps/niri-xmb-config-studio.svg"
+    echo "${install_result} niri-xmb-config-studio"
+fi
 
 if [ ! -e "$CONFIG_DIR/config.toml.example" ]; then
     install -m 0644 "$tmp_dir/package/config/niri-xmb.toml.example" \
