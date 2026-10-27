@@ -100,6 +100,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Daemon,
+    /// Launch the native configuration studio.
+    Gui,
     Show,
     Hide,
     Toggle,
@@ -237,6 +239,7 @@ fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Daemon) {
         Command::Daemon => run_daemon(cli.config.unwrap_or_else(Config::default_path)),
+        Command::Gui => launch_gui(cli.config),
         Command::Show => print_control(ControlCommand::Show),
         Command::Hide => print_control(ControlCommand::Hide),
         Command::Toggle => print_control(ControlCommand::Toggle),
@@ -311,6 +314,39 @@ fn main() -> Result<()> {
 fn print_control(command: ControlCommand) -> Result<()> {
     print!("{}", ipc::send(command)?);
     Ok(())
+}
+
+fn launch_gui(config: Option<PathBuf>) -> Result<()> {
+    let executable = std::env::current_exe().context("failed to locate niri-xmb executable")?;
+    let studio_name = "niri-xmb-config-studio";
+    let studio = executable
+        .parent()
+        .into_iter()
+        .flat_map(|directory| {
+            [
+                directory.join(studio_name),
+                directory.join("bin").join(studio_name),
+                directory
+                    .parent()
+                    .map(|parent| parent.join(studio_name))
+                    .unwrap_or_default(),
+            ]
+        })
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from(studio_name));
+    let mut command = ProcessCommand::new(&studio);
+    if let Some(config) = config {
+        command.args(["--config", &config.to_string_lossy()]);
+    }
+    command.arg("--niri-xmb").arg(executable);
+    let status = command
+        .status()
+        .with_context(|| format!("failed to launch {}", studio.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("config studio exited with {status}");
+    }
 }
 
 /// The log filter a daemon runs at for the given `-v` count. A set RUST_LOG
@@ -700,13 +736,6 @@ fn popup_mode_name(mode: PopupMode) -> &'static str {
     }
 }
 
-fn gamepad_mode_name(mode: GamepadMode) -> &'static str {
-    match mode {
-        GamepadMode::Game => "game",
-        GamepadMode::Navi => "navi",
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn status_response(
     popup_outputs: &HashSet<String>,
@@ -722,32 +751,9 @@ fn status_response(
     serde_json::json!({
         "visible": !popup_outputs.is_empty(),
         "mode": popup_mode_name(popup_mode),
-        "gamepad": {
-            "enabled": gamepad.is_some(),
-            "mode": gamepad.as_ref().map(|status| gamepad_mode_name(status.mode)),
-            "preset": gamepad.as_ref().map(|status| status.preset),
-            "open_combo": gamepad.as_ref().is_some_and(|status| status.open_combo),
-            "devices": gamepad.as_ref().map_or(0, |status| status.devices),
-            "connected": gamepad.as_ref().map(|status| {
-                status.connected.iter().map(|device| serde_json::json!({
-                    "path": device.path,
-                    "name": device.name,
-                    "preset": device.preset,
-                })).collect::<Vec<_>>()
-            }).unwrap_or_default(),
-            // Live pressed buttons and axes for the Config Studio overlay.
-            "live": gamepad.as_ref().map(|status| {
-                status.live.iter().map(|device| serde_json::json!({
-                    "path": device.path,
-                    "buttons": device.buttons.iter().map(|code| {
-                        format!("{:?}", evdev::KeyCode(*code))
-                    }).collect::<Vec<_>>(),
-                    "axes": device.axes.iter().map(|(code, value)| {
-                        (format!("{:?}", evdev::AbsoluteAxisCode(*code)), serde_json::json!(value))
-                    }).collect::<serde_json::Map<String, serde_json::Value>>(),
-                })).collect::<Vec<_>>()
-            }).unwrap_or_default(),
-        },
+        // Live pressed buttons, axes, and discovery diagnostics for the Config Studio overlay.
+        // The shared serializer keeps one-shot status and pushed stream frames identical.
+        "gamepad": gamepad::gamepad_status_json(gamepad.as_ref()),
         "selection": selection.map(|visual| {
             serde_json::json!({
                 "output": visual.output,
@@ -893,10 +899,21 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut surfaces = SurfaceManager::new(&surface_bars, &output_names, ui_tx)
         .context("failed to initialize layer-shell surfaces")?;
     let mut renderer = Renderer::new();
-    let gamepad = gamepad::GamepadService::start(&config.gamepad, wake.handle());
+    // The hub must exist before the gamepad service starts so its reader
+    // threads can push live frames to subscribers from the first event.
+    let subscriptions = std::sync::Arc::new(subscribe::SubscriptionHub::new());
+    let gamepad = gamepad::GamepadService::start(
+        &config.gamepad,
+        wake.handle(),
+        Some(Arc::clone(&subscriptions)),
+    );
+    if gamepad.is_none() {
+        // No readers will ever notify; subscribers still deserve one
+        // (disabled/empty) gamepad frame instead of silence.
+        subscriptions.publish_gamepad(&gamepad::gamepad_status_json(None).to_string());
+    }
 
     let (control_tx, control_rx) = unbounded::<ControlRequest>();
-    let subscriptions = std::sync::Arc::new(subscribe::SubscriptionHub::new());
     // Dropped with the daemon, which removes the file.
     let mirror = mirror::SnapshotMirror::new();
     let _control_server =
@@ -2850,6 +2867,8 @@ mod tests {
                     path: "/dev/input/event10".into(),
                     name: "Flydigi VADER4".into(),
                     preset: crate::config::GamepadPreset::Xbox,
+                    vendor: 0x37d7,
+                    product: 0x2401,
                 }],
                 live: vec![gamepad::GamepadDeviceLive {
                     path: "/dev/input/event10".into(),
@@ -2858,6 +2877,7 @@ mod tests {
                         .into_iter()
                         .collect(),
                 }],
+                discovery: None,
             }),
             0,
         ))
@@ -2869,6 +2889,8 @@ mod tests {
         assert_eq!(value["gamepad"]["open_combo"], true);
         assert_eq!(value["gamepad"]["devices"], 1);
         assert_eq!(value["gamepad"]["connected"][0]["name"], "Flydigi VADER4");
+        assert_eq!(value["gamepad"]["connected"][0]["vendor"], 0x37d7);
+        assert_eq!(value["gamepad"]["connected"][0]["product"], 0x2401);
         assert_eq!(value["gamepad"]["live"][0]["buttons"][0], "BTN_SOUTH");
         assert_eq!(value["gamepad"]["live"][0]["axes"]["ABS_Z"], 0.5);
     }
@@ -2887,6 +2909,17 @@ mod tests {
                 .command,
             Some(Command::ConfigJson)
         ));
+    }
+
+    #[test]
+    fn gui_is_available_as_a_cli_subcommand() {
+        let cli = Cli::try_parse_from(["niri-xmb", "gui"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Gui)));
+
+        let cli =
+            Cli::try_parse_from(["niri-xmb", "gui", "--config", "/tmp/niri-xmb.toml"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Gui)));
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/niri-xmb.toml")));
     }
 
     #[test]

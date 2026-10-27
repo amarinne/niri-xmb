@@ -38,6 +38,7 @@ const NAVI_TICK: Duration = Duration::from_millis(8);
 const HOTPLUG_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const HOTPLUG_SLEEP_SLICE: Duration = Duration::from_millis(100);
 const READER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+#[cfg(test)]
 const GAMEPAD_EVENT_SUFFIXES: [&str; 2] = ["-event-joystick", "-event-gamepad"];
 const BY_ID_DIR: &str = "/dev/input/by-id";
 const HISTORY_FILE: &str = "niri-xmb/controllers.json";
@@ -201,15 +202,17 @@ struct GamepadLive {
 }
 
 impl GamepadLive {
-    /// Fold one evdev event into the state read by `status`.
-    fn record(&mut self, event: &InputEvent, ranges: &HashMap<u16, (i32, i32)>) {
+    /// Fold one evdev event into the state read by `status`. Returns true
+    /// when the visible state actually changed, so callers can skip
+    /// publishing duplicate frames for repeated axis reports.
+    fn record(&mut self, event: &InputEvent, ranges: &HashMap<u16, (i32, i32)>) -> bool {
         let code = event.code();
         match event.event_type() {
             EventType::KEY => {
                 if event.value() == 0 {
-                    self.buttons.remove(&code);
+                    self.buttons.remove(&code)
                 } else {
-                    self.buttons.insert(code);
+                    self.buttons.insert(code)
                 }
             }
             EventType::ABSOLUTE => {
@@ -230,9 +233,9 @@ impl GamepadLive {
                 } else {
                     normalize_signed(event.value(), min, max)
                 };
-                self.axes.insert(code, value);
+                self.axes.insert(code, value) != Some(value)
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -263,7 +266,135 @@ pub struct GamepadService {
     devices: Arc<AtomicUsize>,
     connected: Arc<Mutex<Vec<GamepadDeviceStatus>>>,
     live: Arc<Mutex<HashMap<String, GamepadLive>>>,
+    live_notify: Sender<()>,
+    discovery: Arc<Mutex<GamepadDiscoveryStatus>>,
     supervisor: Option<JoinHandle<()>>,
+    publisher: Option<JoinHandle<()>>,
+}
+
+/// Serialise gamepad state exactly as `status` exposes it under `gamepad`,
+/// so the pushed stream frames and the one-shot response never diverge.
+pub fn gamepad_status_json(status: Option<&GamepadStatus>) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": status.is_some(),
+        "mode": status.map(|status| match status.mode {
+            GamepadMode::Game => "game",
+            GamepadMode::Navi => "navi",
+        }),
+        "preset": status.map(|status| status.preset),
+        "open_combo": status.is_some_and(|status| status.open_combo),
+        "devices": status.map_or(0, |status| status.devices),
+        "connected": status.map(|status| {
+            status.connected.iter().map(|device| serde_json::json!({
+                "path": device.path,
+                "name": device.name,
+                "preset": device.preset,
+                "vendor": device.vendor,
+                "product": device.product,
+            })).collect::<Vec<_>>()
+        }).unwrap_or_default(),
+        "live": status.map(|status| {
+            status.live.iter().map(|device| serde_json::json!({
+                "path": device.path,
+                "buttons": device.buttons.iter().map(|code| {
+                    format!("{:?}", evdev::KeyCode(*code))
+                }).collect::<Vec<_>>(),
+                "axes": device.axes.iter().map(|(code, value)| {
+                    (format!("{:?}", evdev::AbsoluteAxisCode(*code)), serde_json::json!(value))
+                }).collect::<serde_json::Map<String, serde_json::Value>>(),
+            })).collect::<Vec<_>>()
+        }).unwrap_or_default(),
+        "discovery": status.and_then(|status| status.discovery.as_ref()).map(|d| serde_json::json!({
+            "mode": d.mode,
+            "last_scan_ms": d.last_scan_ms,
+            "candidates": d.candidates,
+            "accepted": d.accepted,
+            "rejected": d.rejected,
+            "errors": d.errors.iter().map(|e| serde_json::json!({"kind": e.kind, "path": e.path})).collect::<Vec<_>>(),
+        })),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_status(
+    mode: &AtomicU8,
+    preset: GamepadPreset,
+    open_combo: bool,
+    devices: &AtomicUsize,
+    connected: &Mutex<Vec<GamepadDeviceStatus>>,
+    live: &Mutex<HashMap<String, GamepadLive>>,
+    discovery: &Mutex<GamepadDiscoveryStatus>,
+) -> GamepadStatus {
+    GamepadStatus {
+        mode: mode_from_u8(mode.load(Ordering::Relaxed)),
+        preset,
+        open_combo,
+        devices: devices.load(Ordering::Relaxed),
+        connected: connected.lock().map(|d| d.clone()).unwrap_or_default(),
+        live: live
+            .lock()
+            .map(|live| {
+                let mut entries: Vec<GamepadDeviceLive> = live
+                    .iter()
+                    .map(|(path, state)| GamepadDeviceLive {
+                        path: path.clone(),
+                        buttons: state.buttons.clone(),
+                        axes: state.axes.clone(),
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.path.cmp(&b.path));
+                entries
+            })
+            .unwrap_or_default(),
+        discovery: discovery.lock().ok().map(|d| d.clone()),
+    }
+}
+
+/// Push live gamepad frames to stream subscribers as state changes arrive.
+///
+/// Blocks on the notify channel (never polls), coalesces bursts through a
+/// bounded(1) channel, and publishes at most once per 16 ms (~60 Hz), which
+/// matches the fastest rate a display can show anyway.
+#[allow(clippy::too_many_arguments)]
+fn gamepad_publisher_loop(
+    hub: Arc<crate::subscribe::SubscriptionHub>,
+    notify_rx: Receiver<()>,
+    stop: Arc<AtomicBool>,
+    mode: Arc<AtomicU8>,
+    preset: GamepadPreset,
+    open_combo: bool,
+    devices: Arc<AtomicUsize>,
+    connected: Arc<Mutex<Vec<GamepadDeviceStatus>>>,
+    live: Arc<Mutex<HashMap<String, GamepadLive>>>,
+    discovery: Arc<Mutex<GamepadDiscoveryStatus>>,
+) {
+    let mut last_publish: Option<Instant> = None;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        // Publish current state once at startup so a subscriber that joins
+        // an idle desktop still gets a gamepad frame immediately.
+        if last_publish.is_some() && notify_rx.recv().is_err() {
+            return;
+        }
+        if let Some(last) = last_publish {
+            let earliest = last + Duration::from_millis(16);
+            let now = Instant::now();
+            if earliest > now {
+                thread::sleep(earliest - now);
+            }
+        }
+        while notify_rx.try_recv().is_ok() {}
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let status = build_status(
+            &mode, preset, open_combo, &devices, &connected, &live, &discovery,
+        );
+        hub.publish_gamepad(&gamepad_status_json(Some(&status)).to_string());
+        last_publish = Some(Instant::now());
+    }
 }
 
 /// One controller currently owned by a reader.
@@ -272,6 +403,65 @@ pub struct GamepadDeviceStatus {
     pub path: String,
     pub name: String,
     pub preset: GamepadPreset,
+    /// USB vendor/product from `input_id`, for tester-style device headers.
+    pub vendor: u16,
+    pub product: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NodeId {
+    pub path: PathBuf,
+    pub dev: String,
+    pub sysfs: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ControllerId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Capabilities {
+    pub ev: std::collections::BTreeSet<u16>,
+    pub key: std::collections::BTreeSet<u16>,
+    pub abs: std::collections::BTreeSet<u16>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SysfsMetadata {
+    pub sysfs_path: PathBuf,
+    pub dev: String,
+    pub name: String,
+    pub phys: String,
+    pub uniq: String,
+    pub properties: String,
+    pub properties_bits: std::collections::BTreeSet<u16>,
+    pub bustype: u16,
+    pub vendor: u16,
+    pub product: u16,
+    pub version: u16,
+    pub ev: std::collections::BTreeSet<u16>,
+    pub key: std::collections::BTreeSet<u16>,
+    pub abs: std::collections::BTreeSet<u16>,
+    pub by_id_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct DeviceCandidate {
+    pub node: NodeId,
+    pub controller: Option<ControllerId>,
+    pub path: PathBuf,
+    pub display_path: PathBuf,
+    pub name: String,
+    pub capabilities: Capabilities,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiscoverySnapshot {
+    pub candidates: Vec<DeviceCandidate>,
+    pub rejected: usize,
+    pub errors: Vec<GamepadDiscoveryError>,
+    pub scan_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -297,6 +487,24 @@ pub struct GamepadStatus {
     pub connected: Vec<GamepadDeviceStatus>,
     /// Per-device button and axis state for live overlays, sorted by path.
     pub live: Vec<GamepadDeviceLive>,
+    /// Additive automatic-discovery diagnostics.
+    pub discovery: Option<GamepadDiscoveryStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GamepadDiscoveryError {
+    pub kind: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GamepadDiscoveryStatus {
+    pub mode: String,
+    pub last_scan_ms: u64,
+    pub candidates: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub errors: Vec<GamepadDiscoveryError>,
 }
 
 /// A controller's currently held buttons and normalized axes.
@@ -313,8 +521,11 @@ pub struct GamepadDeviceLive {
 struct ActiveReader {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
+    path: PathBuf,
     name: String,
     preset: GamepadPreset,
+    vendor: u16,
+    product: u16,
 }
 
 impl GamepadService {
@@ -323,7 +534,11 @@ impl GamepadService {
     /// Configuration errors are already rejected by `Config::validate`, so a
     /// failure here is only logged. An absent, unreadable, or unplugged device
     /// must not stop the daemon; the watcher retries while it stays present.
-    pub fn start(config: &GamepadConfig, wake: WakeHandle) -> Option<Self> {
+    pub fn start(
+        config: &GamepadConfig,
+        wake: WakeHandle,
+        hub: Option<Arc<crate::subscribe::SubscriptionHub>>,
+    ) -> Option<Self> {
         if !config.enabled {
             return None;
         }
@@ -347,10 +562,54 @@ impl GamepadService {
         let devices = Arc::new(AtomicUsize::new(0));
         let connected = Arc::new(Mutex::new(Vec::new()));
         let live = Arc::new(Mutex::new(HashMap::new()));
+        let discovery = Arc::new(Mutex::new(GamepadDiscoveryStatus {
+            mode: if config.devices.is_empty() {
+                "automatic".to_string()
+            } else {
+                "explicit".to_string()
+            },
+            last_scan_ms: 0,
+            candidates: 0,
+            accepted: 0,
+            rejected: 0,
+            errors: Vec::new(),
+        }));
         let preset = config.preset;
         let open_combo = !combo_codes.is_empty();
         let config = Arc::new(config.clone());
         let combo_codes = Arc::new(combo_codes);
+        // Bounded(1): readers only signal "live state changed"; extra
+        // signals while one is pending add nothing.
+        let (live_notify, notify_rx) = bounded::<()>(1);
+        let publisher = hub.and_then(|hub| {
+            let notify_rx = notify_rx;
+            let stop = Arc::clone(&stop);
+            let mode = Arc::clone(&mode);
+            let devices = Arc::clone(&devices);
+            let connected = Arc::clone(&connected);
+            let live = Arc::clone(&live);
+            let discovery = Arc::clone(&discovery);
+            thread::Builder::new()
+                .name("niri-xmb-gamepad-publisher".into())
+                .spawn(move || {
+                    gamepad_publisher_loop(
+                        hub,
+                        notify_rx,
+                        stop,
+                        mode,
+                        preset,
+                        open_combo,
+                        devices,
+                        connected,
+                        live,
+                        discovery,
+                    )
+                })
+                .map_err(|error| {
+                    tracing::error!(%error, "failed to start gamepad publisher; live stream disabled");
+                })
+                .ok()
+        });
         let supervisor = {
             let tx = tx.clone();
             let wake = wake.clone();
@@ -362,6 +621,8 @@ impl GamepadService {
             let devices = Arc::clone(&devices);
             let connected = Arc::clone(&connected);
             let live = Arc::clone(&live);
+            let live_notify = live_notify.clone();
+            let discovery = Arc::clone(&discovery);
             thread::Builder::new()
                 .name("niri-xmb-gamepad-hotplug".into())
                 .spawn(move || {
@@ -373,9 +634,11 @@ impl GamepadService {
                         devices,
                         connected,
                         live,
+                        discovery,
                         tx,
                         wake,
                         stop,
+                        live_notify,
                     )
                 })
         };
@@ -389,7 +652,10 @@ impl GamepadService {
                 devices,
                 connected,
                 live,
+                live_notify,
+                discovery,
                 supervisor: Some(handle),
+                publisher,
             }),
             Err(error) => {
                 tracing::error!(
@@ -408,33 +674,15 @@ impl GamepadService {
 
     /// Current mode, configured preset, combo availability, and reader count.
     pub fn status(&self) -> GamepadStatus {
-        GamepadStatus {
-            mode: self.mode(),
-            preset: self.preset,
-            open_combo: self.open_combo,
-            devices: self.devices.load(Ordering::Relaxed),
-            connected: self
-                .connected
-                .lock()
-                .map(|devices| devices.clone())
-                .unwrap_or_default(),
-            live: self
-                .live
-                .lock()
-                .map(|live| {
-                    let mut entries: Vec<GamepadDeviceLive> = live
-                        .iter()
-                        .map(|(path, state)| GamepadDeviceLive {
-                            path: path.clone(),
-                            buttons: state.buttons.clone(),
-                            axes: state.axes.clone(),
-                        })
-                        .collect();
-                    entries.sort_by(|a, b| a.path.cmp(&b.path));
-                    entries
-                })
-                .unwrap_or_default(),
-        }
+        build_status(
+            &self.mode,
+            self.preset,
+            self.open_combo,
+            &self.devices,
+            &self.connected,
+            &self.live,
+            &self.discovery,
+        )
     }
 
     /// Next queued event, if any. Called by the daemon loop after a wake.
@@ -483,8 +731,14 @@ fn toggle_mode(mode: &AtomicU8) -> GamepadMode {
 impl Drop for GamepadService {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Wake the publisher so it sees `stop` instead of parking on recv.
+        let _ = self.live_notify.try_send(());
         if let Some(supervisor) = self.supervisor.take() {
             let _ = supervisor.join();
+        }
+        let _ = self.live_notify.try_send(());
+        if let Some(publisher) = self.publisher.take() {
+            let _ = publisher.join();
         }
     }
 }
@@ -1427,10 +1681,213 @@ fn apply_mode_grab(device: &mut Device, mode: GamepadMode, grab_in_navi: bool, p
     }
 }
 
+#[cfg(test)]
 pub(crate) fn is_gamepad_event_name(name: &str) -> bool {
     GAMEPAD_EVENT_SUFFIXES
         .iter()
         .any(|suffix| name.ends_with(suffix))
+}
+
+fn parse_hex_bits(s: &str) -> std::collections::BTreeSet<u16> {
+    let mut bits = std::collections::BTreeSet::new();
+    for (word_index, word) in s.split_whitespace().enumerate() {
+        let Ok(value) = u64::from_str_radix(word.trim_start_matches("0x"), 16) else {
+            continue;
+        };
+        for bit in 0..64u16 {
+            if value & (1u64 << bit) != 0 {
+                let code = word_index as u16 * 64 + bit;
+                bits.insert(code);
+            }
+        }
+    }
+    bits
+}
+
+fn parse_u16_hex_or_dec(s: &str) -> u16 {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("0x") {
+        u16::from_str_radix(rest, 16).unwrap_or(0)
+    } else {
+        s.parse::<u16>().unwrap_or(0)
+    }
+}
+
+fn read_sysfs_metadata(node_path: &Path) -> Result<SysfsMetadata, String> {
+    let name = node_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    let sysfs_path = PathBuf::from(format!("/sys/class/input/{}/device", name));
+    if !sysfs_path.exists() {
+        return Err("sysfs not found".to_string());
+    }
+    let read = |rel: &str| -> String {
+        std::fs::read_to_string(sysfs_path.join(rel))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    let dev = read("dev");
+    let devname = read("name");
+    let phys = read("phys");
+    let uniq = read("uniq");
+    let properties = read("properties");
+    let properties_bits = parse_hex_bits(&properties);
+    let bustype = parse_u16_hex_or_dec(&read("id/bustype"));
+    let vendor = parse_u16_hex_or_dec(&read("id/vendor"));
+    let product = parse_u16_hex_or_dec(&read("id/product"));
+    let version = parse_u16_hex_or_dec(&read("id/version"));
+    let ev = parse_hex_bits(&read("capabilities/ev"));
+    let key = parse_hex_bits(&read("capabilities/key"));
+    let abs = parse_hex_bits(&read("capabilities/abs"));
+
+    // by-id reverse lookup
+    let by_id_path = find_by_id_for(node_path);
+
+    Ok(SysfsMetadata {
+        sysfs_path,
+        dev,
+        name: if devname.is_empty() { name } else { devname },
+        phys,
+        uniq,
+        properties,
+        properties_bits,
+        bustype,
+        vendor,
+        product,
+        version,
+        ev,
+        key,
+        abs,
+        by_id_path,
+    })
+}
+
+fn find_by_id_for(node_path: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(node_path).unwrap_or_else(|_| node_path.to_path_buf());
+    let Ok(entries) = std::fs::read_dir(BY_ID_DIR) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if std::fs::canonicalize(&path).ok() == Some(canonical.clone()) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+pub fn is_accepted_capability(meta: &SysfsMetadata) -> bool {
+    // Reject virtual uinput/Steam duplicates by default.
+    let name_lc = meta.name.to_lowercase();
+    let phys_lc = meta.phys.to_lowercase();
+    if meta.bustype == 0x06 || phys_lc.contains("uinput") || name_lc.contains("uinput") {
+        return false;
+    }
+    // Reject keyboard/mouse/tablet/touch/accelerometer properties.
+    if meta.properties.contains("ID_INPUT_KEYBOARD")
+        || meta.properties.contains("ID_INPUT_MOUSE")
+        || meta.properties.contains("ID_INPUT_TABLET")
+        || meta.properties.contains("ID_INPUT_TOUCHPAD")
+        || meta.properties.contains("ID_INPUT_TOUCHSCREEN")
+        || meta.properties.contains("ID_INPUT_ACCELEROMETER")
+        || meta.properties_bits.contains(&1) // INPUT_PROP_DIRECT (touchscreen/tablet)
+        || meta.properties_bits.contains(&2) // INPUT_PROP_BUTTONPAD (touchpad)
+        || meta.properties_bits.contains(&6)
+    {
+        return false;
+    }
+    if !meta.ev.contains(&0) || !meta.ev.contains(&1) {
+        return false;
+    }
+    // Stick pair.
+    let stick = (meta.abs.contains(&0) && meta.abs.contains(&1))
+        || (meta.abs.contains(&3) && meta.abs.contains(&4));
+    if !stick {
+        return false;
+    }
+    // Standard gamepad button.
+    let standard_button = meta.key.iter().any(|&k| (304..=318).contains(&k));
+    if !standard_button {
+        return false;
+    }
+    true
+}
+
+pub fn controller_id_from(meta: &SysfsMetadata) -> Option<ControllerId> {
+    if !meta.uniq.is_empty() {
+        return Some(ControllerId(meta.uniq.clone()));
+    }
+    if !meta.phys.is_empty() {
+        return Some(ControllerId(format!(
+            "{}:{}:{}:{}:{}",
+            meta.phys, meta.bustype, meta.vendor, meta.product, meta.version
+        )));
+    }
+    None
+}
+
+pub fn discover_automatic() -> DiscoverySnapshot {
+    let start = std::time::Instant::now();
+    let mut candidates = Vec::new();
+    let mut rejected = 0usize;
+    let mut errors = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/dev/input") else {
+        return DiscoverySnapshot {
+            scan_ms: start.elapsed().as_millis() as u64,
+            ..Default::default()
+        };
+    };
+    let mut nodes: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("event"))
+        .map(|e| e.path())
+        .collect();
+    nodes.sort();
+    for node_path in nodes {
+        match read_sysfs_metadata(&node_path) {
+            Ok(meta) => {
+                if is_accepted_capability(&meta) {
+                    let node = NodeId {
+                        path: node_path.clone(),
+                        dev: meta.dev.clone(),
+                        sysfs: meta.sysfs_path.clone(),
+                    };
+                    let controller = controller_id_from(&meta);
+                    let display_path = meta.by_id_path.clone().unwrap_or_else(|| node_path.clone());
+                    let caps = Capabilities {
+                        ev: meta.ev.clone(),
+                        key: meta.key.clone(),
+                        abs: meta.abs.clone(),
+                    };
+                    candidates.push(DeviceCandidate {
+                        node,
+                        controller,
+                        path: node_path,
+                        display_path,
+                        name: meta.name.clone(),
+                        capabilities: caps,
+                    });
+                } else {
+                    rejected += 1;
+                }
+            }
+            Err(err) => {
+                errors.push(GamepadDiscoveryError {
+                    kind: "not_found".to_string(),
+                    path: node_path.display().to_string(),
+                });
+                let _ = err;
+            }
+        }
+    }
+    DiscoverySnapshot {
+        candidates,
+        rejected,
+        errors,
+        scan_ms: start.elapsed().as_millis() as u64,
+    }
 }
 
 /// Stable by-id paths when no explicit list is configured.
@@ -1438,23 +1895,49 @@ pub(crate) fn is_gamepad_event_name(name: &str) -> bool {
 /// Configured paths are trimmed and deduplicated by their canonical device
 /// node. Prefer `/dev/input/by-id/...` so a reconnect keeps the same path;
 /// `/dev/input/eventN` is accepted for tests and unusual setups.
+#[cfg(test)]
 fn discover_devices(configured: &[String]) -> Vec<PathBuf> {
     if !configured.is_empty() {
         return dedupe_paths(configured.iter().map(|path| PathBuf::from(path.trim())));
     }
-
-    let Ok(entries) = std::fs::read_dir(BY_ID_DIR) else {
-        return Vec::new();
-    };
-    let mut paths = entries
-        .flatten()
-        .filter(|entry| is_gamepad_event_name(&entry.file_name().to_string_lossy()))
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    paths.sort();
-    dedupe_paths(paths)
+    discover_automatic()
+        .candidates
+        .into_iter()
+        .map(|c| c.path)
+        .collect()
 }
 
+pub fn discover_snapshot(configured: &[String]) -> DiscoverySnapshot {
+    if !configured.is_empty() {
+        let candidates: Vec<DeviceCandidate> = configured
+            .iter()
+            .map(|p| {
+                let path = PathBuf::from(p.trim());
+                DeviceCandidate {
+                    node: NodeId {
+                        path: path.clone(),
+                        dev: String::new(),
+                        sysfs: PathBuf::new(),
+                    },
+                    controller: None,
+                    path: path.clone(),
+                    display_path: path.clone(),
+                    name: String::new(),
+                    capabilities: Capabilities::default(),
+                }
+            })
+            .collect();
+        return DiscoverySnapshot {
+            candidates,
+            rejected: 0,
+            errors: Vec::new(),
+            scan_ms: 0,
+        };
+    }
+    discover_automatic()
+}
+
+#[cfg(test)]
 fn dedupe_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut unique = Vec::new();
@@ -1467,6 +1950,7 @@ fn dedupe_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     unique
 }
 
+#[cfg(test)]
 fn hotplug_diff(desired: &[PathBuf], active: &HashSet<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let desired_set: HashSet<&PathBuf> = desired.iter().collect();
     let start = desired
@@ -1491,14 +1975,17 @@ fn supervisor_loop(
     devices: Arc<AtomicUsize>,
     connected: Arc<Mutex<Vec<GamepadDeviceStatus>>>,
     live: Arc<Mutex<HashMap<String, GamepadLive>>>,
+    discovery: Arc<Mutex<GamepadDiscoveryStatus>>,
     tx: Sender<GamepadEvent>,
     wake: WakeHandle,
     stop: Arc<AtomicBool>,
+    live_notify: Sender<()>,
 ) {
-    let mut active: HashMap<PathBuf, ActiveReader> = HashMap::new();
-    let mut retry_at: HashMap<PathBuf, Instant> = HashMap::new();
-    let mut failures: HashSet<PathBuf> = HashSet::new();
-    let mut skipped: HashSet<PathBuf> = HashSet::new();
+    let mut active: HashMap<NodeId, ActiveReader> = HashMap::new();
+    let mut retry_at: HashMap<NodeId, Instant> = HashMap::new();
+    let mut failures: HashSet<NodeId> = HashSet::new();
+    let mut skipped: HashSet<NodeId> = HashSet::new();
+    let mut seen_previous: HashSet<NodeId> = HashSet::new();
     let mut had_active = false;
     tracing::info!(
         combo = combo_codes.len(),
@@ -1507,48 +1994,94 @@ fn supervisor_loop(
     );
 
     while !stop.load(Ordering::Relaxed) {
-        let desired = discover_devices(&config.devices);
-        let desired_set: HashSet<PathBuf> = desired.iter().cloned().collect();
-        retry_at.retain(|path, _| desired_set.contains(path));
-        failures.retain(|path| desired_set.contains(path));
-        skipped.retain(|path| desired_set.contains(path));
+        let snap = discover_snapshot(&config.devices);
+        // debounce: only accept candidates present in previous cycle
+        let accepted_count = snap.candidates.len();
+        let current_nodes: HashSet<NodeId> =
+            snap.candidates.iter().map(|c| c.node.clone()).collect();
+        let desired_candidates: Vec<DeviceCandidate> = snap
+            .candidates
+            .into_iter()
+            .filter(|c| seen_previous.contains(&c.node) || seen_previous.is_empty())
+            .collect();
+        // First scan accepts immediately.
+        if seen_previous.is_empty() {
+            // accept all
+        } else {
+            // already filtered
+        }
+        seen_previous = current_nodes;
 
-        let finished: Vec<PathBuf> = active
+        let desired_set: HashSet<NodeId> =
+            desired_candidates.iter().map(|c| c.node.clone()).collect();
+
+        // update diagnostics
+        if let Ok(mut d) = discovery.lock() {
+            d.mode = if config.devices.is_empty() {
+                "automatic".to_string()
+            } else {
+                "explicit".to_string()
+            };
+            d.last_scan_ms = snap.scan_ms;
+            d.candidates = accepted_count + snap.rejected;
+            d.accepted = accepted_count;
+            d.rejected = snap.rejected;
+            d.errors = snap.errors.clone();
+        }
+
+        retry_at.retain(|node, _| desired_set.contains(node));
+        failures.retain(|node| desired_set.contains(node));
+        skipped.retain(|node| desired_set.contains(node));
+
+        let finished: Vec<NodeId> = active
             .iter()
             .filter(|(_, reader)| reader.handle.is_finished())
-            .map(|(path, _)| path.clone())
+            .map(|(node, _)| node.clone())
             .collect();
-        for path in finished {
-            if let Some(reader) = active.remove(&path) {
+        for node in finished {
+            if let Some(reader) = active.remove(&node) {
                 let _ = reader.handle.join();
-                tracing::info!(path = %path.display(), "gamepad reader stopped");
+                tracing::info!(path = %node.path.display(), "gamepad reader stopped");
             }
-            if desired_set.contains(&path) {
-                retry_at.insert(path, Instant::now() + READER_RETRY_BACKOFF);
+            if desired_set.contains(&node) {
+                retry_at.insert(node.clone(), Instant::now() + READER_RETRY_BACKOFF);
+                if let Ok(mut d) = discovery.lock() {
+                    d.errors.push(GamepadDiscoveryError {
+                        kind: "reader_exited".to_string(),
+                        path: node.path.display().to_string(),
+                    });
+                }
             }
         }
 
-        let active_paths: HashSet<PathBuf> = active.keys().cloned().collect();
-        let (start_paths, stale_paths) = hotplug_diff(&desired, &active_paths);
-        for path in stale_paths {
-            if let Some(reader) = active.remove(&path) {
+        let active_nodes: HashSet<NodeId> = active.keys().cloned().collect();
+        // stale removal
+        let stale: Vec<NodeId> = active_nodes.difference(&desired_set).cloned().collect();
+        for node in stale {
+            if let Some(reader) = active.remove(&node) {
                 reader.stop.store(true, Ordering::Relaxed);
                 let _ = reader.handle.join();
-                tracing::info!(path = %path.display(), "gamepad disconnected");
+                tracing::info!(path = %node.path.display(), "gamepad disconnected");
             }
-            retry_at.remove(&path);
-            failures.remove(&path);
-            skipped.remove(&path);
+            retry_at.remove(&node);
+            failures.remove(&node);
+            skipped.remove(&node);
         }
 
-        for path in start_paths {
-            if skipped.contains(&path) {
+        // start new
+        for cand in &desired_candidates {
+            let node = &cand.node;
+            if active.contains_key(node) {
+                continue;
+            }
+            if skipped.contains(node) {
                 continue;
             }
             let now = Instant::now();
-            if retry_at.get(&path).is_some_and(|until| now < *until) {
+            if retry_at.get(node).is_some_and(|until| now < *until) {
                 continue;
             }
+            let path = cand.display_path.clone();
             match start_reader(
                 &path,
                 &config,
@@ -1558,51 +2091,69 @@ fn supervisor_loop(
                 &live,
                 &tx,
                 &wake,
+                &live_notify,
             ) {
                 Ok(Some(reader)) => {
-                    active.insert(path.clone(), reader);
+                    active.insert(node.clone(), reader);
                     had_active = true;
-                    retry_at.remove(&path);
-                    failures.remove(&path);
-                    skipped.remove(&path);
+                    retry_at.remove(node);
+                    failures.remove(node);
+                    skipped.remove(node);
                 }
                 Ok(None) => {
-                    retry_at.remove(&path);
-                    failures.remove(&path);
-                    skipped.insert(path);
+                    retry_at.remove(node);
+                    failures.remove(node);
+                    skipped.insert(node.clone());
                 }
                 Err(error) => {
-                    if failures.insert(path.clone()) {
+                    if failures.insert(node.clone()) {
                         tracing::warn!(
-                            path = %path.display(),
+                            path = %node.path.display(),
                             %error,
                             "cannot start gamepad reader; will retry"
                         );
                     }
-                    retry_at.insert(path, now + READER_RETRY_BACKOFF);
+                    if let Ok(mut d) = discovery.lock() {
+                        d.errors.push(GamepadDiscoveryError {
+                            kind: "open_failed".to_string(),
+                            path: path.display().to_string(),
+                        });
+                        // bound
+                        if d.errors.len() > 8 {
+                            let keep = d.errors.len() - 8;
+                            d.errors.drain(0..keep);
+                        }
+                    }
+                    retry_at.insert(node.clone(), now + READER_RETRY_BACKOFF);
                 }
             }
         }
 
         devices.store(active.len(), Ordering::Relaxed);
         if let Ok(mut connected) = connected.lock() {
-            *connected = active
-                .iter()
-                .map(|(path, reader)| GamepadDeviceStatus {
-                    path: path.display().to_string(),
+            let mut next: Vec<GamepadDeviceStatus> = active
+                .values()
+                .map(|reader| GamepadDeviceStatus {
+                    path: reader.path.display().to_string(),
                     name: reader.name.clone(),
                     preset: reader.preset,
+                    vendor: reader.vendor,
+                    product: reader.product,
                 })
                 .collect();
-            connected.sort_by(|a, b| a.path.cmp(&b.path));
+            next.sort_by(|a, b| a.path.cmp(&b.path));
+            if *connected != next {
+                *connected = next;
+                let _ = live_notify.try_send(());
+            }
         }
         if let Ok(mut live) = live.lock() {
-            live.retain(|path, _| active.contains_key(Path::new(path)));
+            live.retain(|path, _| active.keys().any(|n| n.path.display().to_string() == *path));
         }
 
         if had_active
             && active.is_empty()
-            && desired.is_empty()
+            && desired_candidates.is_empty()
             && navi.reset_on_disconnect
             && mode_from_u8(mode.load(Ordering::Relaxed)) != GamepadMode::Game
         {
@@ -1617,10 +2168,10 @@ fn supervisor_loop(
         }
     }
 
-    for (path, reader) in active.drain() {
+    for (node, reader) in active.drain() {
         reader.stop.store(true, Ordering::Relaxed);
         let _ = reader.handle.join();
-        tracing::debug!(path = %path.display(), "gamepad reader stopped");
+        tracing::debug!(path = %node.path.display(), "gamepad reader stopped");
     }
     devices.store(0, Ordering::Relaxed);
     if let Ok(mut connected) = connected.lock() {
@@ -1642,6 +2193,7 @@ fn start_reader(
     live: &Arc<Mutex<HashMap<String, GamepadLive>>>,
     tx: &Sender<GamepadEvent>,
     wake: &WakeHandle,
+    live_notify: &Sender<()>,
 ) -> Result<Option<ActiveReader>> {
     let device =
         Device::open(path).with_context(|| format!("cannot open gamepad {}", path.display()))?;
@@ -1667,6 +2219,8 @@ fn start_reader(
     }
 
     let name = device.name().unwrap_or("unknown").to_string();
+    let input_id = device.input_id();
+    let (vendor, product) = (input_id.vendor(), input_id.product());
     let binding_count = bindings.len();
     let bindings = Arc::new(bindings);
     let combo_codes = combo_codes.clone();
@@ -1679,12 +2233,14 @@ fn start_reader(
     let thread_path = path.to_path_buf();
     let tx = tx.clone();
     let wake = wake.clone();
+    let live_notify = live_notify.clone();
     let handle = thread::Builder::new()
         .name("niri-xmb-gamepad".into())
         .spawn(move || {
             if let Ok(mut live) = live.lock() {
                 live.insert(live_key.clone(), GamepadLive::default());
             }
+            let _ = live_notify.try_send(());
             reader_loop(
                 thread_path,
                 device,
@@ -1696,10 +2252,12 @@ fn start_reader(
                 tx,
                 wake,
                 thread_stop,
+                live_notify.clone(),
             );
             if let Ok(mut live) = live.lock() {
                 live.remove(&live_key);
             }
+            let _ = live_notify.try_send(());
         })
         .context("failed to spawn gamepad reader")?;
     tracing::info!(
@@ -1712,8 +2270,11 @@ fn start_reader(
     Ok(Some(ActiveReader {
         stop: reader_stop,
         handle,
+        path: path.to_path_buf(),
         name,
         preset,
+        vendor,
+        product,
     }))
 }
 
@@ -1747,6 +2308,7 @@ fn reader_loop(
     tx: Sender<GamepadEvent>,
     wake: WakeHandle,
     stop: Arc<AtomicBool>,
+    live_notify: Sender<()>,
 ) {
     let ranges = device_axis_ranges(&device);
     let live_key = path.display().to_string();
@@ -1772,6 +2334,7 @@ fn reader_loop(
             {
                 state.clear();
             }
+            let _ = live_notify.try_send(());
         }
 
         let timeout = if last_mode == GamepadMode::Navi {
@@ -1823,11 +2386,12 @@ fn reader_loop(
         };
 
         let mut sent = false;
+        let mut live_changed = false;
         for event in events {
             if let Ok(mut live) = live.lock()
                 && let Some(state) = live.get_mut(&live_key)
             {
-                state.record(&event, &ranges);
+                live_changed |= state.record(&event, &ranges);
             }
             if event.event_type() == EventType::KEY && mode_combo.feed(event.code(), event.value())
             {
@@ -1840,6 +2404,7 @@ fn reader_loop(
                 {
                     state.clear();
                 }
+                live_changed = true;
                 let Ok(queued) =
                     queue_gamepad_event(&tx, GamepadEvent::ModeChanged(next), &mut full_logged)
                 else {
@@ -1877,6 +2442,9 @@ fn reader_loop(
                 };
                 sent |= queued;
             }
+        }
+        if live_changed {
+            let _ = live_notify.try_send(());
         }
         if sent {
             wake.wake();
@@ -1973,6 +2541,12 @@ mod tests {
         assert!((live.axes[&AbsoluteAxisCode::ABS_X.0] - 1.0).abs() < 0.01);
         live.record(&hat(AbsoluteAxisCode::ABS_HAT0X, -1), &ranges);
         assert_eq!(live.axes[&AbsoluteAxisCode::ABS_HAT0X.0], -1.0);
+        // Change reporting drives the push publisher: repeats are not
+        // changes, new values are.
+        assert!(!live.record(&hat(AbsoluteAxisCode::ABS_HAT0X, -1), &ranges));
+        assert!(live.record(&hat(AbsoluteAxisCode::ABS_HAT0X, 1), &ranges));
+        assert!(live.record(&key(KeyCode::BTN_SOUTH, 1), &ranges));
+        assert!(!live.record(&key(KeyCode::BTN_SOUTH, 1), &ranges));
         live.clear();
         assert!(live.buttons.is_empty() && live.axes.is_empty());
     }
@@ -2600,7 +3174,7 @@ mod tests {
     #[test]
     fn disabled_gamepad_does_not_start_a_service() {
         let wake = WakePipe::new().unwrap().handle();
-        assert!(GamepadService::start(&GamepadConfig::default(), wake).is_none());
+        assert!(GamepadService::start(&GamepadConfig::default(), wake, None).is_none());
     }
 
     #[test]
@@ -2611,5 +3185,37 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .is_some_and(is_gamepad_event_name)
         );
+    }
+
+    fn meta_with(abs: &[u16], key: &[u16], props: &str) -> SysfsMetadata {
+        SysfsMetadata {
+            sysfs_path: PathBuf::from("/sys/class/input/event0/device"),
+            dev: "13:64".into(),
+            name: "test".into(),
+            phys: "usb-phys".into(),
+            uniq: String::new(),
+            properties: props.into(),
+            bustype: 3,
+            vendor: 1,
+            product: 1,
+            version: 1,
+            ev: [0, 1, 3].into_iter().collect(),
+            key: key.iter().copied().collect(),
+            abs: abs.iter().copied().collect(),
+            properties_bits: std::collections::BTreeSet::new(),
+            by_id_path: None,
+        }
+    }
+
+    #[test]
+    fn capability_predicate_accepts_xbox_and_rejects_others() {
+        let xbox = meta_with(&[0, 1, 3, 4], &[304, 305, 307, 308], "ID_INPUT_JOYSTICK=1");
+        assert!(is_accepted_capability(&xbox));
+        let motion = meta_with(&[0, 1, 2, 3, 4, 5], &[], "ID_INPUT_ACCELEROMETER=1");
+        assert!(!is_accepted_capability(&motion));
+        let touchpad = meta_with(&[0, 1], &[330], "ID_INPUT_TOUCHPAD=1");
+        assert!(!is_accepted_capability(&touchpad));
+        let keyboard = meta_with(&[], &[30], "ID_INPUT_KEYBOARD=1");
+        assert!(!is_accepted_capability(&keyboard));
     }
 }
