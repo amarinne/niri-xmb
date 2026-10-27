@@ -44,7 +44,6 @@
 
   <!-- Touchpad (Center Top) -->
   <rect id="Touchpad" class="button" x="168" y="98" width="105" height="56" rx="6"/>
-  <text x="220.5" y="126" class="label-sm">TOUCHPAD</text>
 
   <!-- Share / Options Buttons (Flanking Touchpad) -->
   <rect id="Share" class="meta" x="152" y="106" width="10" height="22" rx="4"/>

@@ -2027,10 +2027,12 @@ impl StudioApp {
         let width = ui.available_width();
         if width >= 900.0 {
             let map_width = (width * 0.46).clamp(400.0, 560.0);
+            let mut hotspot = None;
+            let mut row = None;
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.set_width(map_width);
-                    self.controller_map_body(ui, live);
+                    hotspot = self.controller_map_body(ui, live);
                     ui.add_space(6.0);
                     ui.separator();
                     ui.add_space(4.0);
@@ -2039,9 +2041,12 @@ impl StudioApp {
                 ui.add_space(12.0);
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width());
-                    self.merged_bindings(ui);
+                    row = self.merged_bindings(ui);
                 });
             });
+            if let (Some(from), Some(to)) = (hotspot, row) {
+                paint_binding_link(ui, from, to);
+            }
         } else {
             self.controller_map_body(ui, live);
             ui.separator();
@@ -2084,7 +2089,7 @@ impl StudioApp {
         Some(pts)
     }
 
-    fn controller_map_body(&mut self, ui: &mut Ui, live: &GamepadLiveView) {
+    fn controller_map_body(&mut self, ui: &mut Ui, live: &GamepadLiveView) -> Option<Rect> {
         let template = self.template;
         let width = ui.available_width().min(560.0);
         let height = (width * 0.72).clamp(220.0, 340.0);
@@ -2118,6 +2123,7 @@ impl StudioApp {
             );
         }
         let label_size = (rect.width() * 0.016).clamp(7.0, 10.0);
+        let mut selected_rect = None;
         for hotspot in template.hotspots() {
             let center = Pos2::new(
                 rect.min.x + hotspot.x * rect.width(),
@@ -2137,64 +2143,52 @@ impl StudioApp {
                 hit
             };
             let selected = self.selected == hotspot.control;
+            if selected {
+                selected_rect = Some(hit);
+            }
             let response = ui.interact(
                 interact_rect,
                 ui.id().with(("hotspot", template.label(), hotspot.control)),
                 Sense::click(),
             );
-            let stroke = if selected {
-                Stroke::new(2.0_f32, ACCENT)
-            } else if response.hovered() {
-                Stroke::new(1.5_f32, Color32::from_rgb(220, 230, 245))
-            } else {
-                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(116, 162, 255, 110))
-            };
             let is_pressed = self.hotspot_pressed(hotspot, live);
+            let (shape_fill, shape_stroke) = match (is_pressed, selected, response.hovered()) {
+                (true, true, _) => (
+                    Color32::from_rgba_unmultiplied(116, 162, 255, 120),
+                    Stroke::new(2.5_f32, Color32::WHITE),
+                ),
+                (true, false, _) => (
+                    Color32::from_rgba_unmultiplied(116, 162, 255, 90),
+                    Stroke::new(2.0_f32, Color32::WHITE),
+                ),
+                (false, true, _) => (
+                    Color32::from_rgba_unmultiplied(116, 162, 255, 45),
+                    Stroke::new(2.0_f32, ACCENT),
+                ),
+                (false, false, true) => (
+                    Color32::from_rgba_unmultiplied(116, 162, 255, 25),
+                    Stroke::new(1.5_f32, Color32::from_rgb(220, 230, 245)),
+                ),
+                (false, false, false) => (
+                    Color32::TRANSPARENT,
+                    Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(116, 162, 255, 110)),
+                ),
+            };
 
             match hotspot.shape {
                 HotspotShape::Circle => {
                     let r = (hotspot.w * rect.width()).min(hotspot.h * rect.width()) / 2.0;
-                    if selected {
-                        ui.painter().circle_filled(
-                            center,
-                            r,
-                            Color32::from_rgba_unmultiplied(116, 162, 255, 30),
-                        );
+                    if shape_fill != Color32::TRANSPARENT {
+                        ui.painter().circle_filled(center, r, shape_fill);
                     }
-                    if is_pressed {
-                        ui.painter().circle_filled(
-                            center,
-                            r,
-                            Color32::from_rgba_unmultiplied(116, 162, 255, 72),
-                        );
-                        ui.painter()
-                            .circle_stroke(center, r, Stroke::new(1.8_f32, Color32::WHITE));
-                    }
-                    ui.painter().circle_stroke(center, r, stroke);
+                    ui.painter().circle_stroke(center, r, shape_stroke);
                 }
                 HotspotShape::Rect { corner_radius } => {
-                    if selected {
-                        ui.painter().rect_filled(
-                            hit,
-                            corner_radius,
-                            Color32::from_rgba_unmultiplied(116, 162, 255, 30),
-                        );
-                    }
-                    if is_pressed {
-                        ui.painter().rect_filled(
-                            hit,
-                            corner_radius,
-                            Color32::from_rgba_unmultiplied(116, 162, 255, 72),
-                        );
-                        ui.painter().rect_stroke(
-                            hit,
-                            corner_radius,
-                            Stroke::new(1.8_f32, Color32::WHITE),
-                            StrokeKind::Inside,
-                        );
+                    if shape_fill != Color32::TRANSPARENT {
+                        ui.painter().rect_filled(hit, corner_radius, shape_fill);
                     }
                     ui.painter()
-                        .rect_stroke(hit, corner_radius, stroke, StrokeKind::Inside);
+                        .rect_stroke(hit, corner_radius, shape_stroke, StrokeKind::Inside);
                 }
                 HotspotShape::DpadUp
                 | HotspotShape::DpadDown
@@ -2231,16 +2225,21 @@ impl StudioApp {
                 _ => None,
             };
             if let Some(arrow) = dpad_arrow {
+                let arrow_color = if is_pressed {
+                    Color32::WHITE
+                } else if selected {
+                    ACCENT
+                } else if response.hovered() {
+                    Color32::from_rgb(230, 240, 255)
+                } else {
+                    Color32::from_rgb(193, 215, 238)
+                };
                 ui.painter().text(
                     center,
                     Align2::CENTER_CENTER,
                     arrow,
                     FontId::monospace((label_size * 1.1).clamp(8.0, 11.0)),
-                    if selected || is_pressed {
-                        Color32::WHITE
-                    } else {
-                        Color32::from_rgb(193, 215, 238)
-                    },
+                    arrow_color,
                 );
             } else if hotspot.label {
                 let well_radius = rect.height() * (37.5 / 403.0);
@@ -2280,6 +2279,7 @@ impl StudioApp {
                 self.selected = hotspot.control;
             }
         }
+        selected_rect
     }
 
     fn hotspot_pressed(&self, hotspot: &Hotspot, live: &GamepadLiveView) -> bool {
@@ -2319,12 +2319,34 @@ impl StudioApp {
     }
 
     fn inspector_body(&mut self, ui: &mut Ui) {
-        ui.label(
-            RichText::new("Selected")
-                .size(11.0)
-                .strong()
-                .color(TEXT_MUTED),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Selected")
+                    .size(11.0)
+                    .strong()
+                    .color(TEXT_MUTED),
+            );
+            let code = self.selected_code();
+            if let Some(code) = code {
+                let map_path = binding_path(&self.context);
+                let is_bound = get_path(&self.model, &map_path)
+                    .and_then(Value::as_object)
+                    .and_then(|map| map.get(code))
+                    .is_some();
+                let (status_text, status_color) = if is_bound {
+                    ("bound", OK)
+                } else {
+                    ("unbound", TEXT_MUTED)
+                };
+                ui.label(
+                    RichText::new(format!("({status_text} in {})", self.context))
+                        .size(10.0)
+                        .color(status_color),
+                );
+            } else {
+                ui.label(RichText::new("(unmapped)").size(10.0).color(TEXT_MUTED));
+            }
+        });
         ui.add_space(2.0);
         let code = self.selected_code();
         ui.horizontal(|ui| {
@@ -2370,6 +2392,11 @@ impl StudioApp {
             .unwrap_or("")
             .to_string();
         let mut next = current.clone();
+        let actions = if self.context == "xmb" {
+            XMB_ACTIONS
+        } else {
+            ACTIONS
+        };
         ui.horizontal(|ui| {
             field_label(ui, "Action");
             ComboBox::from_id_salt("binding-action")
@@ -2377,7 +2404,7 @@ impl StudioApp {
                 .selected_text(if next.is_empty() { "unbound" } else { &next })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut next, String::new(), "unbound");
-                    for action in ACTIONS {
+                    for action in actions {
                         ui.selectable_value(&mut next, (*action).to_string(), *action);
                     }
                 });
@@ -4819,6 +4846,19 @@ impl StudioApp {
         rect
     }
 
+    fn next_binding_entry<'a>(
+        &self,
+        path: &str,
+        actions: &[&'a str],
+        used: &[String],
+    ) -> Option<(&'static str, &'a str)> {
+        next_binding_entry(self.template, self.selected, path, actions, used)
+    }
+
+    fn default_action_for_code<'a>(&self, path: &str, actions: &[&'a str], code: &str) -> &'a str {
+        default_action_for_code(path, actions, code)
+    }
+
     fn bindings_ui(
         &mut self,
         ui: &mut Ui,
@@ -4879,9 +4919,42 @@ impl StudioApp {
             .iter()
             .map(|(code, _)| code.clone())
             .collect::<Vec<_>>();
-        if let Some(code) = button_menu(ui, "Add binding", &used) {
-            set_map_value(&mut self.model, path, code, actions[0]);
-        }
+        let candidate = self.next_binding_entry(path, actions, &used);
+        ui.horizontal(|ui| {
+            let can_add = candidate.is_some();
+            let add_btn = ui.add_enabled(can_add, egui::Button::new("Add binding"));
+            let response = tt(add_btn, "ui.action.add_binding");
+            if response.clicked()
+                && let Some((code, action)) = candidate
+            {
+                set_map_value(&mut self.model, path, code, action);
+                if let Some(control) = self
+                    .template
+                    .hotspots()
+                    .iter()
+                    .find(|h| h.code == Some(code))
+                    .map(|h| h.control)
+                {
+                    self.selected = control;
+                }
+            }
+            if !can_add {
+                response.on_disabled_hover_text("All standard buttons are bound in this map");
+            }
+            if let Some(code) = button_menu(ui, "▾", &used) {
+                let action = self.default_action_for_code(path, actions, code);
+                set_map_value(&mut self.model, path, code, action);
+                if let Some(control) = self
+                    .template
+                    .hotspots()
+                    .iter()
+                    .find(|h| h.code == Some(code))
+                    .map(|h| h.control)
+                {
+                    self.selected = control;
+                }
+            }
+        });
         target
     }
 
@@ -4964,16 +5037,39 @@ impl StudioApp {
                                     .changed();
                             }
                         });
-                    remove = ui.small_button("x").clicked();
+                    remove = ui
+                        .small_button("x")
+                        .on_hover_text("Remove binding")
+                        .clicked();
                     code_changed || action_changed
                 })
                 .inner
             });
+        let row_clicked = frame.response.interact(Sense::click()).clicked();
+        if row_clicked
+            && let Some(control) = self
+                .template
+                .hotspots()
+                .iter()
+                .find(|h| h.code == Some(code))
+                .map(|h| h.control)
+        {
+            self.selected = control;
+        }
         if remove {
             remove_map_key(&mut self.model, path, code);
         } else if next_code != code {
             remove_map_key(&mut self.model, path, code);
             set_map_value(&mut self.model, path, &next_code, &next_action);
+            if let Some(control) = self
+                .template
+                .hotspots()
+                .iter()
+                .find(|h| h.code == Some(&next_code))
+                .map(|h| h.control)
+            {
+                self.selected = control;
+            }
         } else if frame.inner || next_action != action {
             set_map_value(&mut self.model, path, code, &next_action);
         }
@@ -5083,7 +5179,18 @@ impl StudioApp {
                 }
             }
             self.show_exact_field_error(ui, &path);
-            self.bindings_ui(ui, &format!("{path}.bindings"), ACTIONS, "Bindings", None);
+            let layer_target = if self.context == name {
+                self.selected_code()
+            } else {
+                None
+            };
+            self.bindings_ui(
+                ui,
+                &format!("{path}.bindings"),
+                ACTIONS,
+                "Bindings",
+                layer_target,
+            );
         }
         if let Some(name) = remove_layer
             && let Some(layers) = self.model["gamepad"]["navi"]["layers"].as_object_mut()
@@ -6687,6 +6794,127 @@ fn button_menu(ui: &mut Ui, title: &str, used: &[String]) -> Option<&'static str
     })
     .inner
     .flatten()
+}
+
+/// Determine the button code and default action to auto-fill when adding a binding.
+/// Prefers the currently selected controller hotspot/button; if already bound in
+/// this table or unmapped, searches the template hotspots in selection order, then
+/// falls back to unbound standard gamepad buttons. Avoids empty/invalid states.
+fn next_binding_entry<'a>(
+    template: Template,
+    selected: &str,
+    path: &str,
+    actions: &[&'a str],
+    used: &[String],
+) -> Option<(&'static str, &'a str)> {
+    let code = next_binding_code_for(template, selected, used)?;
+    let action = default_action_for_code(path, actions, code);
+    Some((code, action))
+}
+
+fn next_binding_code_for(
+    template: Template,
+    selected: &str,
+    used: &[String],
+) -> Option<&'static str> {
+    let is_used = |code: &str| used.iter().any(|u| u == code);
+
+    // 1. Prefer currently selected controller hotspot if it has an unbound button code.
+    let hotspots = template.hotspots();
+    if let Some(code) = hotspots
+        .iter()
+        .find(|h| h.control == selected)
+        .and_then(|h| h.code)
+        && !is_used(code)
+    {
+        return Some(code);
+    }
+
+    // 2. Preserve selection order: search hotspots starting after selected control.
+    let selected_idx = hotspots
+        .iter()
+        .position(|h| h.control == selected)
+        .unwrap_or(0);
+
+    for offset in 1..=hotspots.len() {
+        let idx = (selected_idx + offset) % hotspots.len();
+        if let Some(code) = hotspots[idx].code
+            && !is_used(code)
+        {
+            return Some(code);
+        }
+    }
+
+    // 3. Fall back to remaining standard gamepad buttons in BUTTONS.
+    for (code, _) in BUTTONS {
+        if !is_used(code) {
+            return Some(*code);
+        }
+    }
+
+    None
+}
+
+fn default_action_for_code<'a>(path: &str, actions: &[&'a str], code: &str) -> &'a str {
+    if actions.is_empty() {
+        return "";
+    }
+    let preferred = if path.contains("buttons") {
+        // XMB actions
+        match code {
+            "BTN_DPAD_UP" => "up",
+            "BTN_DPAD_DOWN" => "down",
+            "BTN_DPAD_LEFT" => "left",
+            "BTN_DPAD_RIGHT" => "right",
+            "BTN_SOUTH" | "BTN_START" | "BTN_TR" => "confirm",
+            "BTN_EAST" | "BTN_MODE" => "close",
+            "BTN_WEST" | "BTN_SELECT" | "BTN_TL" => "back",
+            "BTN_NORTH" => "tab",
+            _ => "confirm",
+        }
+    } else {
+        // Navi base / layer actions
+        match code {
+            "BTN_SOUTH" => "pointer.left",
+            "BTN_EAST" => "pointer.right",
+            "BTN_WEST" => "pointer.middle",
+            "BTN_NORTH" => "xmb.open",
+            "BTN_START" => "niri.toggle-overview",
+            "BTN_DPAD_UP" => "pointer.scroll-up",
+            "BTN_DPAD_DOWN" => "pointer.scroll-down",
+            _ => "pointer.left",
+        }
+    };
+    if actions.contains(&preferred) {
+        preferred
+    } else {
+        actions[0]
+    }
+}
+
+fn paint_binding_link(ui: &Ui, from: Rect, to: Rect) {
+    let clip = ui.clip_rect();
+    if !clip.contains(from.center()) || !clip.contains(to.center()) || to.left() <= from.right() {
+        return;
+    }
+    let start = Pos2::new(from.right() + 4.0, from.center().y);
+    let end = Pos2::new(to.left() - 6.0, to.center().y);
+    let reach = ((end.x - start.x) * 0.45).clamp(20.0, 90.0);
+    let color = Color32::from_rgba_unmultiplied(116, 162, 255, 150);
+    let painter = ui.painter();
+    painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+        [
+            start,
+            Pos2::new(start.x + reach, start.y),
+            Pos2::new(end.x - reach, end.y),
+            end,
+        ],
+        false,
+        Color32::TRANSPARENT,
+        Stroke::new(1.5_f32, color),
+    ));
+    painter.circle_filled(start, 2.5, color);
+    painter.circle_filled(end, 3.0, color);
 }
 
 fn mini_heading(ui: &mut Ui, text: &str) {
@@ -8527,5 +8755,116 @@ unknown_gamepad_field = 7
         assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
         assert!(!temp.exists());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_binding_autofills_selected_button_and_valid_default() {
+        // When 'A' is selected on Xbox, next binding should auto-fill BTN_SOUTH with default confirm for XMB
+        let entry = next_binding_entry(Template::Xbox, "A", "gamepad.buttons", XMB_ACTIONS, &[]);
+        assert_eq!(entry, Some(("BTN_SOUTH", "confirm")));
+
+        // For Navi base, next binding should auto-fill BTN_SOUTH with default pointer.left
+        let entry = next_binding_entry(Template::Xbox, "A", "gamepad.navi.bindings", ACTIONS, &[]);
+        assert_eq!(entry, Some(("BTN_SOUTH", "pointer.left")));
+
+        // For D-pad up, next binding should auto-fill BTN_DPAD_UP with default up
+        let entry = next_binding_entry(
+            Template::Xbox,
+            "D-pad up",
+            "gamepad.buttons",
+            XMB_ACTIONS,
+            &[],
+        );
+        assert_eq!(entry, Some(("BTN_DPAD_UP", "up")));
+    }
+
+    #[test]
+    fn add_binding_preserves_selection_order_when_selected_already_bound() {
+        let used = vec!["BTN_SOUTH".to_string()];
+        // When 'A' (BTN_SOUTH) is already bound, next binding cycles hotspots in selection order.
+        // In XBOX_HOTSPOTS order, after "A" comes "SELECT" (BTN_SELECT).
+        let entry = next_binding_entry(Template::Xbox, "A", "gamepad.buttons", XMB_ACTIONS, &used);
+        assert_eq!(entry, Some(("BTN_SELECT", "back")));
+
+        let used_two = vec!["BTN_SOUTH".to_string(), "BTN_SELECT".to_string()];
+        let entry = next_binding_entry(
+            Template::Xbox,
+            "A",
+            "gamepad.buttons",
+            XMB_ACTIONS,
+            &used_two,
+        );
+        // After "SELECT" comes "START" (BTN_START).
+        assert_eq!(entry, Some(("BTN_START", "confirm")));
+    }
+
+    #[test]
+    fn add_binding_avoids_invalid_empty_state_when_all_bound() {
+        let all_used: Vec<String> = BUTTONS.iter().map(|(c, _)| (*c).to_string()).collect();
+        let entry = next_binding_entry(
+            Template::Xbox,
+            "A",
+            "gamepad.buttons",
+            XMB_ACTIONS,
+            &all_used,
+        );
+        assert_eq!(
+            entry, None,
+            "must not produce empty or duplicate binding when all buttons are bound"
+        );
+    }
+
+    #[test]
+    fn ds4_touchpad_unmapped_falls_back_in_order() {
+        // Touchpad has code: None. next_binding_entry should find the first hotspot with a code in DS4 order.
+        let entry = next_binding_entry(
+            Template::Ds4,
+            "Touchpad",
+            "gamepad.buttons",
+            XMB_ACTIONS,
+            &[],
+        );
+        assert!(entry.is_some());
+        let (code, action) = entry.unwrap();
+        assert!(!code.is_empty());
+        assert!(XMB_ACTIONS.contains(&action));
+    }
+
+    #[test]
+    fn ds4_artwork_has_no_visible_touchpad_text_but_keeps_hotspot() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let ds4_svg = fs::read_to_string(manifest_dir.join("../../assets/controller-ds4.svg"))
+            .expect("controller-ds4.svg missing");
+
+        // The touchpad rectangle element must remain present for layout and hotspot alignment
+        assert!(
+            ds4_svg.contains("id=\"Touchpad\""),
+            "Touchpad rect must exist"
+        );
+        // But visible text must not be rendered in the controller artwork
+        assert!(
+            !ds4_svg.contains(">TOUCHPAD<") && !ds4_svg.contains(">Touchpad<"),
+            "DS4 artwork must not display visible Touchpad text"
+        );
+
+        // Hotspot selection and behavior remains intact
+        let ds4_hotspots = Template::Ds4.hotspots();
+        let touchpad_hs = ds4_hotspots
+            .iter()
+            .find(|h| h.control == "Touchpad")
+            .expect("Touchpad hotspot must exist in DS4 template");
+        assert_eq!(touchpad_hs.code, None);
+        assert!(!touchpad_hs.label);
+    }
+
+    #[test]
+    fn binding_editor_context_uses_correct_action_set() {
+        // Context "xmb" must use XMB_ACTIONS
+        assert!(XMB_ACTIONS.contains(&"confirm"));
+        assert!(!XMB_ACTIONS.contains(&"pointer.left"));
+
+        // Context "base" or layers must use ACTIONS
+        assert!(ACTIONS.contains(&"pointer.left"));
+        assert!(!ACTIONS.contains(&"confirm"));
     }
 }
