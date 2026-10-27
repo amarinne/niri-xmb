@@ -1,8 +1,8 @@
 //! Native editor for niri-xmb TOML.
 //!
 //! Left navigation selects a section, the command bar loads, validates and
-//! saves, and a persistent live dock shows the popup render and Niri keybind
-//! map. The controller editor map also reflects live input when available. The
+//! saves, and the popup and keyboard pages show live renderer and Niri keybind
+//! state alongside their editors. The controller editor map also reflects live input when available. The
 //! editor loads the real schema through
 //! `niri-xmb config-json`, writes only changed paths through `toml_edit`,
 //! validates with `config-check`, and saves atomically. It does not talk to the
@@ -27,6 +27,8 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write as _};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -567,14 +569,16 @@ enum Section {
     Trigger,
     Popup,
     Appearance,
+    Keyboard,
 }
 
 impl Section {
-    const ALL: [(Section, &'static str); 4] = [
+    const ALL: [(Section, &'static str); 5] = [
         (Self::Controller, "Controller"),
         (Self::Trigger, "Trigger Lab"),
         (Self::Popup, "Popup"),
         (Self::Appearance, "Appearance"),
+        (Self::Keyboard, "Keyboard"),
     ];
 
     fn title(self) -> &'static str {
@@ -583,6 +587,7 @@ impl Section {
             Self::Trigger => "Trigger Lab",
             Self::Popup => "Popup",
             Self::Appearance => "Appearance",
+            Self::Keyboard => "Keyboard",
         }
     }
 
@@ -592,33 +597,7 @@ impl Section {
             Self::Trigger => "Response curve and speed tuning",
             Self::Popup => "Panel, behavior, peek, animation",
             Self::Appearance => "Theme, colors, bars",
-        }
-    }
-}
-
-/// Tabs in the persistent live dock.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DockTab {
-    Popup,
-    Keyboard,
-}
-
-impl DockTab {
-    const ALL: [DockTab; 2] = [Self::Popup, Self::Keyboard];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Popup => "Popup",
-            Self::Keyboard => "Keyboard",
-        }
-    }
-
-    /// The tab that best matches an editor section for auto-follow.
-    fn for_section(section: Section) -> Self {
-        match section {
-            Section::Controller | Section::Trigger | Section::Popup | Section::Appearance => {
-                Self::Popup
-            }
+            Self::Keyboard => "Niri keybinds and live input",
         }
     }
 }
@@ -635,9 +614,47 @@ struct LiveState {
     snapshot: Value,
     error: String,
     updated_at: Option<Instant>,
+    /// When the newest pushed gamepad frame arrived (local clock).
+    gamepad_at: Option<Instant>,
+    /// Smoothed pushed-gamepad frame rate, measured on arrival.
+    gamepad_hz: f32,
+    gamepad_frames: u64,
 }
 
+/// One request/response round-trip on the control socket (no subprocess).
+fn socket_request(socket: &Path, request: &str) -> Option<Value> {
+    let mut stream = UnixStream::connect(socket).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .ok()?;
+    stream.write_all(request.as_bytes()).ok()?;
+    stream.shutdown(std::net::Shutdown::Write).ok()?;
+    let mut text = String::new();
+    stream.read_to_string(&mut text).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn control_socket_path(status: Option<&Value>) -> PathBuf {
+    if let Some(path) = status.and_then(|status| status["socket"].as_str()) {
+        return PathBuf::from(path);
+    }
+    let runtime = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/user/1000"));
+    runtime.join("niri-xmb.sock")
+}
+
+/// Live data arrives on the daemon's push stream, never on a timer.
+///
+/// One `status` request per (re)connect seeds the non-gamepad fields and
+/// locates the socket; after that the thread blocks reading NDJSON frames
+/// and wakes egui only when a frame actually arrives. Gamepad frames are
+/// coalesced by the daemon to ~60 Hz, so stick motion is smooth while an
+/// idle desktop costs no wakeups at all. The 250 ms read timeout exists
+/// only so shutdown can be observed while the stream is idle.
 fn spawn_live(
+    ctx: egui::Context,
     niri_xmb: PathBuf,
     live: Arc<Mutex<LiveState>>,
     stop: Arc<AtomicBool>,
@@ -645,28 +662,20 @@ fn spawn_live(
     thread::Builder::new()
         .name("niri-xmb-studio-live".into())
         .spawn(move || {
-            // The daemon mirrors its snapshot into the runtime directory, so
-            // status plus a file read is enough after the first iteration.
-            let mut mirror: Option<PathBuf> = None;
             while !stop.load(Ordering::Relaxed) {
+                // Seed once per connection: status (socket/mirror paths,
+                // niri health) plus the mirrored snapshot file.
                 let status = run_niri(&niri_xmb, &["status"])
                     .ok()
                     .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-                if let Some(path) = status
+                let socket = control_socket_path(status.as_ref());
+                let snapshot = status
                     .as_ref()
                     .and_then(|status| status["snapshot_mirror"].as_str())
-                {
-                    mirror = Some(PathBuf::from(path));
-                }
-                let snapshot = mirror
-                    .as_ref()
+                    .map(PathBuf::from)
                     .and_then(|path| fs::read_to_string(path).ok())
                     .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                    .or_else(|| {
-                        run_niri(&niri_xmb, &["snapshot"])
-                            .ok()
-                            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                    });
+                    .or_else(|| socket_request(&socket, "snapshot"));
                 if let Ok(mut state) = live.lock() {
                     if let Some(status) = status {
                         state.status = status;
@@ -680,13 +689,107 @@ fn spawn_live(
                         state.error = "daemon status unavailable".to_string();
                     }
                 }
-                // Analog telemetry is rendered by the trigger tuning panel.
-                // Keep this faster than the normal status cadence so reticles
-                // do not appear to jump between stale samples.
-                thread::sleep(Duration::from_millis(50));
+                ctx.request_repaint();
+
+                if stream_live(&ctx, &socket, &live, &stop) {
+                    return; // stop requested
+                }
+                // Stream ended (daemon restart or old daemon): wait briefly
+                // in stop-aware slices, then reseed and reconnect.
+                for _ in 0..5 {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
             }
         })
-        .expect("spawn live studio poller")
+        .expect("spawn live studio stream")
+}
+
+/// Block on the subscribe stream until it ends or `stop` is set.
+/// Returns true when the caller should exit instead of reconnecting.
+fn stream_live(
+    ctx: &egui::Context,
+    socket: &Path,
+    live: &Arc<Mutex<LiveState>>,
+    stop: &Arc<AtomicBool>,
+) -> bool {
+    let Ok(stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let Ok(mut writer) = stream.try_clone() else {
+        return false;
+    };
+    if writer.write_all(b"subscribe 1\n").is_err() {
+        return false;
+    }
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let mut last_gamepad: Option<Instant> = None;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return false,
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => return false,
+        }
+        let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let now = Instant::now();
+        if let Ok(mut state) = live.lock() {
+            match frame["type"].as_str() {
+                Some("snapshot") => {
+                    state.snapshot = frame["snapshot"].clone();
+                    state.error.clear();
+                    state.updated_at = Some(now);
+                }
+                Some("gamepad") => {
+                    if !state.status.is_object() {
+                        state.status = json!({});
+                    }
+                    state.status["gamepad"] = frame["gamepad"].clone();
+                    if let Some(previous) = last_gamepad {
+                        let dt = now.duration_since(previous).as_secs_f32();
+                        if dt > 0.0 {
+                            let hz = (1.0 / dt).min(240.0);
+                            state.gamepad_hz = if state.gamepad_hz <= 0.0 {
+                                hz
+                            } else {
+                                state.gamepad_hz * 0.75 + hz * 0.25
+                            };
+                        }
+                    }
+                    last_gamepad = Some(now);
+                    state.gamepad_at = Some(now);
+                    state.gamepad_frames += 1;
+                    state.error.clear();
+                    state.updated_at = Some(now);
+                }
+                Some("error") => {
+                    state.error = frame["message"]
+                        .as_str()
+                        .unwrap_or("daemon stream error")
+                        .to_string();
+                }
+                _ => {}
+            }
+        }
+        ctx.request_repaint();
+    }
 }
 
 impl Drop for StudioApp {
@@ -738,11 +841,6 @@ struct StudioApp {
     preview_hover: Option<PreviewTarget>,
     preview_selection: Option<PreviewSelection>,
     preview_selection_at: Instant,
-    dock_tab: DockTab,
-    dock_collapsed: bool,
-    dock_height: f32,
-    dock_follow: bool,
-    dock_section: Section,
     keymap: keymap::NiriKeymap,
     keymap_at: Instant,
     keymap_search: String,
@@ -795,11 +893,6 @@ impl StudioApp {
             preview_hover: None,
             preview_selection: None,
             preview_selection_at: Instant::now(),
-            dock_tab: DockTab::Popup,
-            dock_collapsed: false,
-            dock_height: 360.0,
-            dock_follow: true,
-            dock_section: Section::Controller,
             keymap: keymap::NiriKeymap::load_default(),
             keymap_at: Instant::now(),
             keymap_search: String::new(),
@@ -809,6 +902,7 @@ impl StudioApp {
             validated_path: String::new(),
         };
         app.live_thread = Some(spawn_live(
+            cc.egui_ctx.clone(),
             niri_xmb,
             Arc::clone(&app.live),
             Arc::clone(&app.live_stop),
@@ -1308,9 +1402,7 @@ impl StudioApp {
             self.show_changes = !self.show_changes;
         }
         if tt(ui.button("▣ Preview"), "ui.action.preview").clicked() {
-            self.dock_tab = DockTab::Popup;
-            self.dock_collapsed = false;
-            self.dock_follow = true;
+            self.section = Section::Popup;
         }
         if tt(
             ui.add_enabled(self.model != Value::Null, egui::Button::new("✓ Validate")),
@@ -1505,6 +1597,7 @@ impl StudioApp {
                             Section::Trigger => self.trigger_section(ui),
                             Section::Popup => self.popup_section(ui),
                             Section::Appearance => self.appearance_section(ui),
+                            Section::Keyboard => self.keyboard_section(ui),
                         }
                         ui.add_space(24.0);
                     });
@@ -1526,7 +1619,7 @@ impl StudioApp {
 
     fn controller_section(&mut self, ui: &mut Ui) {
         self.section_header(ui);
-        self.detected_controller_card(ui);
+        self.gamepad_diagnostics_card(ui);
         self.controller_map_card(ui);
         if ui.available_width() >= 900.0 {
             ui.columns(2, |cols| {
@@ -1540,63 +1633,134 @@ impl StudioApp {
         section_card(ui, "Layers", |ui| self.layers_ui(ui));
     }
 
-    fn detected_controller_card(&self, ui: &mut Ui) {
+    /// Tester-style live readout: device identity, every button value,
+    /// both stick reticles with raw axis numbers, and the stream rate.
+    /// Fed by pushed gamepad frames; renders identically at any width by
+    /// wrapping button cells and stacking the stick row when narrow.
+    fn gamepad_diagnostics_card(&self, ui: &mut Ui) {
         let live = self
             .live
             .lock()
             .map(|live| live.clone())
             .unwrap_or_default();
-        let status = &live.status;
-        let gamepad = &status["gamepad"];
-        let connected = gamepad["connected"].as_array().cloned().unwrap_or_default();
+        let view = GamepadLiveView::from_status(&live.status);
+        let is_connected = view.connected > 0;
         card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Detected controller").size(12.0).strong());
-                let dot = if !connected.is_empty() { OK } else { WARN };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(if view.device_name.is_empty() {
+                        "No controller"
+                    } else {
+                        &view.device_name
+                    })
+                    .size(17.0)
+                    .strong(),
+                );
+                let dot = if is_connected { OK } else { WARN };
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
                 ui.painter().circle_filled(rect.center(), 3.0, dot);
                 ui.label(
-                    RichText::new(if connected.is_empty() {
-                        "not detected"
-                    } else {
+                    RichText::new(if is_connected {
                         "connected"
+                    } else {
+                        "not detected"
                     })
                     .size(10.0)
                     .color(dot),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let Some(error) = status["error"].as_str() {
+                    if let Some(error) = live.status["error"].as_str() {
                         ui.label(RichText::new(error).size(9.5).color(ERROR));
                     } else if !live.error.is_empty() {
                         ui.label(RichText::new(&live.error).size(9.5).color(ERROR));
                     }
                 });
             });
-            if connected.is_empty() {
+            if is_connected && (view.vendor != 0 || view.product != 0) {
                 ui.label(
-                    RichText::new("No controller connected")
+                    RichText::new(format!(
+                        "Vendor: {:04x}  Product: {:04x}  ·  {}",
+                        view.vendor, view.product, view.device_path
+                    ))
+                    .monospace()
+                    .size(9.5)
+                    .color(TEXT_DIM),
+                );
+            } else if is_connected && !view.device_path.is_empty() {
+                ui.label(
+                    RichText::new(&view.device_path)
+                        .monospace()
+                        .size(9.5)
+                        .color(TEXT_DIM),
+                );
+            }
+            ui.add_space(6.0);
+            let age = live
+                .gamepad_at
+                .map(|at| format!("{} ms ago", at.elapsed().as_millis()))
+                .unwrap_or_else(|| "no frames yet".to_string());
+            let rate = if live.gamepad_hz > 0.5 {
+                format!("{:.0} Hz · {age}", live.gamepad_hz)
+            } else {
+                age
+            };
+            ui.horizontal_wrapped(|ui| {
+                metric_chip(ui, "MAPPING", &view.preset);
+                metric_chip(ui, "MODE", self.gamepad_mode_name());
+                metric_chip(ui, "DEVICES", view.connected);
+                metric_chip(ui, "STREAM", rate);
+                metric_chip(ui, "FRAMES", live.gamepad_frames);
+            });
+            if !is_connected {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Connect a controller to see live buttons, sticks and triggers.")
                         .size(11.0)
                         .color(TEXT_MUTED),
                 );
-            } else {
-                for device in connected {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(device["name"].as_str().unwrap_or("controller"))
-                                .size(11.0)
-                                .color(TEXT),
-                        );
-                        ui.label(
-                            RichText::new(device["path"].as_str().unwrap_or(""))
-                                .monospace()
-                                .size(9.0)
-                                .color(TEXT_DIM),
-                        );
-                    });
+                return;
+            }
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+            diagnostics_label(ui, "Buttons");
+            ui.horizontal_wrapped(|ui| {
+                for (code, friendly) in BUTTONS {
+                    // D-pad may arrive as hat axes rather than BTN_DPAD_*.
+                    let pressed = match *code {
+                        "BTN_DPAD_UP" => view.dpad("up"),
+                        "BTN_DPAD_DOWN" => view.dpad("down"),
+                        "BTN_DPAD_LEFT" => view.dpad("left"),
+                        "BTN_DPAD_RIGHT" => view.dpad("right"),
+                        _ => view.button(code),
+                    };
+                    let short = friendly.split(" / ").next().unwrap_or(friendly);
+                    button_cell(ui, short, pressed);
                 }
+            });
+            ui.add_space(8.0);
+            let (lx, ly) = view.stick(true);
+            let (rx, ry) = view.stick(false);
+            if ui.available_width() >= 680.0 {
+                ui.horizontal_top(|ui| {
+                    stick_reticle(ui, "L STICK", "AXIS 0", lx, "AXIS 1", ly);
+                    ui.add_space(18.0);
+                    stick_reticle(ui, "R STICK", "AXIS 2", rx, "AXIS 3", ry);
+                    ui.add_space(18.0);
+                    ui.vertical(|ui| {
+                        diagnostics_label(ui, "Axes & triggers");
+                        axes_list(ui, &view);
+                    });
+                });
+            } else {
+                stick_reticle(ui, "L STICK", "AXIS 0", lx, "AXIS 1", ly);
+                ui.add_space(6.0);
+                stick_reticle(ui, "R STICK", "AXIS 2", rx, "AXIS 3", ry);
+                ui.add_space(6.0);
+                diagnostics_label(ui, "Axes & triggers");
+                axes_list(ui, &view);
             }
         });
-        ui.add_space(8.0);
     }
 
     fn trigger_section(&mut self, ui: &mut Ui) {
@@ -3498,6 +3662,7 @@ impl StudioApp {
 
     fn popup_section(&mut self, ui: &mut Ui) {
         self.section_header(ui);
+        self.popup_preview_card(ui);
         section_card(ui, "Panel", |ui| {
             if ui.available_width() >= 480.0 {
                 ui.columns(2, |cols| {
@@ -3640,6 +3805,74 @@ impl StudioApp {
                 self.f32_field(ui, "animation.scroll_ms", "Scroll ms", 0.0, 60_000.0, 1.0);
                 self.f32_field(ui, "animation.open_scale", "Open scale", 0.1, 2.0, 0.01);
             }
+        });
+    }
+
+    fn popup_preview_card(&mut self, ui: &mut Ui) {
+        section_card(ui, "Live preview", |ui| {
+            let available = ui.available_size();
+            let wide = available.x >= 760.0;
+            let preview_height = available.y.min(if wide { 360.0 } else { 300.0 }).max(220.0);
+            let preview_width = if wide {
+                (available.x * 0.62).clamp(280.0, 760.0)
+            } else {
+                available.x.max(220.0)
+            };
+            if wide {
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(preview_width, preview_height),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_min_height(preview_height);
+                            self.live_xmb_preview(ui, Vec2::new(preview_width, preview_height));
+                        },
+                    );
+                    ui.add_space(14.0);
+                    self.popup_preview_meta(ui);
+                });
+            } else {
+                self.live_xmb_preview(ui, Vec2::new(preview_width, preview_height));
+                ui.add_space(10.0);
+                self.popup_preview_meta(ui);
+            }
+        });
+    }
+
+    fn popup_preview_meta(&self, ui: &mut Ui) {
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Current panel").size(12.0).strong());
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                metric_chip(ui, "outputs", self.model["popup"]["outputs"].as_str().unwrap_or("focused"));
+                metric_chip(ui, "position", self.model["popup"]["position"].as_str().unwrap_or("cursor"));
+                metric_chip(ui, "surface", self.model["popup"]["surface_mode"].as_str().unwrap_or("fixed"));
+                metric_chip(ui, "labels", on_off(self.model["popup"]["show_labels"].as_bool()));
+                metric_chip(ui, "titles", on_off(self.model["popup"]["show_titles"].as_bool()));
+                metric_chip(ui, "anim", format!("{} ms", self.model["animation"]["panel_ms"].as_f64().unwrap_or(0.0)));
+            });
+            ui.add_space(8.0);
+            ui.label(RichText::new("What you are seeing").size(10.5).strong());
+            ui.label(RichText::new("The preview uses the daemon renderer and current live snapshot. Hover a window or workspace, then click to focus it.").size(10.0).color(TEXT_MUTED));
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                metric_chip(ui, "bars", array_len(&self.model["bars"]));
+                metric_chip(ui, "placements", array_len(&self.model["popup"]["placements"]));
+                metric_chip(ui, "navi binds", map_len(&self.model["gamepad"]["navi"]["bindings"]));
+                metric_chip(ui, "xmb binds", map_len(&self.model["gamepad"]["buttons"]));
+            });
+        });
+    }
+
+    fn keyboard_section(&mut self, ui: &mut Ui) {
+        self.section_header(ui);
+        if self.keymap_at.elapsed() > Duration::from_secs(5) {
+            self.reload_keymap();
+        }
+        section_card(ui, "Keymap", |ui| {
+            let body = ui.available_size();
+            self.keyboard_content(ui, body);
         });
     }
 
@@ -4771,7 +5004,7 @@ impl StudioApp {
 }
 
 // ---------------------------------------------------------------------------
-// Persistent live dock
+// Live controller and keyboard surfaces
 // ---------------------------------------------------------------------------
 
 /// Controller button and axis state aggregated from `niri-xmb status`.
@@ -4781,6 +5014,10 @@ struct GamepadLiveView {
     axes: BTreeMap<String, f32>,
     connected: usize,
     device_name: String,
+    device_path: String,
+    preset: String,
+    vendor: u16,
+    product: u16,
 }
 
 impl GamepadLiveView {
@@ -4788,15 +5025,26 @@ impl GamepadLiveView {
         let connected = status["gamepad"]["connected"]
             .as_array()
             .map_or(0, Vec::len);
-        let device_name = status["gamepad"]["connected"]
+        let first = status["gamepad"]["connected"]
             .as_array()
             .and_then(|devices| devices.first())
-            .and_then(|device| device["name"].as_str())
-            .unwrap_or("")
-            .to_string();
+            .cloned()
+            .unwrap_or(Value::Null);
         let mut view = Self {
             connected,
-            device_name,
+            device_name: first["name"].as_str().unwrap_or("").to_string(),
+            device_path: first["path"].as_str().unwrap_or("").to_string(),
+            preset: first["preset"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    status["gamepad"]["preset"]
+                        .as_str()
+                        .unwrap_or("-")
+                        .to_string()
+                }),
+            vendor: first["vendor"].as_u64().unwrap_or(0) as u16,
+            product: first["product"].as_u64().unwrap_or(0) as u16,
             ..Self::default()
         };
         for device in status["gamepad"]["live"].as_array().into_iter().flatten() {
@@ -4862,232 +5110,6 @@ impl GamepadLiveView {
 }
 
 impl StudioApp {
-    fn live_dock(&mut self, ctx: &egui::Context) {
-        let frame = egui::Frame::new()
-            .fill(PANEL)
-            .inner_margin(egui::Margin::symmetric(12, 4))
-            .stroke(Stroke::new(1.0_f32, BORDER));
-        let max_height = (ctx.screen_rect().height() * 0.62).max(180.0);
-        self.dock_height = self.dock_height.clamp(170.0, max_height);
-        if self.dock_collapsed {
-            egui::TopBottomPanel::bottom("live-dock")
-                .frame(frame)
-                .exact_height(38.0)
-                .show(ctx, |ui| self.dock_header(ui));
-            return;
-        }
-        egui::TopBottomPanel::bottom("live-dock")
-            .frame(frame)
-            .exact_height(self.dock_height)
-            .show(ctx, |ui| {
-                self.dock_grip(ui, max_height);
-                self.dock_header(ui);
-                ui.add_space(4.0);
-                let body = Vec2::new(ui.available_width(), ui.available_height().max(80.0));
-                if self.dock_tab == DockTab::Keyboard
-                    && self.keymap_at.elapsed() > Duration::from_secs(5)
-                {
-                    self.reload_keymap();
-                }
-                match self.dock_tab {
-                    DockTab::Popup => self.dock_popup(ui, body),
-                    DockTab::Keyboard => self.dock_keyboard(ui, body),
-                }
-            });
-    }
-
-    /// Visible drag handle on the dock's top edge.
-    ///
-    /// egui's built-in panel border is only a few pixels wide and invisible, so
-    /// the owner could not find the resize affordance. This strip owns the
-    /// height directly and paints a grip for it.
-    fn dock_grip(&mut self, ui: &mut Ui, max_height: f32) {
-        let (rect, response) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 9.0), Sense::drag());
-        let active = response.hovered() || response.dragged();
-        ui.painter().rect_filled(
-            Rect::from_center_size(rect.center(), Vec2::new(56.0, 5.0)),
-            2.5,
-            if active {
-                ACCENT
-            } else {
-                Color32::from_rgb(92, 102, 118)
-            },
-        );
-        if active {
-            ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
-        }
-        if response.dragged() {
-            let delta = ui.ctx().input(|input| input.pointer.delta().y);
-            self.dock_height = (self.dock_height - delta).clamp(170.0, max_height);
-        }
-        if response.double_clicked() {
-            self.dock_collapsed = true;
-        }
-        response.on_hover_text("Drag to resize · double-click to hide");
-    }
-
-    fn dock_header(&mut self, ui: &mut Ui) {
-        if self.dock_section != self.section {
-            self.dock_section = self.section;
-            if self.dock_follow {
-                self.dock_tab = DockTab::for_section(self.section);
-            }
-        }
-        ui.horizontal(|ui| {
-            let (dot, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
-            let live = self
-                .live
-                .lock()
-                .map(|live| live.clone())
-                .unwrap_or_default();
-            let color = if live.status.is_null() { WARN } else { OK };
-            ui.painter().circle_filled(dot.center(), 3.5, color);
-            ui.label(RichText::new("Live").size(12.0).strong());
-            ui.add_space(6.0);
-            for tab in DockTab::ALL {
-                if dock_tab_button(ui, self.dock_tab == tab, tab.label()).clicked() {
-                    self.dock_tab = tab;
-                    if tab == DockTab::Keyboard {
-                        // The key map needs vertical room to stay square.
-                        self.dock_height = self.dock_height.max(380.0);
-                    }
-                }
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let label = if self.dock_collapsed { "Show" } else { "Hide" };
-                if ui
-                    .add(egui::Button::new(label).small())
-                    .on_hover_text(if self.dock_collapsed {
-                        "Expand live dock"
-                    } else {
-                        "Collapse live dock"
-                    })
-                    .clicked()
-                {
-                    self.dock_collapsed = !self.dock_collapsed;
-                }
-                if ui
-                    .checkbox(&mut self.dock_follow, RichText::new("Follow").size(10.5))
-                    .on_hover_text("Switch the dock tab with the editor section")
-                    .clicked()
-                    && self.dock_follow
-                {
-                    self.dock_tab = DockTab::for_section(self.section);
-                }
-                let status = self.dock_status_text(&live);
-                ui.label(RichText::new(status).monospace().size(9.5).color(TEXT_DIM));
-            });
-        });
-    }
-
-    fn dock_status_text(&self, live: &LiveState) -> String {
-        if live.status.is_null() {
-            return if live.error.is_empty() {
-                "waiting for daemon".into()
-            } else {
-                live.error.clone()
-            };
-        }
-        let mut text = format!(
-            "daemon {}",
-            live.status["mode"].as_str().unwrap_or("hidden")
-        );
-        if let Some(selection) = live.status["selection"].as_object() {
-            if let Some(output) = selection["output"].as_str() {
-                text.push_str(&format!(" · {output}"));
-            }
-            if let Some(workspace) = selection["workspace_id"].as_u64() {
-                text.push_str(&format!(" · ws {workspace}"));
-            }
-        }
-        if let Some(generation) = live.status["generation"].as_u64() {
-            text.push_str(&format!(" · gen {generation}"));
-        }
-        text
-    }
-
-    fn dock_popup(&mut self, ui: &mut Ui, body: Vec2) {
-        let preview_w = (body.x * 0.58).clamp(240.0, body.x);
-        let preview_h = (body.y - 4.0).max(70.0);
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(
-                Vec2::new(preview_w, preview_h),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    ui.set_min_height(preview_h);
-                    self.live_xmb_preview(ui, Vec2::new(preview_w, preview_h));
-                },
-            );
-            ui.add_space(10.0);
-            ui.vertical(|ui| {
-                ui.set_width(ui.available_width());
-                ui.label(RichText::new("Panel").size(11.5).strong());
-                ui.add_space(2.0);
-                ui.horizontal_wrapped(|ui| {
-                    metric_chip(
-                        ui,
-                        "outputs",
-                        self.model["popup"]["outputs"].as_str().unwrap_or("focused"),
-                    );
-                    metric_chip(
-                        ui,
-                        "position",
-                        self.model["popup"]["position"].as_str().unwrap_or("cursor"),
-                    );
-                    metric_chip(
-                        ui,
-                        "surface",
-                        self.model["popup"]["surface_mode"]
-                            .as_str()
-                            .unwrap_or("fixed"),
-                    );
-                    metric_chip(
-                        ui,
-                        "labels",
-                        on_off(self.model["popup"]["show_labels"].as_bool()),
-                    );
-                    metric_chip(
-                        ui,
-                        "titles",
-                        on_off(self.model["popup"]["show_titles"].as_bool()),
-                    );
-                    metric_chip(
-                        ui,
-                        "anim",
-                        format!(
-                            "{} ms",
-                            self.model["animation"]["panel_ms"].as_f64().unwrap_or(0.0)
-                        ),
-                    );
-                });
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    metric_chip(ui, "bars", array_len(&self.model["bars"]));
-                    metric_chip(
-                        ui,
-                        "placements",
-                        array_len(&self.model["popup"]["placements"]),
-                    );
-                    metric_chip(
-                        ui,
-                        "navi binds",
-                        map_len(&self.model["gamepad"]["navi"]["bindings"]),
-                    );
-                    metric_chip(ui, "xmb binds", map_len(&self.model["gamepad"]["buttons"]));
-                });
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(
-                        "Same renderer as the daemon · hover to preview · click an icon to focus",
-                    )
-                    .size(9.5)
-                    .color(TEXT_DIM),
-                );
-            });
-        });
-    }
-
     fn connected_count(&self) -> usize {
         self.live
             .lock()
@@ -5112,7 +5134,7 @@ impl StudioApp {
         }
     }
 
-    fn dock_keyboard(&mut self, ui: &mut Ui, body: Vec2) {
+    fn keyboard_content(&mut self, ui: &mut Ui, body: Vec2) {
         let mapped_keys = self
             .keymap
             .effective()
@@ -5149,7 +5171,7 @@ impl StudioApp {
         let remaining = ui.available_size();
         let mut clicked = None;
         if body.x >= 880.0 {
-            // Wide dock: board on the left, bind table on the right. The board
+            // Wide layout: board on the left, bind table on the right. The board
             // keeps its 15-key width and never stretches to fill the column.
             let cell_by_height = ((remaining.y - 24.0) / 6.0).clamp(12.0, 40.0);
             let map_w = (15.0 * cell_by_height + 18.0).clamp(320.0, 640.0);
@@ -5340,7 +5362,8 @@ impl StudioApp {
                         },
                     );
                 }
-                let response = ui.interact(cap, ui.id().with(("dock-key", *id)), Sense::click());
+                let response =
+                    ui.interact(cap, ui.id().with(("keyboard-key", *id)), Sense::click());
                 if response.clicked() {
                     clicked = Some(*id);
                 }
@@ -5400,10 +5423,10 @@ fn keymap_matches(bind: &keymap::NiriBind, query: &str) -> bool {
             .is_some_and(|title| title.to_ascii_lowercase().contains(query))
 }
 
-/// Largest 1u key edge. Without the cap a wide dock stretches one key across
+/// Largest 1u key edge. Without the cap a wide layout stretches one key across
 /// the panel and the board stops reading as a keyboard.
 const KEYBOARD_MAX_KEY: f32 = 40.0;
-/// Smallest 1u key edge that still reads as a keyboard in a short dock.
+/// Smallest 1u key edge that still reads as a keyboard in a short layout.
 const KEYBOARD_MIN_KEY: f32 = 9.0;
 
 fn keyboard_legend_height(available: Vec2) -> f32 {
@@ -5411,7 +5434,7 @@ fn keyboard_legend_height(available: Vec2) -> f32 {
     0.0
 }
 
-/// Fit the 15x6 unit board into the dock, bounded by both dimensions so keys
+/// Fit the 15x6 unit board into the page, bounded by both dimensions so keys
 /// stay square however the splitter is dragged.
 fn keyboard_cell(available: Vec2) -> f32 {
     ((available.x - 12.0) / 15.0)
@@ -5555,6 +5578,156 @@ fn keymap_row(
         });
 }
 
+fn diagnostics_label(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).size(10.0).strong().color(TEXT_MUTED));
+    ui.add_space(4.0);
+}
+
+fn button_cell(ui: &mut Ui, label: &str, pressed: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(86.0, 36.0), Sense::hover());
+    let fill = if pressed {
+        Color32::from_rgba_unmultiplied(116, 162, 255, 70)
+    } else {
+        FIELD_BG
+    };
+    ui.painter().rect_filled(rect, 5.0, fill);
+    ui.painter().rect_stroke(
+        rect,
+        5.0,
+        Stroke::new(1.0_f32, if pressed { ACCENT } else { BORDER }),
+        StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.min + Vec2::new(6.0, 4.0),
+        Align2::LEFT_TOP,
+        label,
+        FontId::proportional(8.5),
+        if pressed { TEXT } else { TEXT_MUTED },
+    );
+    ui.painter().text(
+        rect.min + Vec2::new(6.0, 18.0),
+        Align2::LEFT_TOP,
+        if pressed { "1.00" } else { "0.00" },
+        FontId::monospace(10.0),
+        if pressed { Color32::WHITE } else { TEXT_DIM },
+    );
+}
+
+fn stick_reticle(ui: &mut Ui, title: &str, x_label: &str, x: f32, y_label: &str, y: f32) {
+    ui.vertical(|ui| {
+        diagnostics_label(ui, title);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                for (label, value) in [(x_label, x), (y_label, y)] {
+                    ui.label(RichText::new(label).monospace().size(8.5).color(TEXT_DIM));
+                    ui.label(
+                        RichText::new(format!("{value:.5}"))
+                            .monospace()
+                            .size(10.5)
+                            .color(TEXT),
+                    );
+                    ui.add_space(4.0);
+                }
+            });
+            ui.add_space(8.0);
+            let size = 108.0;
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+            let center = rect.center();
+            let radius = size / 2.0 - 2.0;
+            ui.painter()
+                .circle_stroke(center, radius, Stroke::new(1.0_f32, BORDER));
+            ui.painter().line_segment(
+                [
+                    Pos2::new(center.x - radius, center.y),
+                    Pos2::new(center.x + radius, center.y),
+                ],
+                Stroke::new(1.0_f32, BORDER),
+            );
+            ui.painter().line_segment(
+                [
+                    Pos2::new(center.x, center.y - radius),
+                    Pos2::new(center.x, center.y + radius),
+                ],
+                Stroke::new(1.0_f32, BORDER),
+            );
+            let dot = Pos2::new(
+                center.x + x.clamp(-1.0, 1.0) * radius,
+                center.y + y.clamp(-1.0, 1.0) * radius,
+            );
+            ui.painter().circle_filled(dot, 4.0, ACCENT);
+            ui.painter()
+                .circle_stroke(dot, 4.0, Stroke::new(1.0_f32, Color32::WHITE));
+        });
+    });
+}
+
+fn axes_list(ui: &mut Ui, view: &GamepadLiveView) {
+    if view.axes.is_empty() {
+        ui.label(
+            RichText::new("no axis input yet")
+                .size(10.0)
+                .color(TEXT_DIM),
+        );
+        return;
+    }
+    for (axis, value) in &view.axes {
+        let value = *value;
+        let trigger = matches!(axis.as_str(), "ABS_Z" | "ABS_RZ");
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(axis).monospace().size(9.0).color(TEXT_DIM));
+            let width = (ui.available_width() - 64.0).clamp(70.0, 190.0);
+            let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 6.0), Sense::hover());
+            ui.painter().rect_filled(bar, 3.0, FIELD_BG);
+            if trigger {
+                ui.painter().rect_filled(
+                    Rect::from_min_size(
+                        bar.min,
+                        Vec2::new(bar.width() * value.clamp(0.0, 1.0), bar.height()),
+                    ),
+                    3.0,
+                    if value > 0.05 { ACCENT } else { BORDER },
+                );
+            } else {
+                let center_x = bar.center().x;
+                let dot_x = center_x + value.clamp(-1.0, 1.0) * bar.width() / 2.0;
+                ui.painter().line_segment(
+                    [
+                        Pos2::new(center_x, bar.min.y),
+                        Pos2::new(center_x, bar.max.y),
+                    ],
+                    Stroke::new(1.0_f32, BORDER),
+                );
+                ui.painter().rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(center_x.min(dot_x), bar.min.y),
+                        Pos2::new(center_x.max(dot_x), bar.max.y),
+                    ),
+                    3.0,
+                    if value.abs() > 0.05 { ACCENT } else { BORDER },
+                );
+            }
+            ui.label(
+                RichText::new(format!("{value:+.3}"))
+                    .monospace()
+                    .size(9.0)
+                    .color(TEXT_DIM),
+            );
+        });
+    }
+    for (label, axis, button) in [("LT", "ABS_Z", "BTN_TL2"), ("RT", "ABS_RZ", "BTN_TR2")] {
+        let value = view.trigger(axis, button);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label).monospace().size(9.0).color(TEXT_DIM));
+            ui.label(
+                RichText::new(format!("{:>3.0}%", value * 100.0))
+                    .monospace()
+                    .size(9.0)
+                    .color(if value > 0.05 { TEXT } else { TEXT_DIM }),
+            );
+        });
+    }
+}
+
 fn metric_chip(ui: &mut Ui, label: &str, value: impl ToString) {
     egui::Frame::new()
         .fill(FIELD_BG)
@@ -5572,35 +5745,6 @@ fn metric_chip(ui: &mut Ui, label: &str, value: impl ToString) {
                 );
             });
         });
-}
-
-fn dock_tab_button(ui: &mut Ui, selected: bool, label: &str) -> egui::Response {
-    let response = egui::Frame::new()
-        .fill(if selected {
-            Color32::from_rgb(36, 47, 64)
-        } else {
-            Color32::TRANSPARENT
-        })
-        .stroke(if selected {
-            Stroke::new(1.0_f32, ACCENT)
-        } else {
-            Stroke::NONE
-        })
-        .corner_radius(6.0)
-        .inner_margin(egui::Margin::symmetric(9, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(label).size(10.5).color(if selected {
-                Color32::WHITE
-            } else {
-                TEXT_MUTED
-            }));
-        })
-        .response
-        .interact(Sense::click());
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-    }
-    response
 }
 
 fn on_off(value: Option<bool>) -> &'static str {
@@ -5735,15 +5879,17 @@ impl eframe::App for StudioApp {
         } else {
             self.nav_strip(ctx);
         }
-        self.live_dock(ctx);
         self.content(ctx);
         self.sync_history();
         self.confirm_modal(ctx);
-        // The live poller updates a shared snapshot without waking egui.
-        // Keep repainting while the live map or dock is visible so controller
-        // presses and popup feedback arrive even when the pointer is idle.
-        if self.section == Section::Controller || !self.dock_collapsed {
-            ctx.request_repaint_after(Duration::from_millis(200));
+        // Live frames wake egui from the stream thread as they arrive.
+        // This slow tick only ages the "last frame" readout and covers the
+        // popup/keyboard views, which have no pushed feed of their own.
+        if matches!(
+            self.section,
+            Section::Controller | Section::Popup | Section::Keyboard
+        ) {
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
 }
@@ -6937,7 +7083,7 @@ mod tests {
     fn live_gamepad_view_exposes_both_stick_coordinates_and_device_state() {
         let status = json!({
             "gamepad": {
-                "connected": [{"name": "Test Pad"}],
+                "connected": [{"name": "Test Pad", "path": "/dev/input/event9", "preset": "ds4", "vendor": 0x054c, "product": 0x05c4}],
                 "live": [{"axes": {
                     "ABS_X": 0.25, "ABS_Y": -0.5,
                     "ABS_RX": -0.75, "ABS_RY": 0.4
@@ -6947,6 +7093,9 @@ mod tests {
         let view = GamepadLiveView::from_status(&status);
         assert_eq!(view.connected, 1);
         assert_eq!(view.device_name, "Test Pad");
+        assert_eq!(view.device_path, "/dev/input/event9");
+        assert_eq!(view.preset, "ds4");
+        assert_eq!((view.vendor, view.product), (0x054c, 0x05c4));
         assert_eq!(view.stick(true), (0.25, -0.5));
         assert_eq!(view.stick(false), (-0.75, 0.4));
     }
@@ -7284,11 +7433,11 @@ unknown_gamepad_field = 7
 
     #[test]
     fn keyboard_cell_keeps_key_proportions() {
-        // Wide dock: the board must not stretch one key across the panel.
+        // Wide layouts must not stretch one key across the panel.
         let wide = keyboard_cell(Vec2::new(1800.0, 400.0));
         assert_eq!(wide, KEYBOARD_MAX_KEY);
 
-        // Short dock: height is the binding constraint, so keys shrink with it.
+        // Short layouts are height-bound, so keys shrink with them.
         let tall = keyboard_cell(Vec2::new(1800.0, 300.0));
         let short = keyboard_cell(Vec2::new(1800.0, 120.0));
         assert!(short < tall);
@@ -7313,7 +7462,7 @@ unknown_gamepad_field = 7
                 "{height}: board taller than the dock"
             );
         }
-        // Width-bound docks still respect the column budget.
+        // Width-bound layouts still respect the column budget.
         let narrow = keyboard_cell(Vec2::new(240.0, 400.0));
         assert!(15.0 * narrow + 10.0 <= 240.0);
     }

@@ -226,7 +226,7 @@ if [ -x "$tmp_dir/package/bin/niri-xmb-config-studio" ]; then
         "$DATA_DIR/applications/niri-xmb-config-studio.desktop"
     install -m 0644 "$tmp_dir/package/share/icons/hicolor/scalable/apps/niri-xmb-config-studio.svg" \
         "$DATA_DIR/icons/hicolor/scalable/apps/niri-xmb-config-studio.svg"
-    echo "${install_result} niri-xmb-config-studio"
+    echo "${install_result} config studio helper (launch with: niri-xmb gui)"
 fi
 
 if [ ! -e "$CONFIG_DIR/config.toml.example" ]; then

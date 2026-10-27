@@ -23,4 +23,4 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -f -t "$prefix/share/icons/hicolor" >/dev/null 2>&1 || true
 fi
 
-echo "installed niri-xmb-config-studio in $prefix"
+echo "installed niri-xmb config studio helper in $prefix; launch it with: niri-xmb gui"

@@ -6,13 +6,15 @@ Native `egui` editor for the controller and XMB TOML.
 
 ```sh
 cargo build -p niri-xmb --bin niri-xmb
-cargo run -p niri-xmb-config-studio -- \
-  --config ~/.config/niri-xmb/config.toml \
-  --niri-xmb target/debug/niri-xmb
+cargo build -p niri-xmb-config-studio
+cargo run -p niri-xmb -- \
+  gui \
+  --config ~/.config/niri-xmb/config.toml
 ```
 
-Use the installed `niri-xmb` path for an installed build. The window loads the
-selected TOML immediately.
+The `gui` subcommand launches the packaged studio helper and passes it the
+selected config and binary paths. Use the installed `niri-xmb gui` command;
+the window loads the selected TOML immediately.
 
 Install the helper, icon, and application entry:
 

@@ -58,10 +58,10 @@ controller identity is recorded in `$XDG_STATE_HOME/niri-xmb/controllers.json`
 (or `~/.local/state/niri-xmb/controllers.json`) with first/last seen times and
 connection count.
 
-A native config editor is available as `niri-xmb-config-studio`: it edits the
-controller and XMB TOML, previews panel/bar geometry and bindings, validates
-through the real loader, and saves atomically. Restart is explicit. Install the
-desktop entry with `scripts/install-config-studio.sh`; see
+A native config editor is available as `niri-xmb gui`: it edits the controller
+and XMB TOML, previews panel/bar geometry and bindings, validates through the
+real loader, and saves atomically. Restart is explicit. Install the desktop
+entry with `scripts/install-config-studio.sh`; see
 [CONFIG_STUDIO.md](CONFIG_STUDIO.md).
 
 The daemon watches `/dev/input/by-id` and attaches/detaches controllers live;

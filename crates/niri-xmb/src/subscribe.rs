@@ -29,6 +29,10 @@ struct HubState {
     /// change moves `content_revision` and deliberately leaves
     /// `generation` alone, and subscribers must still receive it.
     sequence: u64,
+    latest_gamepad: Option<Arc<Published>>,
+    /// Increments on every gamepad publish; independent of `sequence` so a
+    /// snapshot publish never hides a pending gamepad frame (or vice versa).
+    gamepad_sequence: u64,
     active: usize,
 }
 
@@ -82,6 +86,33 @@ impl SubscriptionHub {
         let mut state = self.state.lock().unwrap();
         state.sequence += 1;
         state.latest = Some(Arc::new(published));
+        drop(state);
+        self.signal.notify_all();
+    }
+
+    /// Store the newest live gamepad frame and wake every writer.
+    ///
+    /// `gamepad_body` is an already-serialised JSON object (the same object
+    /// `status` returns under its `gamepad` key). Callers coalesce to about
+    /// 60 Hz; the hub keeps only the newest frame, so a slow subscriber
+    /// skips intermediate stick positions instead of lagging behind them.
+    pub fn publish_gamepad(&self, gamepad_body: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.gamepad_sequence += 1;
+        let sequence = state.gamepad_sequence;
+        let raw = format!(
+            "{{\"type\":\"gamepad\",\"protocol\":{STREAM_PROTOCOL},\
+             \"instance\":\"{}\",\"sequence\":{sequence},\"gamepad\":{gamepad_body}}}",
+            self.instance
+        );
+        let published = if raw.len() > MAX_FRAME_BYTES {
+            Published::Oversize
+        } else {
+            Published::Snapshot {
+                line: Arc::new(raw + "\n"),
+            }
+        };
+        state.latest_gamepad = Some(Arc::new(published));
         drop(state);
         self.signal.notify_all();
     }
@@ -192,8 +223,11 @@ impl SubscriptionHub {
     fn run_writer(&self, mut writer: UnixStream, closed: Arc<AtomicBool>) {
         let _ = writer.set_write_timeout(Some(WRITE_TIMEOUT));
         let mut last_sent: u64 = 0;
+        let mut last_gamepad_sent: u64 = 0;
         loop {
-            let (sequence, next) = {
+            // Collect every pending frame kind; snapshot and gamepad have
+            // independent sequences, so neither can starve the other.
+            let pending: Vec<(bool, u64, Arc<Published>)> = {
                 let mut guard = self.state.lock().unwrap();
                 loop {
                     // The client hanging up wakes this too, so a writer
@@ -202,10 +236,19 @@ impl SubscriptionHub {
                     if closed.load(Ordering::SeqCst) {
                         return;
                     }
+                    let mut pending = Vec::new();
                     if guard.sequence > last_sent
                         && let Some(latest) = guard.latest.as_ref()
                     {
-                        break (guard.sequence, Arc::clone(latest));
+                        pending.push((false, guard.sequence, Arc::clone(latest)));
+                    }
+                    if guard.gamepad_sequence > last_gamepad_sent
+                        && let Some(latest) = guard.latest_gamepad.as_ref()
+                    {
+                        pending.push((true, guard.gamepad_sequence, Arc::clone(latest)));
+                    }
+                    if !pending.is_empty() {
+                        break pending;
                     }
                     guard = self
                         .signal
@@ -213,28 +256,34 @@ impl SubscriptionHub {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                 }
             };
-            match next.as_ref() {
-                Published::Snapshot { line } => {
-                    if writer.write_all(line.as_bytes()).is_err() {
+            for (is_gamepad, sequence, next) in pending {
+                match next.as_ref() {
+                    Published::Snapshot { line } => {
+                        if writer.write_all(line.as_bytes()).is_err() {
+                            if !closed.swap(true, Ordering::SeqCst) {
+                                self.release();
+                            }
+                            return;
+                        }
+                        if is_gamepad {
+                            last_gamepad_sent = sequence;
+                        } else {
+                            last_sent = sequence;
+                        }
+                    }
+                    Published::Oversize => {
+                        write_error(
+                            &writer,
+                            "frame_too_large",
+                            &format!("snapshot frame exceeds {MAX_FRAME_BYTES} bytes"),
+                            false,
+                            &self.instance,
+                        );
                         if !closed.swap(true, Ordering::SeqCst) {
                             self.release();
                         }
                         return;
                     }
-                    last_sent = sequence;
-                }
-                Published::Oversize => {
-                    write_error(
-                        &writer,
-                        "frame_too_large",
-                        &format!("snapshot frame exceeds {MAX_FRAME_BYTES} bytes"),
-                        false,
-                        &self.instance,
-                    );
-                    if !closed.swap(true, Ordering::SeqCst) {
-                        self.release();
-                    }
-                    return;
                 }
             }
         }
@@ -423,6 +472,35 @@ mod tests {
         );
         let frame: serde_json::Value = serde_json::from_str(&read_frame()).unwrap();
         assert_eq!(frame["generation"], 43);
+    }
+
+    #[test]
+    fn subscriber_receives_gamepad_frames_independent_of_snapshots() {
+        let hub = hub();
+        let (_client, mut read_frame) = attach_pair(&hub);
+        hub.publish_gamepad(r#"{"live":[]}"#);
+        hub.publish(7, r#"{"generation":7}"#);
+        hub.publish_gamepad(r#"{"live":[{"path":"/dev/input/event0"}]}"#);
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&read_frame()).unwrap()["type"],
+            "hello"
+        );
+        // Snapshot and gamepad sequences are independent: both newest
+        // frames arrive, neither publish hides the other.
+        let mut types = Vec::new();
+        let mut gamepad = serde_json::Value::Null;
+        for _ in 0..2 {
+            let frame: serde_json::Value = serde_json::from_str(&read_frame()).unwrap();
+            types.push(frame["type"].as_str().unwrap_or("").to_string());
+            if frame["type"] == "gamepad" {
+                gamepad = frame;
+            }
+        }
+        assert!(types.contains(&"snapshot".to_string()), "{types:?}");
+        assert!(types.contains(&"gamepad".to_string()), "{types:?}");
+        assert_eq!(gamepad["gamepad"]["live"][0]["path"], "/dev/input/event0");
+        assert!(gamepad["sequence"].as_u64().unwrap_or(0) >= 2);
     }
 
     #[test]
