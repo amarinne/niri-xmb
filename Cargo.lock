@@ -1606,6 +1606,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "eframe",
+ "evdev",
  "image",
  "kdl 6.7.1",
  "niri-xmb",

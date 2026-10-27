@@ -1337,28 +1337,16 @@ impl StudioApp {
         self.section_header(ui);
         self.detected_controller_card(ui);
         self.controller_map_card(ui);
-        let wide = ui.available_width() >= 900.0;
-        if wide {
+        if ui.available_width() >= 900.0 {
             ui.columns(2, |cols| {
                 section_card(&mut cols[0], "Device", |ui| self.device_fields(ui));
                 section_card(&mut cols[1], "Pointer", |ui| self.pointer_fields(ui));
-                section_card(&mut cols[0], "Bindings", |ui| {
-                    self.bindings_ui(ui, "gamepad.buttons", XMB_ACTIONS, "XMB buttons");
-                    ui.add_space(10.0);
-                    self.bindings_ui(ui, "gamepad.navi.bindings", ACTIONS, "Navi base");
-                });
-                section_card(&mut cols[1], "Layers", |ui| self.layers_ui(ui));
             });
         } else {
             section_card(ui, "Device", |ui| self.device_fields(ui));
             section_card(ui, "Pointer", |ui| self.pointer_fields(ui));
-            section_card(ui, "Bindings", |ui| {
-                self.bindings_ui(ui, "gamepad.buttons", XMB_ACTIONS, "XMB buttons");
-                ui.add_space(10.0);
-                self.bindings_ui(ui, "gamepad.navi.bindings", ACTIONS, "Navi base");
-            });
-            section_card(ui, "Layers", |ui| self.layers_ui(ui));
         }
+        section_card(ui, "Layers", |ui| self.layers_ui(ui));
     }
 
     fn detected_controller_card(&self, ui: &mut Ui) {
@@ -1458,22 +1446,49 @@ impl StudioApp {
                         self.switch_template(template);
                     }
                 }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("bindings follow the selected control")
+                            .size(9.5)
+                            .color(TEXT_DIM),
+                    );
+                });
             });
             ui.add_space(6.0);
-            if ui.available_width() >= 760.0 {
-                ui.columns(2, |cols| {
-                    self.controller_map_body(&mut cols[0]);
-                    self.inspector_body(&mut cols[1]);
+            let mut hotspot = None;
+            let mut row = None;
+            let width = ui.available_width();
+            if width >= 900.0 {
+                let map_width = (width * 0.46).clamp(400.0, 560.0);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(map_width);
+                        hotspot = self.controller_map_body(ui);
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        self.inspector_body(ui);
+                    });
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(ui.available_width());
+                        row = self.merged_bindings(ui);
+                    });
                 });
             } else {
-                self.controller_map_body(ui);
+                hotspot = self.controller_map_body(ui);
                 ui.separator();
                 self.inspector_body(ui);
+                ui.separator();
+                self.merged_bindings(ui);
+            }
+            if let (Some(from), Some(to)) = (hotspot, row) {
+                paint_binding_link(ui, from, to);
             }
         });
     }
 
-    fn controller_map_body(&mut self, ui: &mut Ui) {
+    fn controller_map_body(&mut self, ui: &mut Ui) -> Option<Rect> {
         let template = self.template;
         let width = ui.available_width().min(560.0);
         let height = (width * 0.56).clamp(210.0, 330.0);
@@ -1507,6 +1522,7 @@ impl StudioApp {
             );
         }
         let label_size = (rect.width() * 0.016).clamp(7.0, 10.0);
+        let mut selected_rect = None;
         for hotspot in template.hotspots() {
             let center = Pos2::new(
                 rect.min.x + hotspot.x * rect.width(),
@@ -1530,6 +1546,7 @@ impl StudioApp {
                 Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(116, 162, 255, 110))
             };
             if selected {
+                selected_rect = Some(hit);
                 ui.painter().rect_filled(
                     hit,
                     7.0,
@@ -1565,6 +1582,7 @@ impl StudioApp {
                 self.selected = hotspot.control;
             }
         }
+        selected_rect
     }
 
     fn switch_template(&mut self, template: Template) {
@@ -1591,6 +1609,14 @@ impl StudioApp {
         self.selected = next;
     }
 
+    fn selected_code(&self) -> Option<&'static str> {
+        self.template
+            .hotspots()
+            .iter()
+            .find(|hotspot| hotspot.control == self.selected)
+            .and_then(|hotspot| hotspot.code)
+    }
+
     fn inspector_body(&mut self, ui: &mut Ui) {
         ui.label(
             RichText::new("Selected")
@@ -1599,12 +1625,7 @@ impl StudioApp {
                 .color(TEXT_MUTED),
         );
         ui.add_space(2.0);
-        let code = self
-            .template
-            .hotspots()
-            .iter()
-            .find(|hotspot| hotspot.control == self.selected)
-            .and_then(|hotspot| hotspot.code);
+        let code = self.selected_code();
         ui.horizontal(|ui| {
             ui.label(RichText::new(self.selected).size(18.0).strong());
             if let Some(code) = code {
@@ -1666,36 +1687,6 @@ impl StudioApp {
             } else {
                 set_map_value(&mut self.model, &map_path, code, &next);
             }
-        }
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new("Bindings in context")
-                .size(10.0)
-                .color(TEXT_DIM),
-        );
-        let map = get_path(&self.model, &map_path)
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        if map.is_empty() {
-            ui.label(RichText::new("No bindings").size(11.0).color(TEXT_MUTED));
-        } else {
-            ScrollArea::vertical()
-                .id_salt("selected-bindings")
-                .max_height(150.0)
-                .show(ui, |ui| {
-                    for (code, action) in map {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(code).monospace().size(10.5));
-                            ui.label(RichText::new("→").size(10.5).color(TEXT_DIM));
-                            ui.label(
-                                RichText::new(action.as_str().unwrap_or(""))
-                                    .size(10.5)
-                                    .color(TEXT_MUTED),
-                            );
-                        });
-                    }
-                });
         }
     }
 
@@ -3651,7 +3642,39 @@ impl StudioApp {
         }
     }
 
-    fn bindings_ui(&mut self, ui: &mut Ui, path: &str, actions: &[&str], title: &str) {
+    /// XMB and Navi lists, with the row for the selected control highlighted.
+    /// Returns that row's rect so the card can link it to the controller.
+    fn merged_bindings(&mut self, ui: &mut Ui) -> Option<Rect> {
+        let target = self.selected_code();
+        let mut rect = None;
+        match self.context.as_str() {
+            "xmb" => {
+                rect = self.bindings_ui(ui, "gamepad.buttons", XMB_ACTIONS, "XMB buttons", target);
+                ui.add_space(12.0);
+                self.bindings_ui(ui, "gamepad.navi.bindings", ACTIONS, "Navi base", None);
+            }
+            "base" => {
+                self.bindings_ui(ui, "gamepad.buttons", XMB_ACTIONS, "XMB buttons", None);
+                ui.add_space(12.0);
+                rect = self.bindings_ui(ui, "gamepad.navi.bindings", ACTIONS, "Navi base", target);
+            }
+            _ => {
+                self.bindings_ui(ui, "gamepad.buttons", XMB_ACTIONS, "XMB buttons", None);
+                ui.add_space(12.0);
+                self.bindings_ui(ui, "gamepad.navi.bindings", ACTIONS, "Navi base", None);
+            }
+        }
+        rect
+    }
+
+    fn bindings_ui(
+        &mut self,
+        ui: &mut Ui,
+        path: &str,
+        actions: &[&str],
+        title: &str,
+        highlight: Option<&str>,
+    ) -> Option<Rect> {
         let entries = get_path(&self.model, path)
             .and_then(Value::as_object)
             .map(|map| {
@@ -3677,6 +3700,7 @@ impl StudioApp {
             });
         });
         ui.add_space(3.0);
+        let mut target = None;
         if entries.is_empty() {
             ui.label(RichText::new("No bindings").size(11.0).color(TEXT_MUTED));
         } else if ui.available_width() >= 640.0 && entries.len() > 1 {
@@ -3684,12 +3708,18 @@ impl StudioApp {
             ui.columns(2, |cols| {
                 for (index, (code, action)) in entries.iter().enumerate() {
                     let column = if index < left { 0 } else { 1 };
-                    self.binding_row(&mut cols[column], path, actions, code, action);
+                    if let Some(rect) =
+                        self.binding_row(&mut cols[column], path, actions, code, action, highlight)
+                    {
+                        target = Some(rect);
+                    }
                 }
             });
         } else {
             for (code, action) in &entries {
-                self.binding_row(ui, path, actions, code, action);
+                if let Some(rect) = self.binding_row(ui, path, actions, code, action, highlight) {
+                    target = Some(rect);
+                }
             }
         }
         let used = entries
@@ -3699,12 +3729,22 @@ impl StudioApp {
         if let Some(code) = button_menu(ui, "Add binding", &used) {
             set_map_value(&mut self.model, path, code, actions[0]);
         }
+        target
     }
 
-    fn binding_row(&mut self, ui: &mut Ui, path: &str, actions: &[&str], code: &str, action: &str) {
+    fn binding_row(
+        &mut self,
+        ui: &mut Ui,
+        path: &str,
+        actions: &[&str],
+        code: &str,
+        action: &str,
+        highlight: Option<&str>,
+    ) -> Option<Rect> {
         let mut next_code = code.to_string();
         let mut next_action = action.to_string();
         let mut remove = false;
+        let selected = highlight == Some(code);
         // Every other row's code, so the dropdown only offers free buttons.
         let used = get_path(&self.model, path)
             .and_then(Value::as_object)
@@ -3715,57 +3755,76 @@ impl StudioApp {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let changed = ui
-            .horizontal(|ui| {
-                let mut code_changed = false;
-                ComboBox::from_id_salt(("binding-code", path, code))
-                    .width(120.0)
-                    .selected_text(RichText::new(&next_code).monospace())
-                    .show_ui(ui, |ui| {
-                        if !BUTTONS.iter().any(|(name, _)| *name == next_code) {
-                            let current = next_code.clone();
-                            ui.selectable_value(
-                                &mut next_code,
-                                current.clone(),
-                                RichText::new(current).monospace(),
-                            )
-                            .on_hover_text("Custom button code from the config");
-                        }
-                        for (option, label) in button_options(&used) {
-                            code_changed |= ui
-                                .selectable_value(
-                                    &mut next_code,
-                                    option.to_string(),
-                                    RichText::new(format!("{option}   {label}"))
-                                        .monospace()
-                                        .size(11.0),
-                                )
-                                .changed();
-                        }
-                    });
-                let mut action_changed = false;
-                ComboBox::from_id_salt(("binding", path, code))
-                    .width((ui.available_width() - 34.0).clamp(100.0, 320.0))
-                    .selected_text(&next_action)
-                    .show_ui(ui, |ui| {
-                        for option in actions {
-                            action_changed |= ui
-                                .selectable_value(&mut next_action, (*option).to_string(), *option)
-                                .changed();
-                        }
-                    });
-                remove = ui.small_button("x").clicked();
-                code_changed || action_changed
+        let frame = egui::Frame::new()
+            .fill(if selected {
+                Color32::from_rgba_unmultiplied(116, 162, 255, 30)
+            } else {
+                Color32::TRANSPARENT
             })
-            .inner;
+            .stroke(if selected {
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(116, 162, 255, 110))
+            } else {
+                Stroke::new(1.0_f32, Color32::TRANSPARENT)
+            })
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin::symmetric(4, 1))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let mut code_changed = false;
+                    ComboBox::from_id_salt(("binding-code", path, code))
+                        .width(120.0)
+                        .selected_text(RichText::new(&next_code).monospace())
+                        .show_ui(ui, |ui| {
+                            if !BUTTONS.iter().any(|(name, _)| *name == next_code) {
+                                let current = next_code.clone();
+                                ui.selectable_value(
+                                    &mut next_code,
+                                    current.clone(),
+                                    RichText::new(current).monospace(),
+                                )
+                                .on_hover_text("Custom button code from the config");
+                            }
+                            for (option, label) in button_options(&used) {
+                                code_changed |= ui
+                                    .selectable_value(
+                                        &mut next_code,
+                                        option.to_string(),
+                                        RichText::new(format!("{option}   {label}"))
+                                            .monospace()
+                                            .size(11.0),
+                                    )
+                                    .changed();
+                            }
+                        });
+                    let mut action_changed = false;
+                    ComboBox::from_id_salt(("binding", path, code))
+                        .width((ui.available_width() - 34.0).clamp(100.0, 300.0))
+                        .selected_text(&next_action)
+                        .show_ui(ui, |ui| {
+                            for option in actions {
+                                action_changed |= ui
+                                    .selectable_value(
+                                        &mut next_action,
+                                        (*option).to_string(),
+                                        *option,
+                                    )
+                                    .changed();
+                            }
+                        });
+                    remove = ui.small_button("x").clicked();
+                    code_changed || action_changed
+                })
+                .inner
+            });
         if remove {
             remove_map_key(&mut self.model, path, code);
         } else if next_code != code {
             remove_map_key(&mut self.model, path, code);
             set_map_value(&mut self.model, path, &next_code, &next_action);
-        } else if changed || next_action != action {
+        } else if frame.inner || next_action != action {
             set_map_value(&mut self.model, path, code, &next_action);
         }
+        selected.then_some(frame.response.rect)
     }
 
     fn layers_ui(&mut self, ui: &mut Ui) {
@@ -3855,7 +3914,7 @@ impl StudioApp {
             {
                 axes.push(json!({"axis": "ABS_Z", "threshold": 0.35}));
             }
-            self.bindings_ui(ui, &format!("{path}.bindings"), ACTIONS, "Bindings");
+            self.bindings_ui(ui, &format!("{path}.bindings"), ACTIONS, "Bindings", None);
         }
         if let Some(name) = remove_layer
             && let Some(layers) = self.model["gamepad"]["navi"]["layers"].as_object_mut()
@@ -5709,6 +5768,33 @@ fn button_menu(ui: &mut Ui, title: &str, used: &[String]) -> Option<&'static str
     .flatten()
 }
 
+/// Soft curve from the selected control on the controller image to its row in
+/// the binding lists, with a dot at each end.
+fn paint_binding_link(ui: &Ui, from: Rect, to: Rect) {
+    let clip = ui.clip_rect();
+    if !clip.contains(from.center()) || !clip.contains(to.center()) || to.left() <= from.right() {
+        return;
+    }
+    let start = Pos2::new(from.right() + 4.0, from.center().y);
+    let end = Pos2::new(to.left() - 6.0, to.center().y);
+    let reach = ((end.x - start.x) * 0.45).clamp(20.0, 90.0);
+    let color = Color32::from_rgba_unmultiplied(116, 162, 255, 150);
+    let painter = ui.painter();
+    painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+        [
+            start,
+            Pos2::new(start.x + reach, start.y),
+            Pos2::new(end.x - reach, end.y),
+            end,
+        ],
+        false,
+        Color32::TRANSPARENT,
+        Stroke::new(1.5_f32, color),
+    ));
+    painter.circle_filled(start, 2.5, color);
+    painter.circle_filled(end, 3.0, color);
+}
+
 fn mini_heading(ui: &mut Ui, text: &str) {
     let response = ui.add(
         egui::Label::new(RichText::new(text).size(10.5).strong().color(TEXT_DIM))
@@ -6755,6 +6841,13 @@ unknown_gamepad_field = 7
         }
         let config: Config = toml::from_str(&source).unwrap();
         config.validate().unwrap();
+        use std::str::FromStr;
+        for (code, _) in BUTTONS {
+            assert!(
+                evdev::KeyCode::from_str(code).is_ok(),
+                "{code} must be a known evdev button"
+            );
+        }
     }
 
     #[test]

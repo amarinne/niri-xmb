@@ -21,3 +21,4 @@ toml_edit = "0.22"
 
 [dev-dependencies]
 toml = "0.8"
+evdev = "0.13.2"

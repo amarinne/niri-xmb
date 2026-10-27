@@ -27,8 +27,16 @@ entry appears as **niri-xmb Config**.
 ## Behavior
 
 - **Controller:** slim detected-controller status, the controller map with
-  hotspots and the selected-binding inspector, then Device/Pointer/Bindings/
-  Layers in a two-column grid.
+  hotspots, the selected-control inspector, and the XMB/Navi binding lists in
+  one card, then Device/Pointer and Layers.
+- Binding rows pick the button from a dropdown of standard gamepad codes
+  (labeled A/Cross, LB/L1, and so on), filtered to buttons not already bound in
+  that map. Open combo, mode toggle, and layer hold lists use the same picker,
+  so button codes never need typing.
+- Selecting a hotspot highlights its row in the matching list (base or XMB,
+  following the inspector context) and draws a link from the control to the
+  row. A layer context has no link because those bindings live in the Layers
+  card.
 - **Trigger Lab:** Response (graphs, presets, point inspector) beside Tune
   (pedals, speed multipliers, deadzone/curve/SOCD, pointer/scroll accel).
 - **Popup:** panel, placements, behavior grouped into Input / Close when / Drop
