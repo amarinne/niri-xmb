@@ -742,6 +742,11 @@ impl StudioApp {
         if self.model == Value::Null {
             return;
         }
+        if let Some(error) = self.trigger_points_error() {
+            self.error = error;
+            self.status = "Invalid".to_string();
+            return;
+        }
         let patch = self.patch();
         if patch.is_empty() {
             self.error.clear();
@@ -774,6 +779,11 @@ impl StudioApp {
 
     fn save(&mut self, restart_after: bool) {
         if self.model == Value::Null {
+            return;
+        }
+        if let Some(error) = self.trigger_points_error() {
+            self.error = error;
+            self.status = "Invalid".to_string();
             return;
         }
         let patch = self.patch();
@@ -844,10 +854,20 @@ impl StudioApp {
                     let dirty = self.dirty();
                     ui.add_enabled_ui(dirty, |ui| {
                         if ui.button("Save").clicked() {
-                            self.confirm = Some(Confirm::Save);
+                            if let Some(error) = self.trigger_points_error() {
+                                self.error = error;
+                                self.status = "Invalid".to_string();
+                            } else {
+                                self.confirm = Some(Confirm::Save);
+                            }
                         }
                         if ui.button("Save & Restart").clicked() {
-                            self.confirm = Some(Confirm::Restart);
+                            if let Some(error) = self.trigger_points_error() {
+                                self.error = error;
+                                self.status = "Invalid".to_string();
+                            } else {
+                                self.confirm = Some(Confirm::Restart);
+                            }
                         }
                         if ui.button("Revert").clicked() {
                             self.revert();
@@ -1644,10 +1664,10 @@ impl StudioApp {
                 self.f32_field(
                     &mut cols[1],
                     "gamepad.navi.pointer.scroll_speed",
-                    "Speed",
+                    "Full-stick speed",
                     0.0,
-                    1000.0,
-                    0.1,
+                    100000.0,
+                    1.0,
                 );
             });
         } else {
@@ -1701,12 +1721,50 @@ impl StudioApp {
             self.f32_field(
                 ui,
                 "gamepad.navi.pointer.scroll_speed",
-                "Scroll speed",
+                "Full-stick speed",
                 0.0,
-                1000.0,
-                0.1,
+                100000.0,
+                1.0,
             );
         }
+    }
+
+    fn trigger_points_error(&self) -> Option<String> {
+        let deadzone = get_path(&self.model, "gamepad.navi.pointer.trigger_deadzone")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.08) as f32;
+        let points = self.trigger_points();
+        if points.len() > 5 {
+            return Some("At most five points".to_string());
+        }
+        let mut previous_pull = deadzone;
+        let mut previous_output = 0.0_f32;
+        for (index, point) in points.iter().enumerate() {
+            if !point.pull.is_finite() || !point.output.is_finite() {
+                return Some(format!("Point {} has a non-finite value", index + 1));
+            }
+            if point.pull <= deadzone || point.pull >= 1.0 {
+                return Some(format!(
+                    "Point {} pull must be inside the trigger",
+                    index + 1
+                ));
+            }
+            if point.pull - previous_pull < 0.10 {
+                return Some(format!(
+                    "Point {} must be at least 10% after the previous point",
+                    index + 1
+                ));
+            }
+            if point.output < previous_output || !(0.0..=1.0).contains(&point.output) {
+                return Some(format!(
+                    "Point {} shape must stay between 0% and 100% and not decrease",
+                    index + 1
+                ));
+            }
+            previous_pull = point.pull;
+            previous_output = point.output;
+        }
+        None
     }
 
     fn trigger_points(&self) -> Vec<CurvePoint> {
@@ -1774,6 +1832,36 @@ impl StudioApp {
         next.sort_by(|a, b| a.pull.total_cmp(&b.pull));
         self.selected_point = next.iter().position(|point| point.pull == pull);
         self.set_trigger_points(&next);
+    }
+
+    fn trigger_deadzone_field(&mut self, ui: &mut Ui) {
+        let points = self.trigger_points();
+        let max = points
+            .first()
+            .map(|point| (point.pull - 0.10).max(0.0))
+            .unwrap_or(0.9)
+            .min(0.9);
+        let mut value = get_path(&self.model, "gamepad.navi.pointer.trigger_deadzone")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.08) as f32;
+        let changed = field_row(ui, "Pull deadzone", |ui| {
+            ui.add(
+                egui::DragValue::new(&mut value)
+                    .speed(0.005)
+                    .range(0.0..=max),
+            )
+            .changed()
+        });
+        if changed {
+            set_json_path(
+                &mut self.model,
+                "gamepad.navi.pointer.trigger_deadzone",
+                json!(value),
+            );
+        }
+        if value > max {
+            ui.colored_label(ERROR, "deadzone is too close to the first point");
+        }
     }
 
     fn trigger_presets(&mut self, ui: &mut Ui) {
@@ -1870,6 +1958,8 @@ impl StudioApp {
         let Some(index) = self.selected_point.filter(|index| *index < points.len()) else {
             return;
         };
+        let start = ui.cursor().min;
+        let invalid = self.trigger_points_error();
         let point = points[index];
         let deadzone = get_path(&self.model, "gamepad.navi.pointer.trigger_deadzone")
             .and_then(Value::as_f64)
@@ -1930,7 +2020,11 @@ impl StudioApp {
                     .map(|previous| next[previous].output)
                     .unwrap_or(0.0);
                 let next_output = next.get(index + 1).map(|next| next.output).unwrap_or(1.0);
-                next[index].pull = pull.clamp(previous_pull + 0.10, next_pull - 0.10);
+                let min_pull = previous_pull + 0.10;
+                let max_pull = next_pull - 0.10;
+                if min_pull <= max_pull {
+                    next[index].pull = pull.clamp(min_pull, max_pull);
+                }
                 next[index].output = output.clamp(previous_output, next_output);
                 self.set_trigger_points(&next);
             }
@@ -1969,6 +2063,12 @@ impl StudioApp {
             .size(10.0)
             .color(TEXT_MUTED),
         );
+        if let Some(error) = invalid {
+            let rect = Rect::from_min_max(start, ui.min_rect().max).expand(3.0);
+            ui.painter()
+                .rect_stroke(rect, 5.0, Stroke::new(1.5_f32, ERROR), StrokeKind::Inside);
+            ui.colored_label(ERROR, error);
+        }
     }
 
     fn trigger_response(&mut self, ui: &mut Ui) {
@@ -2017,6 +2117,9 @@ impl StudioApp {
                 "gamepad.navi.pointer.scroll_accel",
                 shared_y_max,
             );
+        }
+        if let Some(error) = self.trigger_points_error() {
+            ui.colored_label(ERROR, error);
         }
         self.point_inspector(ui);
         ui.add_space(4.0);
@@ -2215,7 +2318,12 @@ impl StudioApp {
         if dz_response.dragged()
             && let Some(position) = dz_response.interact_pointer_pos()
         {
-            let value = ((position.x - plot.min.x) / plot.width()).clamp(0.0, 0.9);
+            let max_deadzone = points
+                .first()
+                .map(|point| (point.pull - 0.10).max(0.0))
+                .unwrap_or(0.9)
+                .min(0.9);
+            let value = ((position.x - plot.min.x) / plot.width()).clamp(0.0, max_deadzone);
             set_json_path(
                 &mut self.model,
                 &format!("{pointer}.trigger_deadzone"),
@@ -2307,6 +2415,14 @@ impl StudioApp {
                 .on_hover_text("Initial trigger travel ignored");
         }
 
+        let point_error = self.trigger_points_error();
+        let border_color = if point_error.is_some() { ERROR } else { BORDER };
+        painter.rect_stroke(
+            plot,
+            5.0,
+            Stroke::new(1.0_f32, border_color),
+            StrokeKind::Inside,
+        );
         let plot_response = ui.interact(
             plot,
             ui.id().with((accel_path, "plot-points")),
@@ -2600,14 +2716,7 @@ impl StudioApp {
         if ui.available_width() >= 660.0 {
             ui.columns(3, |cols| {
                 mini_heading(&mut cols[0], "Trigger");
-                self.f32_field(
-                    &mut cols[0],
-                    &format!("{pointer}.trigger_deadzone"),
-                    "Pull deadzone",
-                    0.0,
-                    0.9,
-                    0.005,
-                );
+                self.trigger_deadzone_field(&mut cols[0]);
                 self.f32_field(
                     &mut cols[0],
                     &format!("{pointer}.trigger_curve"),
@@ -2637,14 +2746,7 @@ impl StudioApp {
             });
         } else {
             mini_heading(ui, "Trigger");
-            self.f32_field(
-                ui,
-                &format!("{pointer}.trigger_deadzone"),
-                "Pull deadzone",
-                0.0,
-                0.9,
-                0.005,
-            );
+            self.trigger_deadzone_field(ui);
             self.f32_field(
                 ui,
                 &format!("{pointer}.trigger_curve"),
@@ -3293,10 +3395,20 @@ impl StudioApp {
                 let dirty = self.dirty();
                 ui.add_enabled_ui(dirty, |ui| {
                     if ui.button("Save").clicked() {
-                        self.confirm = Some(Confirm::Save);
+                        if let Some(error) = self.trigger_points_error() {
+                            self.error = error;
+                            self.status = "Invalid".to_string();
+                        } else {
+                            self.confirm = Some(Confirm::Save);
+                        }
                     }
                     if ui.button("Save & Restart").clicked() {
-                        self.confirm = Some(Confirm::Restart);
+                        if let Some(error) = self.trigger_points_error() {
+                            self.error = error;
+                            self.status = "Invalid".to_string();
+                        } else {
+                            self.confirm = Some(Confirm::Restart);
+                        }
                     }
                     if ui.button("Revert").clicked() {
                         self.revert();
