@@ -160,6 +160,51 @@ fn kill_owner(pid: u32) {
     }
 }
 
+/// Find studio processes that predate the lock protocol.
+///
+/// Older installed binaries did not create the lock file. A new binary must
+/// still take over those instances, but only after checking the executable
+/// command line and recording the process start time so a recycled PID cannot
+/// be signalled accidentally.
+fn legacy_studio_processes() -> Vec<(u32, u64)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| is_studio_process(*pid, None))
+        .filter_map(|pid| proc_starttime(pid).map(|starttime| (pid, starttime)))
+        .collect()
+}
+
+/// Terminate compatible pre-lock studio instances before acquiring our lock.
+fn terminate_legacy_studio_processes() {
+    let targets = legacy_studio_processes();
+    for (pid, starttime) in &targets {
+        if is_owner_alive(*pid, *starttime) && is_studio_process(*pid, Some(*starttime)) {
+            terminate_owner(*pid);
+        }
+    }
+
+    let started = Instant::now();
+    while started.elapsed() < TAKEOVER_GRACE {
+        if targets
+            .iter()
+            .all(|(pid, starttime)| !is_owner_alive(*pid, *starttime))
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    for (pid, starttime) in targets {
+        if is_owner_alive(pid, starttime) && is_studio_process(pid, Some(starttime)) {
+            kill_owner(pid);
+        }
+    }
+}
+
 /// Holder for the studio lock. Dropping it closes the file, which releases
 /// the flock. The lock file itself is left in place (unlocked) for the next
 /// starter; a crash releases it the same way via the kernel.
@@ -177,6 +222,11 @@ pub struct SingleInstanceGuard {
 /// owners are never signalled; if the lock stays held by something else this
 /// returns an error instead of killing it.
 pub fn acquire_single_instance() -> Result<SingleInstanceGuard> {
+    // Compatibility path for a studio started before takeover support was
+    // installed. New instances use the flock below; this scan only matches
+    // the studio process identity and never signals unrelated processes.
+    terminate_legacy_studio_processes();
+
     let path = studio_lock_path();
     let mut file = OpenOptions::new()
         .create(true)
