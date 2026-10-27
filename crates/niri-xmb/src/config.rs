@@ -1051,8 +1051,9 @@ pub struct BehaviorConfig {
     pub close_on_drop: bool,
     /// Close when Niri focus changes outside an XMB action.
     pub close_on_external_focus_change: bool,
-    /// Deprecated compatibility field. Manual mode always closes on an
-    /// outside click; use `replay_outside_click` to control click replay.
+    /// Close the manual popup when a click lands outside it. When false,
+    /// outside clicks pass through without closing; use
+    /// `replay_outside_click` to control click replay after dismissal.
     pub close_on_outside_click: bool,
     /// Replay a captured outside click after manual mode closes.
     pub replay_outside_click: bool,

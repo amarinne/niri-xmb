@@ -226,7 +226,7 @@ pub static CATALOG: &[Entry] = &[
     e!(
         "behavior.close_on_outside_click",
         "Outside click",
-        "Legacy field: the manual popup always closes on an outside click. Use Replay outside to control whether that click is then delivered."
+        "Close the manual popup when a click lands outside it. When off, outside clicks pass through without closing."
     ),
     e!(
         "behavior.replay_outside_click",
@@ -416,7 +416,7 @@ pub static CATALOG: &[Entry] = &[
         "Open scale",
         "Scale the popup starts from when opening, as a fraction of full size. 0.94 starts at 94%; 1.0 disables the zoom."
     ),
-    // -- Appearance ---------------------------------------------------------------
+    // -- Popup appearance (theme, colours, geometry, bars) --------------------------
     e!(
         "theme",
         "Theme file",
@@ -734,12 +734,7 @@ pub static CATALOG: &[Entry] = &[
     e!(
         "ui.section.popup",
         "Popup",
-        "XMB popup panel, behaviour, peek, and animation."
-    ),
-    e!(
-        "ui.section.appearance",
-        "Appearance",
-        "Theme, colours, geometry, and bars."
+        "XMB popup panel, behaviour, peek, animation, theme, colours, and bars."
     ),
     e!(
         "ui.section.preview",
@@ -938,6 +933,16 @@ pub static CATALOG: &[Entry] = &[
         "Add a built-in workspace bar."
     ),
     e!(
+        "ui.action.pin_preview",
+        "Pin",
+        "Pin the live preview above the editor so it stays visible while scrolling. Unpin returns it to the page."
+    ),
+    e!(
+        "ui.action.new_theme",
+        "+ New theme",
+        "Create a new valid theme file beside the config with seeded defaults and select it."
+    ),
+    e!(
         "ui.action.delete",
         "Delete",
         "Delete this entry. The change is only written on Save."
@@ -1107,7 +1112,7 @@ pub static CATALOG: &[Entry] = &[
     e!(
         "ui.status.bars_disabled",
         "Bars disabled",
-        "The built-in bars are off (Appearance → Bars → Enabled). This preview section follows that setting."
+        "The built-in bars are off (Popup → Bars → Enabled). This preview section follows that setting."
     ),
     e!(
         "ui.status.no_outputs",

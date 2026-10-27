@@ -142,18 +142,33 @@ impl PopupPreview {
         let width = u32::try_from(output.width.max(1)).ok()?;
         let height = u32::try_from(output.height.max(1)).ok()?;
 
-        let selection = selection.filter(|selection| {
-            selection
-                .window_id
-                .is_none_or(|id| snapshot.window(id).is_some())
-                && snapshot
+        // Keep the workspace selection when its window is gone (closed or
+        // moved): the daemon normalizes the same way and still draws the
+        // workspace row and its titles. Only a workspace that left the host
+        // output drops the whole selection.
+        let selection = selection.and_then(|selection| {
+            let workspace_ok =
+                snapshot
                     .workspace(selection.workspace_id)
                     .is_some_and(|workspace| {
                         output
                             .workspaces
                             .iter()
                             .any(|candidate| candidate.id == workspace.id)
-                    })
+                    });
+            if !workspace_ok {
+                return None;
+            }
+            let window_ok = selection.window_id.is_none_or(|id| {
+                snapshot
+                    .window(id)
+                    .is_some_and(|window| window.workspace_id == selection.workspace_id)
+            });
+            Some(PreviewSelection {
+                output: selection.output.clone(),
+                workspace_id: selection.workspace_id,
+                window_id: selection.window_id.filter(|_| window_ok),
+            })
         });
         let visual = selection.map(|selection| SelectionVisual {
             output: selection.output.clone(),
@@ -495,6 +510,216 @@ mod tests {
         assert_eq!(
             workspace.window_slot(7),
             Some(crate::model::WindowSlot { column: 0, row: 0 })
+        );
+    }
+
+    fn stacked_snapshot() -> Snapshot {
+        let first = WindowModel {
+            id: 7,
+            workspace_id: 1,
+            app_id: "kitty".into(),
+            title: "Terminal".into(),
+            focused: true,
+            urgent: false,
+            floating: false,
+            column: Some(0),
+            tile_width: 1280.0,
+            tile_height: 720.0,
+            x: None,
+            y: None,
+        };
+        let second = WindowModel {
+            id: 8,
+            workspace_id: 1,
+            app_id: "editor".into(),
+            title: "Editor".into(),
+            focused: false,
+            urgent: false,
+            floating: false,
+            column: Some(0),
+            tile_width: 1280.0,
+            tile_height: 720.0,
+            x: None,
+            y: None,
+        };
+        let mut columns = BTreeMap::new();
+        columns
+            .entry(0)
+            .or_insert_with(BTreeMap::new)
+            .insert(0, first);
+        columns
+            .entry(0)
+            .or_insert_with(BTreeMap::new)
+            .insert(1, second);
+        let mut outputs = BTreeMap::new();
+        outputs.insert(
+            "DP-1".into(),
+            OutputModel {
+                name: "DP-1".into(),
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                workspaces: vec![WorkspaceModel {
+                    id: 1,
+                    index: 1,
+                    name: None,
+                    active: true,
+                    focused: true,
+                    urgent: false,
+                    active_window: Some(7),
+                    columns,
+                    floating: Vec::new(),
+                }],
+            },
+        );
+        Snapshot {
+            outputs,
+            focused_window: Some(7),
+            overview_open: false,
+            generation: 1,
+            content_revision: 0,
+        }
+    }
+
+    #[test]
+    fn preview_keeps_workspace_selection_when_window_closed() {
+        // The daemon normalizes a closed selected window back to its
+        // workspace instead of hiding the panel; the preview must do the
+        // same or its titles vanish while the real popup keeps them.
+        let snapshot = snapshot();
+        let config = Config::default();
+        let selection = PreviewSelection {
+            output: "DP-1".into(),
+            workspace_id: 1,
+            window_id: Some(999),
+        };
+        let mut preview = PopupPreview::new();
+        let frame = preview
+            .render(&config, &snapshot, Some(&selection))
+            .expect("workspace selection must still render");
+        assert!(frame.width > 0 && frame.height > 0);
+        assert!(
+            frame.zones.iter().any(|zone| matches!(
+                zone.target,
+                PreviewTarget::Window { .. }
+                    | PreviewTarget::Workspace { .. }
+                    | PreviewTarget::Canvas { .. }
+            )),
+            "closed window must fall back to the workspace, not an empty frame"
+        );
+    }
+
+    #[test]
+    fn preview_title_toggle_changes_shared_renderer_output() {
+        // A stacked column draws a title beside every row through the
+        // shared daemon renderer, so flipping `show_titles` must change the
+        // preview bitmap at identical dimensions.
+        let snapshot = stacked_snapshot();
+        let selection = PreviewSelection {
+            output: "DP-1".into(),
+            workspace_id: 1,
+            window_id: Some(7),
+        };
+        let mut titled = Config::default();
+        titled.popup.show_titles = true;
+        let mut plain = Config::default();
+        plain.popup.show_titles = false;
+        let mut preview = PopupPreview::new();
+        let with_titles = preview
+            .render(&titled, &snapshot, Some(&selection))
+            .expect("titled preview renders");
+        let mut preview = PopupPreview::new();
+        let without_titles = preview
+            .render(&plain, &snapshot, Some(&selection))
+            .expect("untitled preview renders");
+        assert_eq!(with_titles.width, without_titles.width);
+        assert_eq!(with_titles.height, without_titles.height);
+        assert_ne!(
+            with_titles.rgba, without_titles.rgba,
+            "show_titles must change the preview bitmap through the shared renderer"
+        );
+    }
+
+    #[test]
+    fn preview_matches_daemon_renderer_for_same_inputs() {
+        // The preview is an exact duplicate instance: drive a bare daemon
+        // `Renderer` with the same still config, selection, and surface, and
+        // the cropped bytes must equal the preview frame.
+        use crate::render::Renderer;
+        use crate::surface::{SurfaceInfo, SurfaceKind};
+        use std::collections::HashSet;
+
+        let snapshot = snapshot();
+        let mut config = Config::default();
+        config.popup.show_titles = true;
+        let selection = PreviewSelection::from_live(&json!({}), &snapshot).unwrap();
+        let mut preview = PopupPreview::new();
+        let frame = preview
+            .render(&config, &snapshot, Some(&selection))
+            .expect("preview renders");
+
+        let visual = SelectionVisual {
+            output: selection.output.clone(),
+            workspace_id: selection.workspace_id,
+            window_id: selection.window_id,
+            anchors: HashMap::new(),
+        };
+        let mut still = config.clone();
+        still.animation.enabled = false;
+        let open_outputs: HashSet<String> = snapshot.outputs.keys().cloned().collect();
+        let mut renderer = Renderer::new();
+        for _ in 0..3 {
+            renderer.update_animations(&snapshot, &still, Some(&visual), &open_outputs);
+        }
+        let output = snapshot.outputs.get("DP-1").unwrap();
+        let (width, height) = (output.width.max(1) as u32, output.height.max(1) as u32);
+        let surface = SurfaceInfo {
+            id: 7,
+            kind: SurfaceKind::Popup,
+            output: "DP-1".into(),
+            global_x: 0.0,
+            global_y: 0.0,
+            width,
+            height,
+            configured: true,
+            frame_ready: true,
+            needs_full_redraw: false,
+            scale_factor: 1,
+        };
+        let rendered = renderer
+            .render(&surface, &snapshot, &still, None, Some(&visual))
+            .expect("reference renderer renders");
+        let pixels = rendered.pixels.to_vec();
+        let zones = renderer.hit_zones(7).to_vec();
+        let panel = zones
+            .iter()
+            .find(|zone| matches!(zone.target, crate::render::HitTarget::Panel))
+            .expect("reference panel zone")
+            .rect;
+        let padding =
+            (still.style.shadow_spread + still.style.shadow_offset.abs() + 4.0).clamp(0.0, 64.0);
+        let x0 = (panel.x - padding).floor().clamp(0.0, width as f32);
+        let y0 = (panel.y - padding).floor().clamp(0.0, height as f32);
+        let x1 = (panel.x + panel.width + padding)
+            .ceil()
+            .clamp(0.0, width as f32);
+        let y1 = (panel.y + panel.height + padding)
+            .ceil()
+            .clamp(0.0, height as f32);
+        let crop_width = (x1 - x0).max(1.0) as u32;
+        let crop_height = (y1 - y0).max(1.0) as u32;
+        assert_eq!(frame.width, crop_width);
+        assert_eq!(frame.height, crop_height);
+        let stride = width as usize * 4;
+        let mut expected = Vec::with_capacity(crop_width as usize * crop_height as usize * 4);
+        for row in 0..crop_height {
+            let start = (y0 as usize + row as usize) * stride + x0 as usize * 4;
+            expected.extend_from_slice(&pixels[start..start + crop_width as usize * 4]);
+        }
+        assert_eq!(
+            frame.rgba, expected,
+            "preview frame must equal the daemon renderer output"
         );
     }
 

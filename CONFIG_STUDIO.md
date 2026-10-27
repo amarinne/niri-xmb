@@ -41,9 +41,10 @@ entry appears as **niri-xmb Config**.
   card.
 - **Trigger Lab:** Response (graphs, presets, point inspector) beside Tune
   (pedals, speed multipliers, deadzone/curve/SOCD, pointer/scroll accel).
-- **Popup:** panel, placements, behavior grouped into Input / Close when / Drop
-  behavior, peek, and animation.
-- **Appearance:** theme, colors, geometry, and bar configuration.
+- **Popup:** pinnable live preview, panel, placements, behavior grouped into
+  Input / Close when / Drop behavior, peek, animation, then theme (dropdown
+  when several theme files exist, plus `+ New theme`), colors, geometry, and
+  bar configuration.
 - **Live dock:** persistent bottom panel with three tabs. Drag the grip on its
   top edge to resize (the height survives tab switches), double-click the grip
   or press Hide to collapse it to the header. Follow switches tabs with the

@@ -568,16 +568,14 @@ enum Section {
     Controller,
     Trigger,
     Popup,
-    Appearance,
     Keyboard,
 }
 
 impl Section {
-    const ALL: [(Section, &'static str); 5] = [
+    const ALL: [(Section, &'static str); 4] = [
         (Self::Controller, "Controller"),
         (Self::Trigger, "Trigger Lab"),
         (Self::Popup, "Popup"),
-        (Self::Appearance, "Appearance"),
         (Self::Keyboard, "Keyboard"),
     ];
 
@@ -586,7 +584,6 @@ impl Section {
             Self::Controller => "Controller",
             Self::Trigger => "Trigger Lab",
             Self::Popup => "Popup",
-            Self::Appearance => "Appearance",
             Self::Keyboard => "Keyboard",
         }
     }
@@ -595,8 +592,7 @@ impl Section {
         match self {
             Self::Controller => "Device, pointer, bindings, layers",
             Self::Trigger => "Response curve and speed tuning",
-            Self::Popup => "Panel, behavior, peek, animation",
-            Self::Appearance => "Theme, colors, bars",
+            Self::Popup => "Panel, behavior, peek, animation, theme, colors, bars",
             Self::Keyboard => "Niri keybinds and live input",
         }
     }
@@ -619,6 +615,53 @@ struct LiveState {
     /// Smoothed pushed-gamepad frame rate, measured on arrival.
     gamepad_hz: f32,
     gamepad_frames: u64,
+    /// Whether the subscribe socket is currently open. Idle desktops push
+    /// no frames, so this — not frame age — is what proves the stream is
+    /// alive. Set by the stream thread on connect/disconnect.
+    stream_alive: bool,
+    /// How many times the stream thread has re-entered its connect loop.
+    reconnects: u64,
+}
+
+/// Controller telemetry as the studio actually knows it.
+///
+/// An idle desktop pushes no gamepad frames, so a connected controller with
+/// no recent input is `Idle`, not stale. Only a dead stream with a seeded
+/// status is `Reconnecting`, and only a dead stream with no status at all
+/// is `Offline`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TelemetryState {
+    Offline,
+    Reconnecting,
+    NoController,
+    Idle,
+    Live,
+}
+
+/// Classify controller telemetry without timers or polling: the stream
+/// thread owns `stream_alive`, the daemon owns the device list, and frame
+/// age only separates recent input (`Live`) from a connected-but-quiet
+/// controller (`Idle`).
+fn telemetry_state(
+    status_seeded: bool,
+    stream_alive: bool,
+    connected: usize,
+    gamepad_age_ms: Option<u128>,
+    has_input_channels: bool,
+) -> TelemetryState {
+    if !status_seeded && !stream_alive {
+        return TelemetryState::Offline;
+    }
+    if !stream_alive {
+        return TelemetryState::Reconnecting;
+    }
+    if connected == 0 {
+        return TelemetryState::NoController;
+    }
+    if has_input_channels && gamepad_age_ms.is_some_and(|age| age < 750) {
+        return TelemetryState::Live;
+    }
+    TelemetryState::Idle
 }
 
 /// One request/response round-trip on the control socket (no subprocess).
@@ -694,8 +737,14 @@ fn spawn_live(
                 if stream_live(&ctx, &socket, &live, &stop) {
                     return; // stop requested
                 }
-                // Stream ended (daemon restart or old daemon): wait briefly
-                // in stop-aware slices, then reseed and reconnect.
+                // Stream ended (daemon restart or old daemon): record the
+                // disconnect so the UI reports reconnecting instead of
+                // stale telemetry, then reseed and reconnect.
+                if let Ok(mut state) = live.lock() {
+                    state.stream_alive = false;
+                    state.reconnects += 1;
+                }
+                ctx.request_repaint();
                 for _ in 0..5 {
                     if stop.load(Ordering::Relaxed) {
                         return;
@@ -725,6 +774,12 @@ fn stream_live(
     if writer.write_all(b"subscribe 1\n").is_err() {
         return false;
     }
+    // The socket is open and the subscribe request is sent: an idle desktop
+    // pushes no frames, but the stream is alive from here until EOF/error.
+    if let Ok(mut state) = live.lock() {
+        state.stream_alive = true;
+        state.error.clear();
+    }
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let mut last_gamepad: Option<Instant> = None;
@@ -752,6 +807,11 @@ fn stream_live(
         let now = Instant::now();
         if let Ok(mut state) = live.lock() {
             match frame["type"].as_str() {
+                Some("hello") => {
+                    state.stream_alive = true;
+                    state.error.clear();
+                    state.updated_at = Some(now);
+                }
                 Some("snapshot") => {
                     state.snapshot = frame["snapshot"].clone();
                     state.error.clear();
@@ -841,6 +901,8 @@ struct StudioApp {
     preview_hover: Option<PreviewTarget>,
     preview_selection: Option<PreviewSelection>,
     preview_selection_at: Instant,
+    /// Pinned previews render in a fixed top panel that never scrolls away.
+    preview_pinned: bool,
     keymap: keymap::NiriKeymap,
     keymap_at: Instant,
     keymap_search: String,
@@ -893,6 +955,7 @@ impl StudioApp {
             preview_hover: None,
             preview_selection: None,
             preview_selection_at: Instant::now(),
+            preview_pinned: false,
             keymap: keymap::NiriKeymap::load_default(),
             keymap_at: Instant::now(),
             keymap_search: String::new(),
@@ -1268,8 +1331,10 @@ impl StudioApp {
             .unwrap_or_default();
         let gamepad = &live.status["gamepad"];
         let devices = gamepad["devices"].as_u64().unwrap_or(0);
-        let (dot, text) = if live.status.is_null() {
+        let (dot, text) = if live.status.is_null() && !live.stream_alive {
             (TEXT_DIM, "daemon offline".to_string())
+        } else if !live.stream_alive {
+            (WARN, format!("reconnecting · attempt {}", live.reconnects))
         } else if devices == 0 {
             (WARN, "no controller".to_string())
         } else {
@@ -1596,7 +1661,6 @@ impl StudioApp {
                             Section::Controller => self.controller_section(ui),
                             Section::Trigger => self.trigger_section(ui),
                             Section::Popup => self.popup_section(ui),
-                            Section::Appearance => self.appearance_section(ui),
                             Section::Keyboard => self.keyboard_section(ui),
                         }
                         ui.add_space(24.0);
@@ -3174,14 +3238,17 @@ impl StudioApp {
             .map(|live| live.clone())
             .unwrap_or_default();
         let live_view = GamepadLiveView::from_status(&live_state.status);
-        let live_age_ms = live_state
-            .updated_at
-            .map(|at| at.elapsed().as_millis())
-            .unwrap_or(u128::MAX);
-        let live_active = !self.sim_override_live
-            && live_view.connected > 0
-            && !live_view.axes.is_empty()
-            && live_age_ms < 750;
+        // Input recency comes from gamepad frames only: snapshots and other
+        // stream traffic must not mark controller input as live.
+        let gamepad_age_ms = live_state.gamepad_at.map(|at| at.elapsed().as_millis());
+        let telemetry = telemetry_state(
+            !live_state.status.is_null(),
+            live_state.stream_alive,
+            live_view.connected,
+            gamepad_age_ms,
+            !live_view.axes.is_empty() || !live_view.buttons.is_empty(),
+        );
+        let live_active = !self.sim_override_live && telemetry == TelemetryState::Live;
         let deadzone = get_path(&self.model, &format!("{pointer}.trigger_deadzone"))
             .and_then(Value::as_f64)
             .unwrap_or(0.08) as f32;
@@ -3214,26 +3281,33 @@ impl StudioApp {
             .unwrap_or(false);
 
         ui.horizontal_wrapped(|ui| {
-            let status = if live_active {
-                format!(
-                    "● LIVE · {} · {} ms ago",
-                    if live_view.device_name.is_empty() {
-                        "controller"
-                    } else {
-                        live_view.device_name.as_str()
-                    },
-                    live_age_ms
-                )
-            } else if live_view.connected > 0 && live_age_ms >= 750 {
-                "○ STALE · controller telemetry paused".to_string()
+            let device = if live_view.device_name.is_empty() {
+                "controller"
             } else {
-                "○ OFFLINE SANDBOX · simulated input".to_string()
+                live_view.device_name.as_str()
             };
-            ui.label(RichText::new(status).size(10.0).color(if live_active {
-                OK
-            } else {
-                TEXT_DIM
-            }));
+            let (status, color) = match telemetry {
+                TelemetryState::Live => (
+                    format!("● LIVE · {device} · {} ms ago", gamepad_age_ms.unwrap_or(0)),
+                    OK,
+                ),
+                TelemetryState::Idle => (
+                    format!("○ IDLE · {device} · connected, waiting for input"),
+                    TEXT_DIM,
+                ),
+                TelemetryState::Reconnecting => (
+                    format!(
+                        "○ RECONNECTING · stream lost (attempt {})",
+                        live_state.reconnects
+                    ),
+                    WARN,
+                ),
+                TelemetryState::Offline => ("○ OFFLINE · daemon unreachable".to_string(), ERROR),
+                TelemetryState::NoController => {
+                    ("○ NO CONTROLLER · simulated input".to_string(), TEXT_DIM)
+                }
+            };
+            ui.label(RichText::new(status).size(10.0).color(color));
             ui.checkbox(&mut self.sim_override_live, "Use simulated input");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("Reset").clicked() {
@@ -3806,10 +3880,72 @@ impl StudioApp {
                 self.f32_field(ui, "animation.open_scale", "Open scale", 0.1, 2.0, 0.01);
             }
         });
+        // Former Appearance page: theme, colors, geometry, and bars live
+        // here now so every popup control stays on one page.
+        self.style_fields(ui);
+        self.bars_fields(ui);
+    }
+
+    /// Fixed top panel for a pinned preview. It is a real panel, not prose:
+    /// it renders the same live preview above the scrolling editor so the
+    /// panel stays visible while the user edits and scrolls.
+    fn pinned_preview_panel(&mut self, ctx: &egui::Context) {
+        if !(self.section == Section::Popup && self.preview_pinned) {
+            return;
+        }
+        egui::TopBottomPanel::top("pinned-preview")
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .stroke(Stroke::new(1.0_f32, BORDER)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Live preview — pinned").size(12.5).strong());
+                    ui.label(
+                        RichText::new("stays on top while you scroll")
+                            .size(10.5)
+                            .color(TEXT_DIM),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if tt(ui.button("Unpin"), "ui.action.pin_preview").clicked() {
+                            self.preview_pinned = false;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                let width = ui.available_width().max(220.0);
+                self.live_xmb_preview(ui, Vec2::new(width, 300.0));
+            });
     }
 
     fn popup_preview_card(&mut self, ui: &mut Ui) {
         section_card(ui, "Live preview", |ui| {
+            ui.horizontal(|ui| {
+                let label = if self.preview_pinned { "Unpin" } else { "Pin" };
+                if tt(ui.small_button(label), "ui.action.pin_preview").clicked() {
+                    self.preview_pinned = !self.preview_pinned;
+                }
+                ui.label(
+                    RichText::new(if self.preview_pinned {
+                        "Pinned — the preview stays on top while you scroll"
+                    } else {
+                        "Pin to keep the preview on top while you scroll"
+                    })
+                    .size(10.0)
+                    .color(TEXT_MUTED),
+                );
+            });
+            ui.add_space(6.0);
+            if self.preview_pinned {
+                ui.label(
+                    RichText::new("Preview is pinned above.")
+                        .size(10.5)
+                        .color(TEXT_DIM),
+                );
+                return;
+            }
             let available = ui.available_size();
             let wide = available.x >= 760.0;
             let preview_height = available.y.min(if wide { 360.0 } else { 300.0 }).max(220.0);
@@ -3845,21 +3981,61 @@ impl StudioApp {
             ui.label(RichText::new("Current panel").size(12.0).strong());
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                metric_chip(ui, "outputs", self.model["popup"]["outputs"].as_str().unwrap_or("focused"));
-                metric_chip(ui, "position", self.model["popup"]["position"].as_str().unwrap_or("cursor"));
-                metric_chip(ui, "surface", self.model["popup"]["surface_mode"].as_str().unwrap_or("fixed"));
-                metric_chip(ui, "labels", on_off(self.model["popup"]["show_labels"].as_bool()));
-                metric_chip(ui, "titles", on_off(self.model["popup"]["show_titles"].as_bool()));
-                metric_chip(ui, "anim", format!("{} ms", self.model["animation"]["panel_ms"].as_f64().unwrap_or(0.0)));
+                metric_chip(
+                    ui,
+                    "outputs",
+                    self.model["popup"]["outputs"].as_str().unwrap_or("focused"),
+                );
+                metric_chip(
+                    ui,
+                    "position",
+                    self.model["popup"]["position"].as_str().unwrap_or("cursor"),
+                );
+                metric_chip(
+                    ui,
+                    "surface",
+                    self.model["popup"]["surface_mode"]
+                        .as_str()
+                        .unwrap_or("fixed"),
+                );
+                metric_chip(
+                    ui,
+                    "labels",
+                    on_off(self.model["popup"]["show_labels"].as_bool()),
+                );
+                metric_chip(
+                    ui,
+                    "titles",
+                    on_off(self.model["popup"]["show_titles"].as_bool()),
+                );
+                metric_chip(
+                    ui,
+                    "anim",
+                    format!(
+                        "{} ms",
+                        self.model["animation"]["panel_ms"].as_f64().unwrap_or(0.0)
+                    ),
+                );
             });
             ui.add_space(8.0);
-            ui.label(RichText::new("What you are seeing").size(10.5).strong());
-            ui.label(RichText::new("The preview uses the daemon renderer and current live snapshot. Hover a window or workspace, then click to focus it.").size(10.0).color(TEXT_MUTED));
+            ui.label(
+                RichText::new("Hover to highlight · click a window or workspace to focus it.")
+                    .size(10.0)
+                    .color(TEXT_MUTED),
+            );
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 metric_chip(ui, "bars", array_len(&self.model["bars"]));
-                metric_chip(ui, "placements", array_len(&self.model["popup"]["placements"]));
-                metric_chip(ui, "navi binds", map_len(&self.model["gamepad"]["navi"]["bindings"]));
+                metric_chip(
+                    ui,
+                    "placements",
+                    array_len(&self.model["popup"]["placements"]),
+                );
+                metric_chip(
+                    ui,
+                    "navi binds",
+                    map_len(&self.model["gamepad"]["navi"]["bindings"]),
+                );
                 metric_chip(ui, "xmb binds", map_len(&self.model["gamepad"]["buttons"]));
             });
         });
@@ -3876,25 +4052,15 @@ impl StudioApp {
         });
     }
 
-    fn appearance_section(&mut self, ui: &mut Ui) {
-        self.section_header(ui);
-        if ui.available_width() >= 1000.0 {
-            ui.columns(2, |cols| {
-                self.style_fields(&mut cols[0]);
-                self.bars_fields(&mut cols[1]);
-            });
-        } else {
-            self.style_fields(ui);
-            self.bars_fields(ui);
-        }
-    }
-
     fn style_fields(&mut self, ui: &mut Ui) {
         section_card(ui, "Theme", |ui| {
-            self.text_field(ui, "theme", "Theme file");
+            self.theme_selector(ui);
         });
         section_card(ui, "Colors", |ui| {
-            if ui.available_width() >= 480.0 {
+            // Two columns need room for label + hex text + swatch per row;
+            // below this the rows share one column instead of painting over
+            // each other when the window is narrow or zoomed.
+            if ui.available_width() >= 720.0 {
                 let left = COLOR_FIELDS.len().div_ceil(2);
                 ui.columns(2, |cols| {
                     for (index, (path, label)) in COLOR_FIELDS.iter().copied().enumerate() {
@@ -4117,6 +4283,92 @@ impl StudioApp {
         });
     }
 
+    /// Theme picker: a dropdown of the theme files beside the config when
+    /// there is more than one to choose from, the free-text path field, and
+    /// a `+` button that creates a new valid theme file and selects it.
+    fn theme_selector(&mut self, ui: &mut Ui) {
+        let candidates = theme_candidates(&self.config_path);
+        if candidates.len() >= 2 {
+            let current = get_path(&self.model, "theme")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let normalized = normalize_theme_path(&current, &self.config_path);
+            let mut selected = if current.trim().is_empty() {
+                String::new()
+            } else {
+                candidates
+                    .iter()
+                    .find(|candidate| {
+                        normalize_theme_path(candidate, &self.config_path) == normalized
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| current.clone())
+            };
+            let old = selected.clone();
+            field_row_path(ui, Some("theme"), "Theme", |ui| {
+                let mut changed = false;
+                ComboBox::from_id_salt("theme-selector")
+                    .width(input_width(ui).clamp(90.0, 280.0))
+                    .selected_text(if selected.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        theme_display_name(&selected).to_string()
+                    })
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(&mut selected, String::new(), "(none)")
+                            .changed();
+                        for candidate in &candidates {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut selected,
+                                    candidate.clone(),
+                                    theme_display_name(candidate),
+                                )
+                                .changed();
+                        }
+                        if !old.is_empty() && !candidates.contains(&old) {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut selected,
+                                    old.clone(),
+                                    theme_display_name(&old),
+                                )
+                                .changed();
+                        }
+                    });
+                changed
+            });
+            if selected != old {
+                if selected.trim().is_empty() {
+                    set_json_path(&mut self.model, "theme", Value::Null);
+                } else {
+                    set_json_path(&mut self.model, "theme", Value::String(selected));
+                }
+            }
+        }
+        self.text_field(ui, "theme", "Theme file");
+        ui.horizontal(|ui| {
+            if tt(ui.button("+ New theme"), "ui.action.new_theme").clicked() {
+                match create_theme_file(&self.config_path, &self.model) {
+                    Some(path) => {
+                        set_json_path(&mut self.model, "theme", Value::String(path));
+                        self.status = "Created theme".to_string();
+                    }
+                    None => {
+                        self.error = "Could not create a theme file beside the config".to_string();
+                    }
+                }
+            }
+            ui.label(
+                RichText::new("Creates themes/custom-N.toml with valid defaults and selects it.")
+                    .size(10.0)
+                    .color(TEXT_MUTED),
+            );
+        });
+    }
+
     fn text_field(&mut self, ui: &mut Ui, path: &str, label: &str) {
         let mut value = get_path(&self.model, path)
             .and_then(Value::as_str)
@@ -4324,11 +4576,12 @@ impl StudioApp {
             .unwrap_or("")
             .to_string();
         let changed = field_row_path(ui, Some(path), label, |ui| {
+            // Fixed compact text width: the swatch shares the row, and an
+            // adaptive width lets the row overflow narrow columns and paint
+            // over the neighbouring column when zoomed.
+            let text_width = 132.0_f32.min(ui.available_width()).max(64.0);
             let mut changed = ui
-                .add(
-                    egui::TextEdit::singleline(&mut value)
-                        .desired_width(input_width(ui).min(150.0)),
-                )
+                .add(egui::TextEdit::singleline(&mut value).desired_width(text_width))
                 .changed();
             // Interactive swatch: picking a colour writes it back as hex,
             // typing hex updates the swatch on the next frame.
@@ -5879,6 +6132,7 @@ impl eframe::App for StudioApp {
         } else {
             self.nav_strip(ctx);
         }
+        self.pinned_preview_panel(ctx);
         self.content(ctx);
         self.sync_history();
         self.confirm_modal(ctx);
@@ -5984,7 +6238,7 @@ fn field_row_path(
     add: impl FnOnce(&mut Ui) -> bool,
 ) -> bool {
     let label = path.map_or(label, |path| i18n::label_for_path(path, label));
-    let label_width = (ui.available_width() * 0.42).clamp(110.0, 190.0);
+    let label_width = stable_label_width(ui);
     ui.horizontal(|ui| {
         let label_response = right_label(ui, label_width, label);
         if let Some(hover) = i18n::hover_for(path, label) {
@@ -6004,7 +6258,7 @@ fn tt(response: egui::Response, key: &str) -> egui::Response {
 }
 
 fn field_label(ui: &mut Ui, label: &str) {
-    let width = (ui.available_width() * 0.34).clamp(110.0, 180.0);
+    let width = stable_label_width(ui);
     let response = right_label(ui, width, label);
     if let Some(hover) = i18n::hover_for(None, label) {
         response.on_hover_text(hover);
@@ -6031,6 +6285,147 @@ fn right_label(ui: &mut Ui, width: f32, label: &str) -> egui::Response {
 
 fn input_width(ui: &Ui) -> f32 {
     (ui.available_width() - 2.0).clamp(64.0, 360.0)
+}
+
+/// Fixed form label width. Proportional label widths drift apart when the
+/// window is resized or the UI is zoomed because each column measures a
+/// different available width; one constant keeps every input in a column
+/// starting at the same x. Very narrow panels still get a smaller box so
+/// the input keeps some room.
+const LABEL_WIDTH: f32 = 140.0;
+
+fn stable_label_width(ui: &Ui) -> f32 {
+    LABEL_WIDTH.min(ui.available_width() * 0.55).max(72.0)
+}
+
+/// Expand a leading `~/` against `$HOME` for filesystem access.
+fn expand_theme_path(value: &str) -> PathBuf {
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(value)
+}
+
+/// Directory containing the config file, with `~` expanded.
+fn theme_config_dir(config_path: &str) -> PathBuf {
+    let expanded = expand_theme_path(config_path.trim());
+    expanded
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Collapse an absolute path under `$HOME` back to `~/...`, matching the
+/// stored theme style.
+fn collapse_home(path: &Path) -> String {
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        if let Ok(rest) = path.strip_prefix(&home) {
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
+/// Resolve a stored theme value the same way the daemon does: `~/` against
+/// `$HOME`, absolute as-is, relative against the config directory.
+fn normalize_theme_path(value: &str, config_path: &str) -> PathBuf {
+    let expanded = expand_theme_path(value.trim());
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        theme_config_dir(config_path).join(expanded)
+    }
+}
+
+fn theme_display_name(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+}
+
+/// Theme files beside the config (`themes/*.toml` and `*.toml`, excluding
+/// the config itself), collapsed to `~/...` and sorted. Only existing files
+/// are ever offered, so the dropdown can never select an invalid path.
+fn theme_candidates(config_path: &str) -> Vec<String> {
+    let dir = theme_config_dir(config_path);
+    let config_file = expand_theme_path(config_path.trim())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_string();
+    let mut candidates = Vec::new();
+    for scan in [dir.join("themes"), dir.clone()] {
+        let Ok(entries) = fs::read_dir(&scan) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                continue;
+            }
+            if scan == dir
+                && path.file_name().and_then(|name| name.to_str()) == Some(config_file.as_str())
+            {
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let collapsed = collapse_home(&path);
+            if !candidates.contains(&collapsed) {
+                candidates.push(collapsed);
+            }
+        }
+    }
+    candidates.sort();
+    candidates
+}
+
+/// Seed content for a new theme file: a `[style]` table with the currently
+/// edited background/accent/text (or built-in defaults), which always
+/// passes the daemon theme validator.
+fn theme_seed(model: &Value) -> String {
+    let pick =
+        |key: &str, fallback: &str| model["style"][key].as_str().unwrap_or(fallback).to_string();
+    format!(
+        "# Created by niri-xmb Config Studio. Every key under [style] is\n\
+         # optional; delete a line to fall back to the built-in default.\n\
+         [style]\n\
+         background = \"{}\"\n\
+         accent = \"{}\"\n\
+         text = \"{}\"\n",
+        pick("background", "#f2141218"),
+        pick("accent", "#ffd0bcff"),
+        pick("text", "#ffe6e1e5"),
+    )
+}
+
+/// Create `themes/custom-N.toml` beside the config with valid seeded
+/// defaults and return its collapsed path. The file is validated before it
+/// is handed back, so an invalid path is never installed as a placeholder.
+fn create_theme_file(config_path: &str, model: &Value) -> Option<String> {
+    let dir = theme_config_dir(config_path);
+    let themes = dir.join("themes");
+    fs::create_dir_all(&themes).ok()?;
+    let expanded_config = expand_theme_path(config_path.trim());
+    for index in 1..1000 {
+        let candidate = themes.join(format!("custom-{index}.toml"));
+        if candidate.exists() {
+            continue;
+        }
+        fs::write(&candidate, theme_seed(model)).ok()?;
+        let collapsed = collapse_home(&candidate);
+        if Config::validate_theme_reference(&collapsed, &expanded_config).is_err() {
+            fs::remove_file(&candidate).ok()?;
+            return None;
+        }
+        return Some(collapsed);
+    }
+    None
 }
 
 /// Standard buttons that are not bound yet, so one physical button never
@@ -7070,6 +7465,160 @@ mod tests {
         assert!(view.dpad("down"));
         assert!(!view.dpad("up"));
         assert!(!view.dpad("right"));
+    }
+
+    #[test]
+    fn telemetry_state_reports_stream_health_not_frame_age() {
+        // An idle desktop pushes no gamepad frames: a connected controller
+        // with old frames is idle, never stale.
+        assert_eq!(
+            telemetry_state(true, true, 1, Some(100), true),
+            TelemetryState::Live
+        );
+        assert_eq!(
+            telemetry_state(true, true, 1, Some(5_000), true),
+            TelemetryState::Idle
+        );
+        assert_eq!(
+            telemetry_state(true, true, 1, None, false),
+            TelemetryState::Idle
+        );
+        // Buttons without axes are still input channels when recent.
+        assert_eq!(
+            telemetry_state(true, true, 1, Some(10), true),
+            TelemetryState::Live
+        );
+        // No controller is its own state while the stream is alive.
+        assert_eq!(
+            telemetry_state(true, true, 0, None, false),
+            TelemetryState::NoController
+        );
+        // A dead stream reports reconnecting when a status was seeded,
+        // offline when nothing was ever received.
+        assert_eq!(
+            telemetry_state(true, false, 1, Some(10), true),
+            TelemetryState::Reconnecting
+        );
+        assert_eq!(
+            telemetry_state(false, false, 0, None, false),
+            TelemetryState::Offline
+        );
+    }
+
+    #[test]
+    fn theme_seed_passes_daemon_validation() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/niri-xmb-studio-theme-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("themes")).unwrap();
+        let config_path = dir.join("config.toml");
+        fs::write(&config_path, "[popup]\n").unwrap();
+        for model in [
+            json!({}),
+            json!({"style": {"background": "#f2141218", "accent": "#ffd0bcff"}}),
+        ] {
+            let seed_path = dir.join("themes").join("seed.toml");
+            fs::write(&seed_path, theme_seed(&model)).unwrap();
+            Config::validate_theme_reference("themes/seed.toml", &config_path)
+                .expect("seeded theme must validate");
+            fs::remove_file(&seed_path).ok();
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn theme_discovery_lists_files_and_creation_selects_valid_file() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/niri-xmb-studio-theme-new-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("themes")).unwrap();
+        let config_path = dir.join("config.toml");
+        fs::write(&config_path, "[popup]\n").unwrap();
+        fs::write(dir.join("themes").join("a.toml"), "[style]\n").unwrap();
+        fs::write(dir.join("themes").join("b.toml"), "[style]\n").unwrap();
+        let config_str = config_path.display().to_string();
+        let candidates = theme_candidates(&config_str);
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        assert!(candidates.iter().all(|path| path.ends_with(".toml")));
+        // The config file itself is never offered, even though it is TOML.
+        assert!(!candidates.iter().any(|path| path.ends_with("config.toml")));
+
+        let created = create_theme_file(&config_str, &json!({})).expect("create theme");
+        assert!(created.ends_with("custom-1.toml"), "{created}");
+        assert!(
+            normalize_theme_path(&created, &config_str).is_file(),
+            "created file must exist"
+        );
+        Config::validate_theme_reference(&created, &expand_theme_path(&config_str))
+            .expect("created theme must validate");
+        let again = theme_candidates(&config_str);
+        assert_eq!(again.len(), 3, "{again:?}");
+        let second = create_theme_file(&config_str, &json!({})).expect("create again");
+        assert_ne!(created, second);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn field_rows_stay_aligned_across_window_widths() {
+        // Zoom/resize drift: label right edges must line up per column at
+        // every width, so inputs start at the same x no matter the scale.
+        let left = COLOR_FIELDS.len().div_ceil(2);
+        let wanted: Vec<String> = COLOR_FIELDS
+            .iter()
+            .map(|(path, label)| i18n::label_for_path(path, label).to_string())
+            .collect();
+        for width in [560.0_f32, 900.0, 1440.0, 2200.0] {
+            let ctx = egui::Context::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(width, 900.0),
+                )),
+                ..Default::default()
+            };
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.columns(2, |cols| {
+                        for (index, (path, label)) in COLOR_FIELDS.iter().copied().enumerate() {
+                            let column = usize::from(index >= left);
+                            field_row_path(&mut cols[column], Some(path), label, |ui| {
+                                ui.label("x");
+                                true
+                            });
+                        }
+                    });
+                });
+            });
+            let mut edges: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+            for shape in &output.shapes {
+                if let egui::epaint::Shape::Text(text) = &shape.shape
+                    && let Some(index) = wanted
+                        .iter()
+                        .position(|want| want.as_str() == text.galley.text())
+                {
+                    let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                    edges[usize::from(index >= left)].push(rect.right());
+                }
+            }
+            for (column, group) in edges.iter().enumerate() {
+                let spread = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+                    - group.iter().cloned().fold(f32::INFINITY, f32::min);
+                assert!(
+                    spread <= 1.5,
+                    "width {width}: column {column} right edges differ by {spread:.1}px"
+                );
+            }
+        }
     }
 
     #[test]

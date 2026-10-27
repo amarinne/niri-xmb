@@ -1303,7 +1303,7 @@ fn run_daemon(config_path: PathBuf) -> Result<()> {
                             // accept the pointer.
                         } else {
                             let capture =
-                                popup_capture_outside(PopupMode::Manual, PopupInput::FULL);
+                                popup_capture_outside(&config, PopupMode::Manual, PopupInput::FULL);
                             surfaces.set_popup_input(PopupInput::FULL, capture)?;
                             panel.promote(snapshot.focused_window);
                             reset_selection(&mut selection, &snapshot);
@@ -1668,14 +1668,15 @@ fn should_close_on_external_focus_change(
 }
 
 /// Whether a visible popup should swallow the whole output to catch outside
-/// clicks. Manual mode always needs this, including pointer-only capture;
-/// peek remains panel-only so it never becomes modal.
-fn popup_capture_outside(mode: PopupMode, input: PopupInput) -> bool {
-    mode == PopupMode::Manual && input.pointer
+/// clicks. Manual mode captures only when `close_on_outside_click` is set,
+/// including pointer-only capture; peek remains panel-only so it never
+/// becomes modal.
+fn popup_capture_outside(config: &Config, mode: PopupMode, input: PopupInput) -> bool {
+    config.behavior.close_on_outside_click && mode == PopupMode::Manual && input.pointer
 }
 
-fn should_close_manual_outside(mode: PopupMode, press_active: bool) -> bool {
-    mode == PopupMode::Manual && !press_active
+fn should_close_manual_outside(config: &Config, mode: PopupMode, press_active: bool) -> bool {
+    config.behavior.close_on_outside_click && mode == PopupMode::Manual && !press_active
 }
 
 fn should_replay_outside_click(config: &Config) -> bool {
@@ -1691,7 +1692,7 @@ fn show_popup(
     mode: PopupMode,
 ) -> Result<()> {
     let outputs = popup_output_targets(snapshot, config);
-    let capture_outside = popup_capture_outside(mode, input);
+    let capture_outside = popup_capture_outside(config, mode, input);
     surfaces.show_popups_with(&outputs, input, capture_outside)?;
     visible.clear();
     visible.extend(outputs);
@@ -2183,7 +2184,7 @@ fn handle_ui_event(
                     }
                 }
             } else if matches!(event.kind, SurfaceKind::Popup)
-                && should_close_manual_outside(panel.mode(), panel.press().is_some())
+                && should_close_manual_outside(config, panel.mode(), panel.press().is_some())
             {
                 surfaces.hide_all_popups()?;
                 panel.outputs_mut().clear();
@@ -3110,34 +3111,64 @@ mod tests {
         );
     }
 
-    /// Manual capture is unconditional, and replay remains an independent
-    /// post-dismissal option. The deprecated compatibility flag is ignored.
+    /// Manual capture follows `close_on_outside_click`, and replay remains
+    /// an independent post-dismissal option.
     #[test]
-    fn manual_outside_capture_ignores_legacy_and_replay_settings() {
+    fn manual_outside_capture_follows_close_and_replay_settings() {
         let mut config = Config::default();
         config.behavior.close_on_outside_click = true;
 
         config.behavior.replay_outside_click = true;
-        assert!(popup_capture_outside(PopupMode::Manual, PopupInput::FULL));
         assert!(popup_capture_outside(
+            &config,
+            PopupMode::Manual,
+            PopupInput::FULL
+        ));
+        assert!(popup_capture_outside(
+            &config,
             PopupMode::Manual,
             PopupInput::POINTER
+        ));
+        assert!(should_close_manual_outside(
+            &config,
+            PopupMode::Manual,
+            false
+        ));
+        assert!(!should_close_manual_outside(
+            &config,
+            PopupMode::Manual,
+            true
         ));
         assert!(should_replay_outside_click(&config));
 
         config.behavior.replay_outside_click = false;
-        assert!(popup_capture_outside(PopupMode::Manual, PopupInput::FULL));
         assert!(popup_capture_outside(
+            &config,
+            PopupMode::Manual,
+            PopupInput::FULL
+        ));
+        assert!(popup_capture_outside(
+            &config,
             PopupMode::Manual,
             PopupInput::POINTER
         ));
         assert!(!should_replay_outside_click(&config));
 
         config.behavior.close_on_outside_click = false;
-        assert!(popup_capture_outside(PopupMode::Manual, PopupInput::FULL));
-        assert!(popup_capture_outside(
+        assert!(!popup_capture_outside(
+            &config,
+            PopupMode::Manual,
+            PopupInput::FULL
+        ));
+        assert!(!popup_capture_outside(
+            &config,
             PopupMode::Manual,
             PopupInput::POINTER
+        ));
+        assert!(!should_close_manual_outside(
+            &config,
+            PopupMode::Manual,
+            false
         ));
     }
 
@@ -3643,33 +3674,84 @@ mod ui_tests {
         assert_eq!(classify_peek_pointer(&bar), PeekPointer::Ignore);
     }
 
-    /// Full-output click capture is limited to manual mode. Peek and peek
-    /// armed remain panel-only, including their pointer-only input.
+    /// Full-output click capture is limited to manual mode with
+    /// `close_on_outside_click` set. Peek and peek armed remain panel-only,
+    /// including their pointer-only input.
     #[test]
     fn only_a_manual_session_may_capture_the_whole_output() {
         let mut config = Config::default();
         config.behavior.replay_outside_click = false;
+        config.behavior.close_on_outside_click = true;
 
-        assert!(popup_capture_outside(PopupMode::Manual, PopupInput::FULL));
         assert!(popup_capture_outside(
+            &config,
+            PopupMode::Manual,
+            PopupInput::FULL
+        ));
+        assert!(popup_capture_outside(
+            &config,
             PopupMode::Manual,
             PopupInput::POINTER
         ));
-        assert!(!popup_capture_outside(PopupMode::Manual, PopupInput::NONE));
-        assert!(!popup_capture_outside(PopupMode::Peek, PopupInput::POINTER));
         assert!(!popup_capture_outside(
+            &config,
+            PopupMode::Manual,
+            PopupInput::NONE
+        ));
+        assert!(!popup_capture_outside(
+            &config,
+            PopupMode::Peek,
+            PopupInput::POINTER
+        ));
+        assert!(!popup_capture_outside(
+            &config,
             PopupMode::PeekArmed,
             PopupInput::POINTER
         ));
-        assert!(!popup_capture_outside(PopupMode::Peek, PopupInput::NONE));
+        assert!(!popup_capture_outside(
+            &config,
+            PopupMode::Peek,
+            PopupInput::NONE
+        ));
+
+        config.behavior.close_on_outside_click = false;
+        assert!(!popup_capture_outside(
+            &config,
+            PopupMode::Manual,
+            PopupInput::FULL
+        ));
     }
 
     #[test]
     fn outside_click_closes_manual_mode_but_waits_for_an_active_press() {
-        assert!(should_close_manual_outside(PopupMode::Manual, false));
-        assert!(!should_close_manual_outside(PopupMode::Manual, true));
-        assert!(!should_close_manual_outside(PopupMode::Peek, false));
-        assert!(!should_close_manual_outside(PopupMode::PeekArmed, false));
+        let mut config = Config::default();
+        config.behavior.close_on_outside_click = true;
+        assert!(should_close_manual_outside(
+            &config,
+            PopupMode::Manual,
+            false
+        ));
+        assert!(!should_close_manual_outside(
+            &config,
+            PopupMode::Manual,
+            true
+        ));
+        assert!(!should_close_manual_outside(
+            &config,
+            PopupMode::Peek,
+            false
+        ));
+        assert!(!should_close_manual_outside(
+            &config,
+            PopupMode::PeekArmed,
+            false
+        ));
+        config.behavior.close_on_outside_click = false;
+        assert!(!should_close_manual_outside(
+            &config,
+            PopupMode::Manual,
+            false
+        ));
     }
 
     #[test]
@@ -3693,8 +3775,13 @@ mod ui_tests {
             popup_output_targets(&snapshot, &config),
             ["DP-1", "HDMI-A-1"]
         );
-        assert!(popup_capture_outside(PopupMode::Manual, PopupInput::FULL));
         assert!(popup_capture_outside(
+            &config,
+            PopupMode::Manual,
+            PopupInput::FULL
+        ));
+        assert!(popup_capture_outside(
+            &config,
             PopupMode::Manual,
             PopupInput::POINTER
         ));

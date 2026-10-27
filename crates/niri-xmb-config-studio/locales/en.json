@@ -103,7 +103,7 @@
       "label": "External focus"
     },
     "behavior.close_on_outside_click": {
-      "description": "Legacy field: the manual popup always closes on an outside click. Use Replay outside to control whether that click is then delivered.",
+      "description": "Close the manual popup when a click lands outside it. When off, outside clicks pass through without closing.",
       "label": "Outside click"
     },
     "behavior.close_on_window_click": {
@@ -574,6 +574,14 @@
       "description": "Load the TOML file at the path above, discarding the in-memory model.",
       "label": "Load"
     },
+    "ui.action.new_theme": {
+      "description": "Create a new valid theme file beside the config with seeded defaults and select it.",
+      "label": "+ New theme"
+    },
+    "ui.action.pin_preview": {
+      "description": "Pin the live preview above the editor so it stays visible while scrolling. Unpin returns it to the page.",
+      "label": "Pin"
+    },
     "ui.action.preview": {
       "description": "Go to the Preview section with the live popup render.",
       "label": "Preview"
@@ -782,16 +790,12 @@
       "description": "Trigger preset: gentle response early, catching up later. Two points at 35%→10% and 65%→40%.",
       "label": "Soft start"
     },
-    "ui.section.appearance": {
-      "description": "Theme, colours, geometry, and bars.",
-      "label": "Appearance"
-    },
     "ui.section.controller": {
       "description": "Gamepad device, pointer, bindings, and layers.",
       "label": "Controller"
     },
     "ui.section.popup": {
-      "description": "XMB popup panel, behaviour, peek, and animation.",
+      "description": "XMB popup panel, behaviour, peek, animation, theme, colours, and bars.",
       "label": "Popup"
     },
     "ui.section.preview": {
@@ -811,7 +815,7 @@
       "label": "All standard buttons are bound"
     },
     "ui.status.bars_disabled": {
-      "description": "The built-in bars are off (Appearance → Bars → Enabled). This preview section follows that setting.",
+      "description": "The built-in bars are off (Popup → Bars → Enabled). This preview section follows that setting.",
       "label": "Bars disabled"
     },
     "ui.status.confirm_restart": {
