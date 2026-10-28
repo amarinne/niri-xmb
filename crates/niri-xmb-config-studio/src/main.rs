@@ -185,44 +185,32 @@ const COLOR_FIELDS: &[(&str, &str)] = &[
 ];
 
 const GEOMETRY_FIELDS: &[(&str, &str, f64, f64, f64)] = &[
-    ("style.panel_radius", "Panel radius", 0.0, 2048.0, 0.5),
-    ("style.radius", "Small radius", 0.0, 2048.0, 0.5),
-    ("style.border_width", "Border width", 0.0, 2048.0, 0.1),
+    ("style.panel_radius", "Panel radius", 0.0, 64.0, 0.5),
+    ("style.radius", "Small radius", 0.0, 64.0, 0.5),
+    ("style.border_width", "Border width", 0.0, 8.0, 0.1),
     ("style.dim_alpha", "Dim alpha", 0.0, 1.0, 0.01),
-    ("style.panel_padding", "Panel padding", 0.0, 2048.0, 0.5),
-    ("style.gap", "Gap", 0.0, 2048.0, 0.5),
-    ("style.canvas_gap", "Canvas gap", 0.0, 2048.0, 0.5),
-    ("style.column_gap", "Column gap", 0.0, 2048.0, 0.5),
-    ("style.stack_gap", "Stack gap", 0.0, 2048.0, 0.5),
-    ("style.row_gap", "Row gap", 0.0, 2048.0, 0.5),
-    ("style.shadow_offset", "Shadow offset", -2048.0, 2048.0, 0.5),
-    ("style.shadow_spread", "Shadow spread", 0.0, 2048.0, 0.5),
-    ("style.empty_dot_radius", "Empty dot", 0.0, 2048.0, 0.5),
-    ("style.label_font_size", "Label size", 1.0, 512.0, 0.5),
-    ("style.title_font_size", "Title size", 1.0, 512.0, 0.5),
-    ("style.urgent_ring_width", "Urgent ring", 0.0, 2048.0, 0.1),
+    ("style.panel_padding", "Panel padding", 0.0, 64.0, 0.5),
+    ("style.gap", "Gap", 0.0, 64.0, 0.5),
+    ("style.canvas_gap", "Canvas gap", 0.0, 64.0, 0.5),
+    ("style.column_gap", "Column gap", 0.0, 64.0, 0.5),
+    ("style.stack_gap", "Stack gap", 0.0, 64.0, 0.5),
+    ("style.row_gap", "Row gap", 0.0, 64.0, 0.5),
+    ("style.shadow_offset", "Shadow offset", -32.0, 32.0, 0.5),
+    ("style.shadow_spread", "Shadow spread", 0.0, 32.0, 0.5),
+    ("style.empty_dot_radius", "Empty dot", 0.0, 16.0, 0.5),
+    ("style.label_font_size", "Label size", 1.0, 32.0, 0.5),
+    ("style.title_font_size", "Title size", 1.0, 32.0, 0.5),
+    ("style.urgent_ring_width", "Urgent ring", 0.0, 8.0, 0.1),
     (
         "style.urgent_ring_padding",
         "Urgent padding",
         0.0,
-        2048.0,
+        16.0,
         0.1,
     ),
-    (
-        "style.urgent_glow_spread",
-        "Urgent spread",
-        0.0,
-        2048.0,
-        0.1,
-    ),
+    ("style.urgent_glow_spread", "Urgent spread", 0.0, 32.0, 0.1),
     ("style.urgent_glow_alpha", "Urgent alpha", 0.0, 1.0, 0.01),
-    (
-        "style.urgent_badge_radius",
-        "Urgent badge",
-        0.0,
-        2048.0,
-        0.1,
-    ),
+    ("style.urgent_badge_radius", "Urgent badge", 0.0, 16.0, 0.1),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -772,33 +760,24 @@ impl ControllerTab {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum PopupTab {
     #[default]
-    Panel,
-    Placements,
-    Behavior,
-    Peek,
-    Animation,
+    PanelPlacements,
+    BehaviorPeekAnimation,
     Theme,
     Bars,
 }
 
 impl PopupTab {
-    const ALL: [Self; 7] = [
-        Self::Panel,
-        Self::Placements,
-        Self::Behavior,
-        Self::Peek,
-        Self::Animation,
+    const ALL: [Self; 4] = [
+        Self::PanelPlacements,
+        Self::BehaviorPeekAnimation,
         Self::Theme,
         Self::Bars,
     ];
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Panel => "Panel",
-            Self::Placements => "Placements",
-            Self::Behavior => "Behavior",
-            Self::Peek => "Peek",
-            Self::Animation => "Animation",
+            Self::PanelPlacements => "Panel & Placements",
+            Self::BehaviorPeekAnimation => "Behavior, Peek & Animation",
             Self::Theme => "Theme & Colors",
             Self::Bars => "Bars",
         }
@@ -1482,7 +1461,7 @@ impl StudioApp {
             selected: Template::Xbox.default_control(),
             context: "base".to_string(),
             controller_tab: ControllerTab::Bindings,
-            popup_tab: PopupTab::Panel,
+            popup_tab: PopupTab::PanelPlacements,
             pointer_source: None,
             scroll_source: None,
             error: String::new(),
@@ -2201,12 +2180,7 @@ impl StudioApp {
 
     /// Header on the persistent controller stage: connection indicator, device name,
     /// vendor/product IDs, template toggle (Xbox/DS4), and live stream telemetry rate.
-    fn controller_stage_header(
-        &mut self,
-        ui: &mut Ui,
-        live: &LiveState,
-        view: &GamepadLiveView,
-    ) {
+    fn controller_stage_header(&mut self, ui: &mut Ui, live: &LiveState, view: &GamepadLiveView) {
         let is_connected = view.connected > 0;
         ui.horizontal(|ui| {
             ui.label(
@@ -2454,9 +2428,24 @@ impl StudioApp {
                     binding_path(&self.context)
                 };
                 set_map_value(&mut self.model, &map_path, "BTN_DPAD_UP", "pointer.move-up");
-                set_map_value(&mut self.model, &map_path, "BTN_DPAD_DOWN", "pointer.move-down");
-                set_map_value(&mut self.model, &map_path, "BTN_DPAD_LEFT", "pointer.move-left");
-                set_map_value(&mut self.model, &map_path, "BTN_DPAD_RIGHT", "pointer.move-right");
+                set_map_value(
+                    &mut self.model,
+                    &map_path,
+                    "BTN_DPAD_DOWN",
+                    "pointer.move-down",
+                );
+                set_map_value(
+                    &mut self.model,
+                    &map_path,
+                    "BTN_DPAD_LEFT",
+                    "pointer.move-left",
+                );
+                set_map_value(
+                    &mut self.model,
+                    &map_path,
+                    "BTN_DPAD_RIGHT",
+                    "pointer.move-right",
+                );
                 self.selected = "D-pad up";
             }
             ControlSource::Other => {}
@@ -2477,9 +2466,8 @@ impl StudioApp {
         }
         let has_other_scroll = bindings.is_some_and(|map| {
             map.values().any(|v| {
-                v.as_str().is_some_and(|s| {
-                    matches!(s, "pointer.scroll-up" | "pointer.scroll-down")
-                })
+                v.as_str()
+                    .is_some_and(|s| matches!(s, "pointer.scroll-up" | "pointer.scroll-down"))
             })
         });
         if has_other_scroll {
@@ -2520,8 +2508,18 @@ impl StudioApp {
                 } else {
                     binding_path(&self.context)
                 };
-                set_map_value(&mut self.model, &map_path, "BTN_DPAD_UP", "pointer.scroll-up");
-                set_map_value(&mut self.model, &map_path, "BTN_DPAD_DOWN", "pointer.scroll-down");
+                set_map_value(
+                    &mut self.model,
+                    &map_path,
+                    "BTN_DPAD_UP",
+                    "pointer.scroll-up",
+                );
+                set_map_value(
+                    &mut self.model,
+                    &map_path,
+                    "BTN_DPAD_DOWN",
+                    "pointer.scroll-down",
+                );
                 self.selected = "D-pad up";
             }
             ControlSource::Other => {}
@@ -2548,12 +2546,24 @@ impl StudioApp {
         });
         let click_matches = matches!(
             selected_action,
-            Some("pointer.left" | "pointer.right" | "pointer.middle" | "pointer.back" | "pointer.forward")
+            Some(
+                "pointer.left"
+                    | "pointer.right"
+                    | "pointer.middle"
+                    | "pointer.back"
+                    | "pointer.forward"
+            )
         );
-        let motion_matches = (current_source == ControlSource::Dpad || current_source == ControlSource::Other)
+        let motion_matches = (current_source == ControlSource::Dpad
+            || current_source == ControlSource::Other)
             && matches!(
                 selected_action,
-                Some("pointer.move-up" | "pointer.move-down" | "pointer.move-left" | "pointer.move-right")
+                Some(
+                    "pointer.move-up"
+                        | "pointer.move-down"
+                        | "pointer.move-left"
+                        | "pointer.move-right"
+                )
             );
         let is_active = stick_selected || click_matches || motion_matches;
 
@@ -2571,7 +2581,11 @@ impl StudioApp {
             // Header: Cursor icon, title, Enabled checkbox, Curves jump
             ui.horizontal(|ui| {
                 let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(18.0, 18.0), Sense::hover());
-                draw_cursor_icon(ui.painter(), icon_rect, if is_active { ACCENT } else { TEXT });
+                draw_cursor_icon(
+                    ui.painter(),
+                    icon_rect,
+                    if is_active { ACCENT } else { TEXT },
+                );
                 ui.add_space(2.0);
                 ui.label(RichText::new("Pointer").size(12.5).strong());
 
@@ -2583,7 +2597,11 @@ impl StudioApp {
                     .on_hover_text("Enable analog stick or digital mouse cursor")
                     .changed()
                 {
-                    set_json_path(&mut self.model, "gamepad.navi.pointer.enabled", Value::Bool(enabled));
+                    set_json_path(
+                        &mut self.model,
+                        "gamepad.navi.pointer.enabled",
+                        Value::Bool(enabled),
+                    );
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2613,7 +2631,10 @@ impl StudioApp {
                             ControlSource::Dpad,
                             ControlSource::Other,
                         ] {
-                            if ui.selectable_value(&mut chosen_source, src, src.label()).clicked() {
+                            if ui
+                                .selectable_value(&mut chosen_source, src, src.label())
+                                .clicked()
+                            {
                                 self.set_pointer_control_source(src);
                             }
                         }
@@ -2631,7 +2652,11 @@ impl StudioApp {
                     .on_hover_text("Invert pointer vertical axis")
                     .changed()
                 {
-                    set_json_path(&mut self.model, "gamepad.navi.pointer.invert_y", Value::Bool(invert_y));
+                    set_json_path(
+                        &mut self.model,
+                        "gamepad.navi.pointer.invert_y",
+                        Value::Bool(invert_y),
+                    );
                 }
             });
 
@@ -2648,14 +2673,17 @@ impl StudioApp {
                     ] {
                         let bound = self.buttons_for_action(&self.context, act);
                         if bound.is_empty() {
-                            let text = RichText::new(format!("+ {act_label}")).size(9.5).color(TEXT_DIM);
+                            let text = RichText::new(format!("+ {act_label}"))
+                                .size(9.5)
+                                .color(TEXT_DIM);
                             let btn = egui::Button::new(text)
                                 .fill(CARD)
                                 .stroke(Stroke::new(1.0_f32, BORDER))
                                 .corner_radius(3.0);
                             let mut pill_resp = ui.add(btn);
                             if let Some(code) = &selected_code {
-                                pill_resp = pill_resp.on_hover_text(format!("Bind {code} to {act_label}"));
+                                pill_resp =
+                                    pill_resp.on_hover_text(format!("Bind {code} to {act_label}"));
                             }
                             if pill_resp.clicked()
                                 && let Some(code) = self.selected_code()
@@ -2670,7 +2698,8 @@ impl StudioApp {
                         } else {
                             for code in &bound {
                                 let ctrl = self.control_name_for_code(code);
-                                let is_sel = self.selected == ctrl || selected_code.as_deref() == Some(code.as_str());
+                                let is_sel = self.selected == ctrl
+                                    || selected_code.as_deref() == Some(code.as_str());
                                 let text = RichText::new(format!("{act_label}: {ctrl}"))
                                     .size(9.5)
                                     .color(if is_sel { Color32::WHITE } else { TEXT_MUTED });
@@ -2713,14 +2742,17 @@ impl StudioApp {
                 ] {
                     let bound = self.buttons_for_action(&self.context, act);
                     if bound.is_empty() {
-                        let text = RichText::new(format!("+ {act_label}")).size(9.5).color(TEXT_DIM);
+                        let text = RichText::new(format!("+ {act_label}"))
+                            .size(9.5)
+                            .color(TEXT_DIM);
                         let btn = egui::Button::new(text)
                             .fill(CARD)
                             .stroke(Stroke::new(1.0_f32, BORDER))
                             .corner_radius(3.0);
                         let mut pill_resp = ui.add(btn);
                         if let Some(code) = &selected_code {
-                            pill_resp = pill_resp.on_hover_text(format!("Bind {code} to {act_label}"));
+                            pill_resp =
+                                pill_resp.on_hover_text(format!("Bind {code} to {act_label}"));
                         }
                         if pill_resp.clicked()
                             && let Some(code) = self.selected_code()
@@ -2735,7 +2767,8 @@ impl StudioApp {
                     } else {
                         for code in &bound {
                             let ctrl = self.control_name_for_code(code);
-                            let is_sel = self.selected == ctrl || selected_code.as_deref() == Some(code.as_str());
+                            let is_sel = self.selected == ctrl
+                                || selected_code.as_deref() == Some(code.as_str());
                             let text = RichText::new(format!("{act_label}: {ctrl}"))
                                 .size(9.5)
                                 .color(if is_sel { Color32::WHITE } else { TEXT_MUTED });
@@ -2805,7 +2838,11 @@ impl StudioApp {
             // Header: Scroll wheel icon, title, Enabled checkbox, Curves jump
             ui.horizontal(|ui| {
                 let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(18.0, 18.0), Sense::hover());
-                draw_scroll_wheel_icon(ui.painter(), icon_rect, if is_active { ACCENT } else { TEXT });
+                draw_scroll_wheel_icon(
+                    ui.painter(),
+                    icon_rect,
+                    if is_active { ACCENT } else { TEXT },
+                );
                 ui.add_space(2.0);
                 ui.label(RichText::new("Scroll Wheel").size(12.5).strong());
 
@@ -2817,7 +2854,11 @@ impl StudioApp {
                     .on_hover_text("Enable scroll wheel")
                     .changed()
                 {
-                    set_json_path(&mut self.model, "gamepad.navi.pointer.scroll_enabled", Value::Bool(enabled));
+                    set_json_path(
+                        &mut self.model,
+                        "gamepad.navi.pointer.scroll_enabled",
+                        Value::Bool(enabled),
+                    );
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2847,7 +2888,10 @@ impl StudioApp {
                             ControlSource::Dpad,
                             ControlSource::Other,
                         ] {
-                            if ui.selectable_value(&mut chosen_source, src, src.label()).clicked() {
+                            if ui
+                                .selectable_value(&mut chosen_source, src, src.label())
+                                .clicked()
+                            {
                                 self.set_scroll_control_source(src);
                             }
                         }
@@ -2857,15 +2901,20 @@ impl StudioApp {
                 }
 
                 ui.add_space(6.0);
-                let mut scroll_invert_y = get_path(&self.model, "gamepad.navi.pointer.scroll_invert_y")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                let mut scroll_invert_y =
+                    get_path(&self.model, "gamepad.navi.pointer.scroll_invert_y")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                 if ui
                     .checkbox(&mut scroll_invert_y, "Invert Y")
                     .on_hover_text("Invert scroll wheel direction")
                     .changed()
                 {
-                    set_json_path(&mut self.model, "gamepad.navi.pointer.scroll_invert_y", Value::Bool(scroll_invert_y));
+                    set_json_path(
+                        &mut self.model,
+                        "gamepad.navi.pointer.scroll_invert_y",
+                        Value::Bool(scroll_invert_y),
+                    );
                 }
             });
 
@@ -2880,14 +2929,17 @@ impl StudioApp {
                 ] {
                     let bound = self.buttons_for_action(&self.context, act);
                     if bound.is_empty() {
-                        let text = RichText::new(format!("+ {act_label}")).size(9.5).color(TEXT_DIM);
+                        let text = RichText::new(format!("+ {act_label}"))
+                            .size(9.5)
+                            .color(TEXT_DIM);
                         let btn = egui::Button::new(text)
                             .fill(CARD)
                             .stroke(Stroke::new(1.0_f32, BORDER))
                             .corner_radius(3.0);
                         let mut pill_resp = ui.add(btn);
                         if let Some(code) = &selected_code {
-                            pill_resp = pill_resp.on_hover_text(format!("Bind {code} to {act_label}"));
+                            pill_resp =
+                                pill_resp.on_hover_text(format!("Bind {code} to {act_label}"));
                         }
                         if pill_resp.clicked()
                             && let Some(code) = self.selected_code()
@@ -2902,7 +2954,8 @@ impl StudioApp {
                     } else {
                         for code in &bound {
                             let ctrl = self.control_name_for_code(code);
-                            let is_sel = self.selected == ctrl || selected_code.as_deref() == Some(code.as_str());
+                            let is_sel = self.selected == ctrl
+                                || selected_code.as_deref() == Some(code.as_str());
                             let text = RichText::new(format!("{act_label}: {ctrl}"))
                                 .size(9.5)
                                 .color(if is_sel { Color32::WHITE } else { TEXT_MUTED });
@@ -3284,7 +3337,8 @@ impl StudioApp {
                         } else {
                             Color32::from_rgba_unmultiplied(116, 162, 255, 140)
                         };
-                        ui.painter().circle_filled(puck_pos, puck_radius, puck_color);
+                        ui.painter()
+                            .circle_filled(puck_pos, puck_radius, puck_color);
                         ui.painter().circle_stroke(
                             puck_pos,
                             puck_radius,
@@ -3320,10 +3374,8 @@ impl StudioApp {
                     }
                     if is_trigger && trigger_val > 0.01 {
                         let fill_h = hit.height() * trigger_val.clamp(0.0, 1.0);
-                        let fill_rect = Rect::from_min_max(
-                            Pos2::new(hit.min.x, hit.max.y - fill_h),
-                            hit.max,
-                        );
+                        let fill_rect =
+                            Rect::from_min_max(Pos2::new(hit.min.x, hit.max.y - fill_h), hit.max);
                         let fill_radius = if trigger_val >= 0.88 {
                             rect_radius
                         } else {
@@ -3346,7 +3398,9 @@ impl StudioApp {
                     if is_trigger && trigger_val > 0.01 {
                         let pct_str = format!("{:.0}%", trigger_val * 100.0);
                         let font_id = FontId::monospace((hit.height() * 0.26).clamp(9.0, 11.0));
-                        let galley = ui.painter().layout_no_wrap(pct_str, font_id, Color32::WHITE);
+                        let galley = ui
+                            .painter()
+                            .layout_no_wrap(pct_str, font_id, Color32::WHITE);
                         let pill_rect = Rect::from_min_size(
                             Pos2::new(hit.max.x + 5.0, hit.center().y - galley.size().y * 0.5),
                             galley.size(),
@@ -3612,9 +3666,11 @@ impl StudioApp {
                     ("Scroll ▼", "pointer.scroll-down"),
                 ] {
                     let is_current = current == act;
-                    let text = RichText::new(label)
-                        .size(9.5)
-                        .color(if is_current { Color32::WHITE } else { TEXT_MUTED });
+                    let text = RichText::new(label).size(9.5).color(if is_current {
+                        Color32::WHITE
+                    } else {
+                        TEXT_MUTED
+                    });
                     let btn = egui::Button::new(text)
                         .fill(if is_current {
                             Color32::from_rgba_unmultiplied(116, 162, 255, 60)
@@ -3723,8 +3779,8 @@ impl StudioApp {
                     &mut cols[0],
                     "gamepad.navi.pointer.curve",
                     "Curve",
-                    0.05,
-                    10.0,
+                    0.25,
+                    3.0,
                     0.05,
                 );
                 self.f32_field(
@@ -3732,15 +3788,15 @@ impl StudioApp {
                     "gamepad.navi.pointer.speed",
                     "Speed",
                     0.0,
-                    20000.0,
+                    2400.0,
                     10.0,
                 );
                 self.f32_field(
                     &mut cols[0],
                     "gamepad.navi.pointer.max_step",
                     "Max step",
-                    0.0,
-                    1000.0,
+                    1.0,
+                    96.0,
                     1.0,
                 );
                 self.bool_field(&mut cols[0], "gamepad.navi.pointer.invert_y", "Invert Y");
@@ -3765,7 +3821,7 @@ impl StudioApp {
                     "gamepad.navi.pointer.scroll_speed",
                     "Full-stick speed",
                     0.0,
-                    100000.0,
+                    30.0,
                     1.0,
                 );
             });
@@ -3785,21 +3841,14 @@ impl StudioApp {
                 1.0,
                 0.005,
             );
-            self.f32_field(ui, "gamepad.navi.pointer.curve", "Curve", 0.05, 10.0, 0.05);
-            self.f32_field(
-                ui,
-                "gamepad.navi.pointer.speed",
-                "Speed",
-                0.0,
-                20000.0,
-                10.0,
-            );
+            self.f32_field(ui, "gamepad.navi.pointer.curve", "Curve", 0.25, 3.0, 0.05);
+            self.f32_field(ui, "gamepad.navi.pointer.speed", "Speed", 0.0, 2400.0, 10.0);
             self.f32_field(
                 ui,
                 "gamepad.navi.pointer.max_step",
                 "Max step",
-                0.0,
-                1000.0,
+                1.0,
+                96.0,
                 1.0,
             );
             self.bool_field(ui, "gamepad.navi.pointer.invert_y", "Invert Y");
@@ -3822,7 +3871,7 @@ impl StudioApp {
                 "gamepad.navi.pointer.scroll_speed",
                 "Full-stick speed",
                 0.0,
-                100000.0,
+                30.0,
                 1.0,
             );
         }
@@ -3942,19 +3991,12 @@ impl StudioApp {
             .min(0.9);
         let mut value = get_path(&self.model, "gamepad.navi.pointer.trigger_deadzone")
             .and_then(Value::as_f64)
-            .unwrap_or(0.08) as f32;
+            .unwrap_or(0.08);
         let changed = field_row_path(
             ui,
             Some("gamepad.navi.pointer.trigger_deadzone"),
             "Pull deadzone",
-            |ui| {
-                ui.add(
-                    egui::DragValue::new(&mut value)
-                        .speed(0.005)
-                        .range(0.0..=max),
-                )
-                .changed()
-            },
+            |ui| numeric_slider_f32(ui, &mut value, 0.0, max as f64, 0.005, ""),
         );
         if changed {
             set_json_path(
@@ -3963,7 +4005,7 @@ impl StudioApp {
                 json!(value),
             );
         }
-        if value > max {
+        if value > max as f64 {
             ui.colored_label(ERROR, "deadzone is too close to the first point");
         }
     }
@@ -4087,24 +4129,17 @@ impl StudioApp {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("Point {}", index + 1)).strong());
-            let mut pull = point.pull;
-            let mut output = point.output;
-            let pull_changed = ui
-                .add(
-                    egui::DragValue::new(&mut pull)
-                        .speed(0.005)
-                        .range(deadzone + 0.001..=0.999)
-                        .suffix(" pull"),
-                )
-                .changed();
-            let output_changed = ui
-                .add(
-                    egui::DragValue::new(&mut output)
-                        .speed(0.005)
-                        .range(0.0..=1.0)
-                        .suffix(" shape"),
-                )
-                .changed();
+            let mut pull = point.pull as f64;
+            let mut output = point.output as f64;
+            let pull_changed = numeric_slider_f32(
+                ui,
+                &mut pull,
+                (deadzone + 0.001) as f64,
+                0.999,
+                0.005,
+                " pull",
+            );
+            let output_changed = numeric_slider_f32(ui, &mut output, 0.0, 1.0, 0.005, " shape");
             if ui.small_button("Delete point").clicked() {
                 let mut next = points.clone();
                 next.remove(index);
@@ -4127,9 +4162,9 @@ impl StudioApp {
                 let min_pull = previous_pull + 0.10;
                 let max_pull = next_pull - 0.10;
                 if min_pull <= max_pull {
-                    next[index].pull = pull.clamp(min_pull, max_pull);
+                    next[index].pull = (pull as f32).clamp(min_pull, max_pull);
                 }
-                next[index].output = output.clamp(previous_output, next_output);
+                next[index].output = (output as f32).clamp(previous_output, next_output);
                 self.set_trigger_points(&next);
             }
         });
@@ -4715,8 +4750,8 @@ impl StudioApp {
                     &mut cols[0],
                     &format!("{pointer}.trigger_curve"),
                     "Response curve",
-                    0.05,
-                    5.0,
+                    0.25,
+                    3.0,
                     0.05,
                 );
                 self.combo_field(
@@ -4758,8 +4793,8 @@ impl StudioApp {
                 ui,
                 &format!("{pointer}.trigger_curve"),
                 "Response curve",
-                0.05,
-                5.0,
+                0.25,
+                3.0,
                 0.05,
             );
             self.combo_field(
@@ -4820,7 +4855,7 @@ impl StudioApp {
             "behavior.popup_grab_region",
             "Grab region",
             0.0,
-            2048.0,
+            96.0,
             1.0,
         );
         self.f32_field(
@@ -4828,7 +4863,7 @@ impl StudioApp {
             "behavior.drag_threshold",
             "Drag threshold",
             0.0,
-            2048.0,
+            96.0,
             0.5,
         );
     }
@@ -4898,14 +4933,22 @@ impl StudioApp {
         ui.separator();
         ui.add_space(6.0);
         match self.popup_tab {
-            PopupTab::Panel => self.popup_panel_fields(ui),
-            PopupTab::Placements => self.placements_ui(ui),
-            PopupTab::Behavior => self.behavior_fields(ui),
-            PopupTab::Peek => self.popup_peek_fields(ui),
-            PopupTab::Animation => self.popup_animation_fields(ui),
+            PopupTab::PanelPlacements => self.panel_placements_fields(ui),
+            PopupTab::BehaviorPeekAnimation => self.behavior_peek_animation_fields(ui),
             PopupTab::Theme => self.style_fields(ui),
             PopupTab::Bars => self.bars_fields(ui),
         }
+    }
+
+    fn panel_placements_fields(&mut self, ui: &mut Ui) {
+        section_card(ui, "Panel", |ui| self.popup_panel_fields(ui));
+        section_card(ui, "Placements", |ui| self.placements_ui(ui));
+    }
+
+    fn behavior_peek_animation_fields(&mut self, ui: &mut Ui) {
+        section_card(ui, "Behavior", |ui| self.behavior_fields(ui));
+        section_card(ui, "Peek", |ui| self.popup_peek_fields(ui));
+        section_card(ui, "Animation", |ui| self.popup_animation_fields(ui));
     }
 
     fn popup_panel_fields(&mut self, ui: &mut Ui) {
@@ -4937,7 +4980,7 @@ impl StudioApp {
                     "popup.follow_delay_ms",
                     "Follow delay ms",
                     0,
-                    60_000,
+                    1000,
                     10,
                     " ms",
                 );
@@ -4978,7 +5021,7 @@ impl StudioApp {
                 "popup.follow_delay_ms",
                 "Follow delay ms",
                 0,
-                60_000,
+                5000,
                 10,
                 " ms",
             );
@@ -4996,7 +5039,7 @@ impl StudioApp {
                     "peek.duration_ms",
                     "Duration ms",
                     0,
-                    60_000,
+                    5000,
                     10,
                     " ms",
                 );
@@ -5007,7 +5050,7 @@ impl StudioApp {
                     "peek.arm_grace_ms",
                     "Arm grace ms",
                     0,
-                    60_000,
+                    5000,
                     10,
                     " ms",
                 );
@@ -5016,26 +5059,18 @@ impl StudioApp {
                     "peek.demote_ms",
                     "Demote ms",
                     0,
-                    60_000,
+                    5000,
                     10,
                     " ms",
                 );
             });
         } else {
             self.bool_field(ui, "peek.enabled", "Enabled");
-            self.slider_u64_field(ui, "peek.duration_ms", "Duration ms", 0, 60_000, 10, " ms");
+            self.slider_u64_field(ui, "peek.duration_ms", "Duration ms", 0, 5000, 10, " ms");
             self.bool_field(ui, "peek.pointer_promote", "Pointer promote");
             self.bool_field(ui, "peek.move_popup", "Border move");
-            self.slider_u64_field(
-                ui,
-                "peek.arm_grace_ms",
-                "Arm grace ms",
-                0,
-                60_000,
-                10,
-                " ms",
-            );
-            self.slider_u64_field(ui, "peek.demote_ms", "Demote ms", 0, 60_000, 10, " ms");
+            self.slider_u64_field(ui, "peek.arm_grace_ms", "Arm grace ms", 0, 5000, 10, " ms");
+            self.slider_u64_field(ui, "peek.demote_ms", "Demote ms", 0, 5000, 10, " ms");
         }
     }
 
@@ -5048,7 +5083,7 @@ impl StudioApp {
                     "animation.panel_ms",
                     "Panel ms",
                     0.0,
-                    60_000.0,
+                    1000.0,
                     1.0,
                     " ms",
                 );
@@ -5057,7 +5092,7 @@ impl StudioApp {
                     "animation.emphasis_ms",
                     "Emphasis ms",
                     0.0,
-                    60_000.0,
+                    1000.0,
                     1.0,
                     " ms",
                 );
@@ -5066,7 +5101,7 @@ impl StudioApp {
                     "animation.scroll_ms",
                     "Scroll ms",
                     0.0,
-                    60_000.0,
+                    1000.0,
                     1.0,
                     " ms",
                 );
@@ -5087,7 +5122,7 @@ impl StudioApp {
                 "animation.panel_ms",
                 "Panel ms",
                 0.0,
-                60_000.0,
+                1000.0,
                 1.0,
                 " ms",
             );
@@ -5096,7 +5131,7 @@ impl StudioApp {
                 "animation.emphasis_ms",
                 "Emphasis ms",
                 0.0,
-                60_000.0,
+                1000.0,
                 1.0,
                 " ms",
             );
@@ -5105,7 +5140,7 @@ impl StudioApp {
                 "animation.scroll_ms",
                 "Scroll ms",
                 0.0,
-                60_000.0,
+                1000.0,
                 1.0,
                 " ms",
             );
@@ -5347,8 +5382,8 @@ impl StudioApp {
                     }
                 }
             }
-            self.u64_field(ui, "style.icon_size", "Icon size", 1, 1024);
-            self.u64_field(ui, "style.icon_size_focused", "Focused icon size", 1, 1024);
+            self.u64_field(ui, "style.icon_size", "Icon size", 1, 128);
+            self.u64_field(ui, "style.icon_size_focused", "Focused icon size", 1, 128);
         });
     }
 
@@ -5413,22 +5448,22 @@ impl StudioApp {
                             &format!("{base}.width"),
                             "Width",
                             1,
-                            max_width,
+                            max_width.min(1920),
                         );
                         self.u64_field(
                             &mut cols[0],
                             &format!("{base}.height"),
                             "Height",
                             1,
-                            max_height,
+                            max_height.min(512),
                         );
-                        self.i64_field(&mut cols[0], &format!("{base}.margin"), "Margin", 0, 8192);
+                        self.i64_field(&mut cols[0], &format!("{base}.margin"), "Margin", 0, 128);
                         self.i64_field(
                             &mut cols[0],
                             &format!("{base}.offset"),
                             "Offset",
-                            -8192,
-                            8192,
+                            -256,
+                            256,
                         );
                         self.bool_field(
                             &mut cols[0],
@@ -5489,10 +5524,22 @@ impl StudioApp {
                         "Align",
                         &["start", "center", "end"],
                     );
-                    self.u64_field(ui, &format!("{base}.width"), "Width", 1, max_width);
-                    self.u64_field(ui, &format!("{base}.height"), "Height", 1, max_height);
-                    self.i64_field(ui, &format!("{base}.margin"), "Margin", 0, 8192);
-                    self.i64_field(ui, &format!("{base}.offset"), "Offset", -8192, 8192);
+                    self.u64_field(
+                        ui,
+                        &format!("{base}.width"),
+                        "Width",
+                        1,
+                        max_width.min(1920),
+                    );
+                    self.u64_field(
+                        ui,
+                        &format!("{base}.height"),
+                        "Height",
+                        1,
+                        max_height.min(512),
+                    );
+                    self.i64_field(ui, &format!("{base}.margin"), "Margin", 0, 128);
+                    self.i64_field(ui, &format!("{base}.offset"), "Offset", -256, 256);
                     self.bool_field(ui, &format!("{base}.allow_column_join"), "Column join");
                     self.bool_field(
                         ui,
@@ -5656,12 +5703,7 @@ impl StudioApp {
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            ui.add(
-                egui::DragValue::new(&mut value)
-                    .speed(speed)
-                    .range(min..=max),
-            )
-            .changed()
+            numeric_slider_f32(ui, &mut value, min, max, speed, "")
         });
         if changed {
             set_json_path(&mut self.model, path, json!(value));
@@ -5684,12 +5726,7 @@ impl StudioApp {
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            ui.add(
-                egui::Slider::new(&mut value, min..=max)
-                    .step_by(step)
-                    .suffix(suffix),
-            )
-            .changed()
+            numeric_slider_f32(ui, &mut value, min, max, step, suffix)
         });
         if changed {
             set_json_path(&mut self.model, path, json!(value));
@@ -5702,8 +5739,7 @@ impl StudioApp {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            ui.add(egui::DragValue::new(&mut value).speed(1.0).range(min..=max))
-                .changed()
+            numeric_slider_u64(ui, &mut value, min, max, 1.0, "")
         });
         if changed {
             set_json_path(&mut self.model, path, json!(value));
@@ -5726,12 +5762,7 @@ impl StudioApp {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            ui.add(
-                egui::Slider::new(&mut value, min..=max)
-                    .step_by(step as f64)
-                    .suffix(suffix),
-            )
-            .changed()
+            numeric_slider_u64(ui, &mut value, min, max, step as f64, suffix)
         });
         if changed {
             set_json_path(&mut self.model, path, json!(value));
@@ -5744,8 +5775,7 @@ impl StudioApp {
             .and_then(Value::as_i64)
             .unwrap_or(0);
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            ui.add(egui::DragValue::new(&mut value).speed(1.0).range(min..=max))
-                .changed()
+            numeric_slider_i64(ui, &mut value, min, max, 1.0, "")
         });
         if changed {
             set_json_path(&mut self.model, path, json!(value));
@@ -5886,8 +5916,20 @@ impl StudioApp {
             .unwrap_or_default();
         let mut text = value;
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            ui.add(egui::TextEdit::singleline(&mut text).desired_width(input_width(ui).min(170.0)))
+            if !text.trim_end().ends_with('%')
+                && let Ok(mut number) = text.trim().parse::<f64>()
+            {
+                let changed = numeric_slider_f32(ui, &mut number, 0.0, 1200.0, 1.0, "");
+                if changed {
+                    text = number.to_string();
+                }
+                changed
+            } else {
+                ui.add(
+                    egui::TextEdit::singleline(&mut text).desired_width(input_width(ui).min(170.0)),
+                )
                 .changed()
+            }
         });
         if changed {
             let text = text.trim().to_string();
@@ -6317,14 +6359,7 @@ impl StudioApp {
                 let mut threshold = get_path(&self.model, &format!("{axis_path}.threshold"))
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0);
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut threshold)
-                            .speed(0.001)
-                            .range(0.0..=1.0),
-                    )
-                    .changed()
-                {
+                if numeric_slider_f32(ui, &mut threshold, 0.0, 1.0, 0.001, "") {
                     set_json_path(
                         &mut self.model,
                         &format!("{axis_path}.threshold"),
@@ -7697,6 +7732,84 @@ fn field_row_path(
     .inner
 }
 
+/// A compact slider paired with an unrestricted numeric editor. The slider
+/// covers the useful everyday range; typing remains available for larger or
+/// more precise values accepted by the daemon validator.
+fn numeric_slider_f32(
+    ui: &mut Ui,
+    value: &mut f64,
+    min: f64,
+    max: f64,
+    step: f64,
+    suffix: &str,
+) -> bool {
+    let before = *value;
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 84.0).max(64.0);
+        ui.add_sized(
+            [width, 20.0],
+            egui::Slider::new(value, min..=max).step_by(step),
+        );
+        ui.add(
+            egui::DragValue::new(value)
+                .speed(step)
+                .suffix(suffix)
+                .clamp_existing_to_range(false),
+        );
+    });
+    *value != before
+}
+
+fn numeric_slider_u64(
+    ui: &mut Ui,
+    value: &mut u64,
+    min: u64,
+    max: u64,
+    step: f64,
+    suffix: &str,
+) -> bool {
+    let before = *value;
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 84.0).max(64.0);
+        ui.add_sized(
+            [width, 20.0],
+            egui::Slider::new(value, min..=max).step_by(step),
+        );
+        ui.add(
+            egui::DragValue::new(value)
+                .speed(step)
+                .suffix(suffix)
+                .clamp_existing_to_range(false),
+        );
+    });
+    *value != before
+}
+
+fn numeric_slider_i64(
+    ui: &mut Ui,
+    value: &mut i64,
+    min: i64,
+    max: i64,
+    step: f64,
+    suffix: &str,
+) -> bool {
+    let before = *value;
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 84.0).max(64.0);
+        ui.add_sized(
+            [width, 20.0],
+            egui::Slider::new(value, min..=max).step_by(step),
+        );
+        ui.add(
+            egui::DragValue::new(value)
+                .speed(step)
+                .suffix(suffix)
+                .clamp_existing_to_range(false),
+        );
+    });
+    *value != before
+}
+
 /// Attach the catalog hover text for a `ui.*` key to a widget response.
 fn tt(response: egui::Response, key: &str) -> egui::Response {
     match i18n::hover_for_key(key) {
@@ -8105,16 +8218,76 @@ fn control_name_for_code_and_template(template: Template, code: &str) -> &'stati
         "BTN_DPAD_DOWN" => "D-pad down",
         "BTN_DPAD_LEFT" => "D-pad left",
         "BTN_DPAD_RIGHT" => "D-pad right",
-        "BTN_SOUTH" => if template == Template::Ds4 { "Cross" } else { "A" },
-        "BTN_EAST" => if template == Template::Ds4 { "Circle" } else { "B" },
-        "BTN_WEST" => if template == Template::Ds4 { "Square" } else { "X" },
-        "BTN_NORTH" => if template == Template::Ds4 { "Triangle" } else { "Y" },
-        "BTN_TL" => if template == Template::Ds4 { "L1" } else { "LB" },
-        "BTN_TR" => if template == Template::Ds4 { "R1" } else { "RB" },
-        "BTN_TL2" => if template == Template::Ds4 { "L2" } else { "LT" },
-        "BTN_TR2" => if template == Template::Ds4 { "R2" } else { "RT" },
-        "BTN_THUMBL" => if template == Template::Ds4 { "L3" } else { "L STICK" },
-        "BTN_THUMBR" => if template == Template::Ds4 { "R3" } else { "R STICK" },
+        "BTN_SOUTH" => {
+            if template == Template::Ds4 {
+                "Cross"
+            } else {
+                "A"
+            }
+        }
+        "BTN_EAST" => {
+            if template == Template::Ds4 {
+                "Circle"
+            } else {
+                "B"
+            }
+        }
+        "BTN_WEST" => {
+            if template == Template::Ds4 {
+                "Square"
+            } else {
+                "X"
+            }
+        }
+        "BTN_NORTH" => {
+            if template == Template::Ds4 {
+                "Triangle"
+            } else {
+                "Y"
+            }
+        }
+        "BTN_TL" => {
+            if template == Template::Ds4 {
+                "L1"
+            } else {
+                "LB"
+            }
+        }
+        "BTN_TR" => {
+            if template == Template::Ds4 {
+                "R1"
+            } else {
+                "RB"
+            }
+        }
+        "BTN_TL2" => {
+            if template == Template::Ds4 {
+                "L2"
+            } else {
+                "LT"
+            }
+        }
+        "BTN_TR2" => {
+            if template == Template::Ds4 {
+                "R2"
+            } else {
+                "RT"
+            }
+        }
+        "BTN_THUMBL" => {
+            if template == Template::Ds4 {
+                "L3"
+            } else {
+                "L STICK"
+            }
+        }
+        "BTN_THUMBR" => {
+            if template == Template::Ds4 {
+                "R3"
+            } else {
+                "R STICK"
+            }
+        }
         _ => "Button",
     }
 }
@@ -8202,10 +8375,8 @@ fn draw_scroll_wheel_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
         StrokeKind::Inside,
     );
     // Upper center wheel capsule
-    let wheel_rect = Rect::from_center_size(
-        Pos2::new(center.x, center.y - 3.2),
-        Vec2::new(3.0, 6.0),
-    );
+    let wheel_rect =
+        Rect::from_center_size(Pos2::new(center.x, center.y - 3.2), Vec2::new(3.0, 6.0));
     painter.rect_filled(wheel_rect, 1.5, color);
     // Subtle tick line below wheel
     painter.line_segment(
@@ -8213,7 +8384,10 @@ fn draw_scroll_wheel_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
             Pos2::new(center.x, center.y + 2.5),
             Pos2::new(center.x, center.y + 5.5),
         ],
-        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 120)),
+        Stroke::new(
+            1.0_f32,
+            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 120),
+        ),
     );
 }
 
@@ -9124,15 +9298,12 @@ mod tests {
 
     #[test]
     fn popup_tabs_keep_the_popup_sections_in_order() {
-        assert_eq!(PopupTab::ALL.len(), 7);
+        assert_eq!(PopupTab::ALL.len(), 4);
         assert_eq!(
             PopupTab::ALL.map(PopupTab::label),
             [
-                "Panel",
-                "Placements",
-                "Behavior",
-                "Peek",
-                "Animation",
+                "Panel & Placements",
+                "Behavior, Peek & Animation",
                 "Theme & Colors",
                 "Bars",
             ]
@@ -10297,8 +10468,14 @@ unknown_gamepad_field = 7
         // Stick template mapping
         assert_eq!(stick_control_for_template(Template::Ds4, "left"), "L3");
         assert_eq!(stick_control_for_template(Template::Ds4, "right"), "R3");
-        assert_eq!(stick_control_for_template(Template::Xbox, "left"), "L STICK");
-        assert_eq!(stick_control_for_template(Template::Xbox, "right"), "R STICK");
+        assert_eq!(
+            stick_control_for_template(Template::Xbox, "left"),
+            "L STICK"
+        );
+        assert_eq!(
+            stick_control_for_template(Template::Xbox, "right"),
+            "R STICK"
+        );
 
         // Control source labels
         assert_eq!(ControlSource::LeftStick.label(), "Left Stick");
@@ -10307,10 +10484,25 @@ unknown_gamepad_field = 7
         assert_eq!(ControlSource::Other.label(), "Other");
 
         // Control name for code
-        assert_eq!(control_name_for_code_and_template(Template::Xbox, "BTN_SOUTH"), "A");
-        assert_eq!(control_name_for_code_and_template(Template::Xbox, "BTN_DPAD_UP"), "D-pad up");
-        assert_eq!(control_name_for_code_and_template(Template::Xbox, "BTN_TRIGGER_HAPPY1"), "Paddle 1");
-        assert_eq!(control_name_for_code_and_template(Template::Ds4, "BTN_SOUTH"), "Cross");
-        assert_eq!(control_name_for_code_and_template(Template::Ds4, "BTN_TL"), "L1");
+        assert_eq!(
+            control_name_for_code_and_template(Template::Xbox, "BTN_SOUTH"),
+            "A"
+        );
+        assert_eq!(
+            control_name_for_code_and_template(Template::Xbox, "BTN_DPAD_UP"),
+            "D-pad up"
+        );
+        assert_eq!(
+            control_name_for_code_and_template(Template::Xbox, "BTN_TRIGGER_HAPPY1"),
+            "Paddle 1"
+        );
+        assert_eq!(
+            control_name_for_code_and_template(Template::Ds4, "BTN_SOUTH"),
+            "Cross"
+        );
+        assert_eq!(
+            control_name_for_code_and_template(Template::Ds4, "BTN_TL"),
+            "L1"
+        );
     }
 }
