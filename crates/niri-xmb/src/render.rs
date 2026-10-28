@@ -1015,11 +1015,6 @@ impl Renderer {
 
         let padding = config.style.panel_padding;
         let gap = config.style.canvas_gap;
-        let header = if config.popup.show_labels {
-            config.style.label_font_size + 7.0
-        } else {
-            0.0
-        };
         let count = outputs.len() as f32;
         let logical_width = pixmap.width() as f32 / self.render_scale;
         let logical_height = pixmap.height() as f32 / self.render_scale;
@@ -1042,7 +1037,7 @@ impl Renderer {
             .max(1.0);
         let canvas_width_limit =
             ((max_panel_width - padding * 2.0 - gap * (count - 1.0)) / count).max(1.0);
-        let canvas_height_limit = (max_panel_height - padding * 2.0 - header).max(1.0);
+        let canvas_height_limit = (max_panel_height - padding * 2.0).max(1.0);
         let output_canvas_width_limit = ((logical_width - 64.0) / count).max(1.0);
         let output_canvas_height_limit = logical_height - 64.0;
         let canvas_width = config
@@ -1060,7 +1055,7 @@ impl Renderer {
             .min(output_canvas_height_limit)
             .min(canvas_height_limit);
         let panel_width = padding * 2.0 + canvas_width * count + gap * (count - 1.0);
-        let panel_height = padding * 2.0 + header + canvas_height;
+        let panel_height = padding * 2.0 + canvas_height;
 
         let (mut panel_x, mut panel_y) = match config.popup.position {
             PopupPosition::Center => (
@@ -1126,7 +1121,7 @@ impl Renderer {
 
         for (index, output) in outputs.iter().enumerate() {
             let origin_x = panel_x + padding + index as f32 * (canvas_width + gap);
-            let origin_y = panel_y + padding + header;
+            let origin_y = panel_y + padding;
             if index > 0 {
                 fill_rect(
                     pixmap,
@@ -1136,16 +1131,6 @@ impl Renderer {
                     (canvas_height - 12.0).max(0.0),
                     config.style.border_soft.get(),
                     self.render_scale,
-                );
-            }
-            if config.popup.show_labels {
-                self.text.draw(
-                    pixmap,
-                    &output.name,
-                    (origin_x + 4.0) * self.render_scale,
-                    (panel_y + padding) * self.render_scale,
-                    config.style.label_font_size * self.render_scale,
-                    config.style.muted.get(),
                 );
             }
             self.draw_output_canvas(
@@ -1161,6 +1146,25 @@ impl Renderer {
                 selection,
                 zones,
             );
+            if config.popup.show_labels {
+                // Overlay the name in the canvas corner instead of reserving a
+                // header row, so toggling labels never shifts the content.
+                let size = config.style.label_font_size;
+                let label = truncate_label_to_width(
+                    &mut self.text,
+                    &output.name,
+                    (canvas_width - 12.0).max(0.0),
+                    size,
+                );
+                self.text.draw(
+                    pixmap,
+                    &label,
+                    (origin_x + 6.0) * self.render_scale,
+                    (origin_y + 4.0) * self.render_scale,
+                    size * self.render_scale,
+                    config.style.muted.get(),
+                );
+            }
         }
         Some(panel)
     }
@@ -1791,6 +1795,7 @@ mod tests {
         assert!(!renderer.panel_grab_hit(1, 50.0, 60.0, 4.0));
         assert!(!renderer.panel_grab_hit(1, 5.0, 50.0, 4.0));
     }
+    use crate::config::PopupConfig;
     use crate::model::OutputModel;
     use std::collections::BTreeMap;
 
@@ -1839,6 +1844,50 @@ mod tests {
             needs_full_redraw: false,
             scale_factor: 1,
         }
+    }
+
+    #[test]
+    fn labels_do_not_change_the_popup_layout() {
+        let mut renderer = Renderer::new();
+        let snapshot = snapshot();
+        let config = Config::default();
+        let labelled = Config {
+            popup: PopupConfig {
+                show_labels: true,
+                ..config.popup.clone()
+            },
+            ..config.clone()
+        };
+
+        let mut plain_pixmap = Pixmap::new(1600, 900).unwrap();
+        let plain = renderer
+            .render_popup(
+                &mut plain_pixmap,
+                "eDP-1",
+                &snapshot,
+                &config,
+                None,
+                &mut Vec::new(),
+            )
+            .expect("popup renders");
+        let mut labelled_pixmap = Pixmap::new(1600, 900).unwrap();
+        let with_labels = renderer
+            .render_popup(
+                &mut labelled_pixmap,
+                "eDP-1",
+                &snapshot,
+                &labelled,
+                None,
+                &mut Vec::new(),
+            )
+            .expect("popup renders");
+
+        // The output name is an overlay in the canvas corner, so turning labels
+        // on must not move the panel or the canvases inside it.
+        assert_eq!(plain.x, with_labels.x);
+        assert_eq!(plain.y, with_labels.y);
+        assert_eq!(plain.width, with_labels.width);
+        assert_eq!(plain.height, with_labels.height);
     }
 
     #[test]

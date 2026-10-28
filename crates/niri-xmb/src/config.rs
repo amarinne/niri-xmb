@@ -651,7 +651,9 @@ pub struct PopupConfig {
     /// are laid out side by side inside the panel.
     pub canvas_width: ConfigLength,
     pub canvas_height: ConfigLength,
-    /// Draw workspace and output names. Off by default for the icon-only look.
+    /// Overlay output names in the corner of each monitor canvas. Drawn on top
+    /// of the canvas, so toggling it never changes the panel or canvas layout.
+    /// Off by default for the icon-only look.
     pub show_labels: bool,
     pub show_titles: bool,
 }

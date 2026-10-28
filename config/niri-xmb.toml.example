@@ -70,7 +70,7 @@ fixed_y = 80       # Y origin for position = "fixed"; for example "5%"
 # they are laid out side by side.
 canvas_width = 300  # width per output map; for example "20%"
 canvas_height = 190 # height per output map; for example "24%"
-show_labels = false # workspace and output names
+show_labels = false # overlay output names in the canvas corners
 show_titles = false # selected app name, with window-title fallback
 
 # Where the panel sits on each monitor, for position = "anchored". The combined

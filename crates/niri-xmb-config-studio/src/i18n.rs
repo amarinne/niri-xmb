@@ -342,7 +342,7 @@ pub static CATALOG: &[Entry] = &[
     e!(
         "popup.show_labels",
         "Labels",
-        "Show workspace labels in the popup."
+        "Overlay the output name in the corner of each monitor canvas."
     ),
     e!(
         "popup.show_titles",

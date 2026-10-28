@@ -355,7 +355,7 @@
       "label": "Position"
     },
     "popup.show_labels": {
-      "description": "Show workspace labels in the popup.",
+      "description": "Overlay the output name in the corner of each monitor canvas.",
       "label": "Labels"
     },
     "popup.show_titles": {
