@@ -884,8 +884,8 @@ local function windowItem(window, iconSize, allowDrag, indicatorMode)
         padding = 3,
         radius = (iconSize + 6) / 2,
         fill = hovered and "on_surface/0.10" or "#00000000",
-        border = "#00000000",
-        borderWidth = 0,
+        border = window.urgent and "error/0.90" or "#00000000",
+        borderWidth = window.urgent and 1 or 0,
         opacity = window.floating and 0.78 or 1.0,
         onClick = function()
             focusWindow(windowId)
@@ -948,8 +948,16 @@ local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, indicato
         end
     end
 
+    local urgent = workspace.urgent == true
+    for _, window in ipairs(windows) do
+        if window.urgent then
+            urgent = true
+            break
+        end
+    end
+
     if #windows == 0 then
-        table.insert(rowChildren, ui.row({
+        local emptyProps = {
             key = "empty-" .. idString(workspace.id),
             width = itemHeight,
             height = itemHeight,
@@ -960,23 +968,25 @@ local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, indicato
             onClick = function()
                 focusWorkspace(workspace.id)
             end,
-        }, {
-            ui.row({
-                key = "empty-dot",
-                width = 8,
-                height = 8,
-                radius = 4,
-                fill = workspace.active and "primary" or "on_surface_variant/0.55",
-            }),
-        }))
-    end
-
-    local urgent = false
-    for _, window in ipairs(windows) do
-        if window.urgent then
-            urgent = true
-            break
+        }
+        if allowDrag then
+            emptyProps.accepts = { "niri-window" }
+            emptyProps.value = idString(workspace.id) .. "|0|0.5"
+            emptyProps.onDrop = onDrop
+            emptyProps.hitSlop = 0
+            emptyProps.expandOnDrag = false
         end
+
+        local emptyChild = ui.box({
+            key = "empty-dot",
+            width = 8,
+            height = 8,
+            radius = 4,
+            fill = workspace.active and "primary" or "on_surface_variant/0.55",
+        })
+        local emptyNode = allowDrag and ui.dropZone(emptyProps, { emptyChild })
+            or ui.row(emptyProps, { emptyChild })
+        table.insert(rowChildren, emptyNode)
     end
 
     local groupFill = workspace.active and "surface_variant/0.52" or "surface_variant/0.18"
@@ -995,8 +1005,9 @@ local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, indicato
     }
 
     local props = {
-        -- Use a new key so hosts that retained the old fixed-width node create
-        -- a fresh auto-sized node. Flex then tracks window count and order.
+        -- Re-key the auto-sized state when an empty workspace gains windows.
+        -- The host otherwise retains the empty pill's fixed width for one
+        -- frame, which makes the tuned insertion animation jump.
         key = (#windows == 0 and "workspace-empty-" or "workspace-auto-") .. idString(workspace.id),
         direction = "row",
         align = "center",
@@ -1007,7 +1018,7 @@ local function workspaceNode(workspace, iconSize, allowDrag, allowJoin, indicato
         fill = groupFill,
         border = groupBorder,
         borderWidth = 1,
-        opacity = workspace.active and 1.0 or inactiveOpacity,
+        opacity = urgent and 1.0 or (workspace.active and 1.0 or inactiveOpacity),
     }
     if #windows == 0 then
         props.width = itemHeight + 6
