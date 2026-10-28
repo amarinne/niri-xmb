@@ -1015,6 +1015,10 @@ struct StudioApp {
     /// The live telemetry disclosure is user-controlled and must not change
     /// when pushed controller frames or window resizing cause a redraw.
     controller_telemetry_expanded: bool,
+    /// Pointer and trigger tuning disclosures, user-owned like telemetry so
+    /// redraws never collapse or expand them behind the user's back.
+    controller_pointer_expanded: bool,
+    controller_trigger_expanded: bool,
     #[allow(dead_code)]
     display_pointer_multiplier: f32,
     #[allow(dead_code)]
@@ -1390,6 +1394,8 @@ impl StudioApp {
             // Keep the high-volume diagnostic readout out of the way until
             // the user explicitly opens it from the chevron header.
             controller_telemetry_expanded: false,
+            controller_pointer_expanded: false,
+            controller_trigger_expanded: false,
             display_pointer_multiplier: 1.0,
             display_scroll_multiplier: 1.0,
             display_multiplier_at: Instant::now(),
@@ -1465,11 +1471,6 @@ impl StudioApp {
         self.status = "Loaded".to_string();
         self.show_changes = false;
         self.show_candidate = false;
-    }
-
-    fn revert(&mut self) {
-        self.undo();
-        self.status = "Reverted previous change".to_string();
     }
 
     fn dirty(&self) -> bool {
@@ -1831,56 +1832,30 @@ impl StudioApp {
         } else {
             OK
         };
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
         ui.painter().circle_filled(rect.center(), 3.5, dot);
-        ui.label(
-            RichText::new(if patch.is_empty() {
-                "No changes".to_string()
-            } else {
-                format!("{} changes", patch.set.len() + patch.remove.len())
-            })
-            .size(11.0)
-            .color(TEXT),
-        );
-        if !self.status.is_empty() {
-            ui.label(
-                RichText::new(&self.status)
-                    .size(10.5)
-                    .color(if self.error.is_empty() {
-                        status_color(&self.status)
-                    } else {
-                        ERROR
-                    }),
-            );
-        }
-        if !self.field_errors.is_empty() {
-            ui.label(
-                RichText::new(format!("{} invalid field(s)", self.field_errors.len()))
-                    .size(10.5)
-                    .color(ERROR),
-            )
-            .on_hover_text(&self.field_errors[0].message);
-        }
+        let tooltip = if !self.error.is_empty() {
+            self.error.clone()
+        } else if let Some(error) = self.field_errors.first() {
+            error.message.clone()
+        } else if !self.status.is_empty() {
+            self.status.clone()
+        } else if patch.is_empty() {
+            "No changes".to_string()
+        } else {
+            format!("{} pending change(s)", patch.set.len() + patch.remove.len())
+        };
+        response.on_hover_text(tooltip);
     }
 
     fn action_buttons(&mut self, ui: &mut Ui) {
         let dirty = self.dirty() && self.field_errors.is_empty();
         let can_undo = !self.history_undo.is_empty();
         let can_redo = !self.history_redo.is_empty();
-        if tt(
-            ui.add_enabled(can_undo, egui::Button::new("↶")),
-            "ui.action.undo",
-        )
-        .clicked()
-        {
+        if history_icon_button(ui, can_undo, false, "ui.action.undo").clicked() {
             self.undo();
         }
-        if tt(
-            ui.add_enabled(can_redo, egui::Button::new("↷")),
-            "ui.action.redo",
-        )
-        .clicked()
-        {
+        if history_icon_button(ui, can_redo, true, "ui.action.redo").clicked() {
             self.redo();
         }
         ui.separator();
@@ -1891,9 +1866,6 @@ impl StudioApp {
         .clicked()
         {
             self.show_changes = !self.show_changes;
-        }
-        if tt(ui.button("▣ Preview"), "ui.action.preview").clicked() {
-            self.section = Section::Popup;
         }
         if tt(
             ui.add_enabled(self.model != Value::Null, egui::Button::new("✓ Validate")),
@@ -1918,14 +1890,6 @@ impl StudioApp {
         {
             self.save(true);
         }
-        if tt(
-            ui.add_enabled(can_undo, egui::Button::new("↩ Revert")),
-            "ui.action.revert",
-        )
-        .clicked()
-        {
-            self.revert();
-        }
     }
 
     fn changes_drawer(&mut self, ui: &mut Ui) {
@@ -1944,9 +1908,7 @@ impl StudioApp {
                 }
             }
         });
-        if patch.is_empty() {
-            ui.label(RichText::new("No changes").size(10.5).color(TEXT_MUTED));
-        } else {
+        if !patch.is_empty() {
             ScrollArea::vertical()
                 .id_salt("patch-paths")
                 .max_height(100.0)
@@ -2358,29 +2320,10 @@ impl StudioApp {
             if let (Some(from), Some(to)) = (hotspot, row) {
                 paint_binding_link(ui, from, to);
             }
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
-            mini_heading(ui, "Pointer from analog sticks");
-            self.pointer_fields(ui);
             ui.add_space(10.0);
             ui.separator();
-            ui.add_space(8.0);
-            mini_heading(ui, "Hold layers and chords");
-            ui.label(
-                RichText::new("Hold one or more buttons, then bind another button to an action such as key.enter or niri.focus-workspace-next.")
-                    .size(10.5)
-                    .color(TEXT_MUTED),
-            );
             ui.add_space(4.0);
-            self.layers_ui(ui);
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
-            mini_heading(ui, "Trigger speed: brake / gas");
-            self.trigger_response(ui);
-            ui.add_space(8.0);
-            self.accel_fields(ui);
+            self.controller_tuning_disclosures(ui);
         } else {
             self.controller_map_body(ui, live);
             ui.separator();
@@ -2388,13 +2331,35 @@ impl StudioApp {
             ui.separator();
             self.merged_bindings(ui);
             ui.separator();
-            mini_heading(ui, "Pointer from analog sticks");
+            self.controller_tuning_disclosures(ui);
+        }
+    }
+
+    /// Pointer and trigger tuning as user-owned disclosures inside the mapping
+    /// card, so every controller setting lives in one card instead of a flat
+    /// run of separators.
+    fn controller_tuning_disclosures(&mut self, ui: &mut Ui) {
+        if collapsible_heading(
+            ui,
+            "Pointer from analog sticks",
+            self.controller_pointer_expanded,
+        ) {
+            self.controller_pointer_expanded = !self.controller_pointer_expanded;
+        }
+        if self.controller_pointer_expanded {
             self.pointer_fields(ui);
+            ui.add_space(10.0);
             ui.separator();
-            mini_heading(ui, "Hold layers and chords");
-            self.layers_ui(ui);
-            ui.separator();
-            mini_heading(ui, "Trigger speed: brake / gas");
+            ui.add_space(4.0);
+        }
+        if collapsible_heading(
+            ui,
+            "Trigger speed: brake / gas",
+            self.controller_trigger_expanded,
+        ) {
+            self.controller_trigger_expanded = !self.controller_trigger_expanded;
+        }
+        if self.controller_trigger_expanded {
             self.trigger_response(ui);
             self.accel_fields(ui);
         }
@@ -6578,6 +6543,48 @@ fn tt(response: egui::Response, key: &str) -> egui::Response {
     }
 }
 
+/// Draw the history controls as vector icons instead of relying on a font's
+/// Unicode arrow coverage. This keeps the buttons visible across systems.
+fn history_icon_button(ui: &mut Ui, enabled: bool, redo: bool, key: &str) -> egui::Response {
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new("").min_size(Vec2::new(28.0, 24.0)),
+    );
+    let rect = response.rect.shrink2(Vec2::new(7.0, 5.0));
+    let color = if enabled { TEXT } else { TEXT_DIM };
+    let stroke = Stroke::new(1.7_f32, color);
+    let center = rect.center();
+    let radius = (rect.width().min(rect.height()) * 0.48).max(3.0);
+    let arc_rect = Rect::from_center_size(
+        Pos2::new(center.x, center.y),
+        Vec2::new(radius * 2.0, radius * 1.65),
+    );
+    let start = -std::f32::consts::FRAC_PI_2;
+    let sweep = std::f32::consts::PI * 1.5;
+    let mut points = Vec::with_capacity(25);
+    for index in 0..=24 {
+        let angle = start + sweep * index as f32 / 24.0;
+        let unit = Vec2::new(angle.cos(), angle.sin());
+        let point = Pos2::new(
+            if redo {
+                arc_rect.center().x - unit.x * arc_rect.width() * 0.5
+            } else {
+                arc_rect.center().x + unit.x * arc_rect.width() * 0.5
+            },
+            arc_rect.center().y + unit.y * arc_rect.height() * 0.5,
+        );
+        points.push(point);
+    }
+    ui.painter().add(egui::Shape::line(points.clone(), stroke));
+    let tip = points[points.len() - 1];
+    let direction = if redo { 1.0 } else { -1.0 };
+    ui.painter()
+        .line_segment([tip, tip + Vec2::new(-direction * 4.0, -3.0)], stroke);
+    ui.painter()
+        .line_segment([tip, tip + Vec2::new(-direction * 4.0, 3.0)], stroke);
+    tt(response, key)
+}
+
 fn field_label(ui: &mut Ui, label: &str) {
     let width = stable_label_width(ui);
     let response = right_label(ui, width, label);
@@ -7150,14 +7157,6 @@ fn map_len(value: &Value) -> usize {
 
 fn array_len(value: &Value) -> usize {
     value.as_array().map_or(0, Vec::len)
-}
-
-fn status_color(status: &str) -> Color32 {
-    match status {
-        "Valid" | "Saved" | "Saved and restarted" => OK,
-        "Invalid" | "Not saved" | "Saved; restart failed" => ERROR,
-        _ => TEXT_MUTED,
-    }
 }
 
 fn control_hint(template: Template, control: &str) -> Option<&'static str> {
