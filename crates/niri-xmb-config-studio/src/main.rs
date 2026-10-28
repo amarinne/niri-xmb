@@ -20,7 +20,7 @@ use egui::{
     Align, Align2, Color32, ColorImage, ComboBox, CursorIcon, FontId, Key, Layout, Modifiers, Pos2,
     Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2,
 };
-use niri_xmb::config::Config;
+use niri_xmb::config::{Config, ConfigLengthBounds, config_length_bounds};
 use niri_xmb::preview::{
     PopupPreview, PreviewFrame, PreviewSelection, PreviewTarget, snapshot_from_json,
 };
@@ -221,6 +221,94 @@ enum HotspotShape {
     DpadDown,
     DpadLeft,
     DpadRight,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LengthUnit {
+    Pixels,
+    Percent,
+}
+
+impl LengthUnit {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pixels => "px",
+            Self::Percent => "%",
+        }
+    }
+}
+
+fn parse_length_value(value: &Value) -> (LengthUnit, String, Option<f64>) {
+    match value {
+        Value::String(text) if text.trim_end().ends_with('%') => {
+            let number = text.trim_end().trim_end_matches('%').trim().to_string();
+            (LengthUnit::Percent, number.clone(), number.parse().ok())
+        }
+        Value::String(text) => {
+            let number = text.clone();
+            (
+                LengthUnit::Pixels,
+                number.clone(),
+                number.trim().parse().ok(),
+            )
+        }
+        Value::Number(number) => {
+            let number = number.to_string();
+            (LengthUnit::Pixels, number.clone(), number.parse().ok())
+        }
+        _ => (LengthUnit::Pixels, String::new(), None),
+    }
+}
+
+fn format_length_value(unit: LengthUnit, number: &str) -> Value {
+    match unit {
+        LengthUnit::Pixels => number
+            .trim()
+            .parse::<f64>()
+            .map_or_else(|_| Value::String(number.to_string()), |value| json!(value)),
+        LengthUnit::Percent => Value::String(format!("{}%", number.trim())),
+    }
+}
+
+fn toggle_length_value(
+    unit: LengthUnit,
+    value: f64,
+    reference_extent: Option<f64>,
+    bounds: ConfigLengthBounds,
+) -> (LengthUnit, f64) {
+    let next = match unit {
+        LengthUnit::Pixels => LengthUnit::Percent,
+        LengthUnit::Percent => LengthUnit::Pixels,
+    };
+    let converted = reference_extent
+        .filter(|extent| extent.is_finite() && *extent > 0.0)
+        .map_or(value, |extent| match (unit, next) {
+            (LengthUnit::Pixels, LengthUnit::Percent) => value / extent * 100.0,
+            (LengthUnit::Percent, LengthUnit::Pixels) => value * extent / 100.0,
+            _ => value,
+        });
+    let (min, max) = match next {
+        LengthUnit::Pixels => (bounds.min_pixels as f64, bounds.max_pixels as f64),
+        LengthUnit::Percent => (bounds.min_percent as f64, bounds.max_percent as f64),
+    };
+    let value = if reference_extent.is_some() {
+        converted.clamp(min, max)
+    } else {
+        converted
+    };
+    (next, value)
+}
+
+fn length_slider_bounds(bounds: ConfigLengthBounds, unit: LengthUnit) -> (f64, f64) {
+    let (min, max) = match unit {
+        LengthUnit::Pixels => (bounds.min_pixels as f64, bounds.max_pixels as f64),
+        LengthUnit::Percent => (bounds.min_percent as f64, bounds.max_percent as f64),
+    };
+    // Keep the common range easy to scan while retaining the complete daemon
+    // range in the editable DragValue.
+    let min = if min < 0.0 { min.max(-1200.0) } else { min };
+    let max = if max > 1200.0 { max.min(1200.0) } else { max };
+    (min.min(max), max.max(min))
 }
 
 struct Hotspot {
@@ -5906,41 +5994,63 @@ impl StudioApp {
         self.show_field_error(ui, path);
     }
 
+    fn length_reference_extent(&self, path: &str) -> Option<f64> {
+        let live = self.live.lock().ok()?.clone();
+        let snapshot = snapshot_from_json(&live.snapshot)?;
+        let output = snapshot
+            .focused_output()
+            .and_then(|name| snapshot.outputs.get(name))?;
+        if path.contains("height") || path.contains("fixed_y") {
+            Some(output.height.max(1) as f64)
+        } else {
+            Some(output.width.max(1) as f64)
+        }
+    }
+
     fn length_field(&mut self, ui: &mut Ui, path: &str, label: &str) {
-        let value = get_path(&self.model, path)
-            .map(|value| match value {
-                Value::String(value) => value.clone(),
-                Value::Number(value) => value.to_string(),
-                _ => String::new(),
-            })
-            .unwrap_or_default();
-        let mut text = value;
+        let bounds = config_length_bounds(path).expect("length editor path has daemon bounds");
+        let source = get_path(&self.model, path).unwrap_or(&Value::Null);
+        let (mut unit, mut text, parsed) = parse_length_value(source);
+        let mut number = parsed.unwrap_or(0.0);
+        let reference_extent = self.length_reference_extent(path);
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            if !text.trim_end().ends_with('%')
-                && let Ok(mut number) = text.trim().parse::<f64>()
-            {
-                let changed = numeric_slider_f32(ui, &mut number, 0.0, 1200.0, 1.0, "");
-                if changed {
-                    text = number.to_string();
+            ui.horizontal(|ui| {
+                let mut changed;
+                if parsed.is_some() {
+                    let (min, max) = length_slider_bounds(bounds, unit);
+                    changed = numeric_slider_f32(ui, &mut number, min, max, 1.0, "");
+                    if changed {
+                        text = number.to_string();
+                    }
+                } else {
+                    changed = ui
+                        .add(egui::TextEdit::singleline(&mut text).desired_width(120.0))
+                        .changed();
+                }
+                let next = match unit {
+                    LengthUnit::Pixels => LengthUnit::Percent,
+                    LengthUnit::Percent => LengthUnit::Pixels,
+                };
+                if ui
+                    .small_button(unit.label())
+                    .on_hover_text(format!("Switch to {}", next.label()))
+                    .clicked()
+                {
+                    if parsed.is_some() {
+                        (unit, number) =
+                            toggle_length_value(unit, number, reference_extent, bounds);
+                        text = number.to_string();
+                    } else {
+                        unit = next;
+                    }
+                    changed = true;
                 }
                 changed
-            } else {
-                ui.add(
-                    egui::TextEdit::singleline(&mut text).desired_width(input_width(ui).min(170.0)),
-                )
-                .changed()
-            }
+            })
+            .inner
         });
         if changed {
-            let text = text.trim().to_string();
-            let value = if text.ends_with('%') {
-                Value::String(text)
-            } else {
-                text.parse::<f64>()
-                    .map(|value| json!(value))
-                    .unwrap_or(Value::String(text))
-            };
-            set_json_path(&mut self.model, path, value);
+            set_json_path(&mut self.model, path, format_length_value(unit, &text));
         }
         self.show_field_error(ui, path);
     }
@@ -7745,17 +7855,19 @@ fn numeric_slider_f32(
 ) -> bool {
     let before = *value;
     ui.horizontal(|ui| {
-        let width = (ui.available_width() - 84.0).max(64.0);
+        let width = numeric_slider_width(ui, suffix);
         ui.add_sized(
             [width, 20.0],
-            egui::Slider::new(value, min..=max).step_by(step),
+            egui::Slider::new(value, min..=max)
+                .step_by(step)
+                .show_value(false),
         );
         ui.add(
             egui::DragValue::new(value)
                 .speed(step)
-                .suffix(suffix)
                 .clamp_existing_to_range(false),
         );
+        static_unit_label(ui, suffix);
     });
     *value != before
 }
@@ -7770,17 +7882,19 @@ fn numeric_slider_u64(
 ) -> bool {
     let before = *value;
     ui.horizontal(|ui| {
-        let width = (ui.available_width() - 84.0).max(64.0);
+        let width = numeric_slider_width(ui, suffix);
         ui.add_sized(
             [width, 20.0],
-            egui::Slider::new(value, min..=max).step_by(step),
+            egui::Slider::new(value, min..=max)
+                .step_by(step)
+                .show_value(false),
         );
         ui.add(
             egui::DragValue::new(value)
                 .speed(step)
-                .suffix(suffix)
                 .clamp_existing_to_range(false),
         );
+        static_unit_label(ui, suffix);
     });
     *value != before
 }
@@ -7795,19 +7909,33 @@ fn numeric_slider_i64(
 ) -> bool {
     let before = *value;
     ui.horizontal(|ui| {
-        let width = (ui.available_width() - 84.0).max(64.0);
+        let width = numeric_slider_width(ui, suffix);
         ui.add_sized(
             [width, 20.0],
-            egui::Slider::new(value, min..=max).step_by(step),
+            egui::Slider::new(value, min..=max)
+                .step_by(step)
+                .show_value(false),
         );
         ui.add(
             egui::DragValue::new(value)
                 .speed(step)
-                .suffix(suffix)
                 .clamp_existing_to_range(false),
         );
+        static_unit_label(ui, suffix);
     });
     *value != before
+}
+
+fn static_unit_label(ui: &mut Ui, suffix: &str) {
+    let unit = suffix.trim();
+    if !unit.is_empty() {
+        ui.label(RichText::new(unit).color(TEXT_MUTED));
+    }
+}
+
+fn numeric_slider_width(ui: &Ui, suffix: &str) -> f32 {
+    let unit_reserve = if suffix.trim().is_empty() { 0.0 } else { 24.0 };
+    (ui.available_width() - 84.0 - unit_reserve).max(64.0)
 }
 
 /// Attach the catalog hover text for a `ui.*` key to a widget response.
@@ -9376,6 +9504,43 @@ mod tests {
             telemetry_state(false, false, 0, None, false),
             TelemetryState::Offline
         );
+    }
+
+    #[test]
+    fn length_values_parse_pixels_and_percent() {
+        assert_eq!(
+            parse_length_value(&json!(320)),
+            (LengthUnit::Pixels, "320".to_string(), Some(320.0))
+        );
+        assert_eq!(
+            parse_length_value(&json!("25%")),
+            (LengthUnit::Percent, "25".to_string(), Some(25.0))
+        );
+    }
+
+    #[test]
+    fn length_values_format_without_changing_static_pixel_fields() {
+        assert_eq!(format_length_value(LengthUnit::Pixels, "320"), json!(320.0));
+        assert_eq!(format_length_value(LengthUnit::Percent, "25"), json!("25%"));
+    }
+
+    #[test]
+    fn length_unit_toggle_round_trips_with_live_extent() {
+        let bounds = config_length_bounds("popup.width").unwrap();
+        let (unit, percent) = toggle_length_value(LengthUnit::Pixels, 960.0, Some(1920.0), bounds);
+        assert_eq!(unit, LengthUnit::Percent);
+        assert!((percent - 50.0).abs() < f64::EPSILON);
+        let (unit, pixels) = toggle_length_value(unit, percent, Some(1920.0), bounds);
+        assert_eq!(unit, LengthUnit::Pixels);
+        assert!((pixels - 960.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn length_unit_toggle_without_extent_keeps_the_magnitude() {
+        let bounds = config_length_bounds("popup.width").unwrap();
+        let (unit, value) = toggle_length_value(LengthUnit::Pixels, 320.0, None, bounds);
+        assert_eq!(unit, LengthUnit::Percent);
+        assert_eq!(value, 320.0);
     }
 
     #[test]

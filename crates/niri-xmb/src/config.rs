@@ -13,6 +13,60 @@ const MAX_STYLE_LENGTH: f32 = 2048.0;
 const MAX_FONT_SIZE: f32 = 512.0;
 const MAX_ICON_SIZE: u32 = 1024;
 
+/// Valid ranges for a [`ConfigLength`] field. The studio uses this same
+/// schema so its unit controls cannot drift from daemon validation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConfigLengthBounds {
+    pub min_pixels: f32,
+    pub max_pixels: f32,
+    pub min_percent: f32,
+    pub max_percent: f32,
+}
+
+/// Return the daemon-owned bounds for a config path that stores a length.
+pub fn config_length_bounds(field: &str) -> Option<ConfigLengthBounds> {
+    match field {
+        "popup.width" | "popup.height" | "popup.canvas_width" | "popup.canvas_height" => {
+            Some(ConfigLengthBounds {
+                min_pixels: 1.0,
+                max_pixels: MAX_LOGICAL_DIMENSION,
+                min_percent: 0.1,
+                max_percent: 100.0,
+            })
+        }
+        "popup.fixed_x" | "popup.fixed_y" => Some(ConfigLengthBounds {
+            min_pixels: -MAX_OFFSET,
+            max_pixels: MAX_OFFSET,
+            min_percent: -100.0,
+            max_percent: 100.0,
+        }),
+        field
+            if (field.starts_with("popup.placements[")
+                || field.starts_with("popup.placements."))
+                && field.ends_with(".margin") =>
+        {
+            Some(ConfigLengthBounds {
+                min_pixels: 0.0,
+                max_pixels: MAX_OFFSET,
+                min_percent: 0.0,
+                max_percent: 100.0,
+            })
+        }
+        field
+            if (field.starts_with("bars[") || field.starts_with("bars."))
+                && field.ends_with(".margin") =>
+        {
+            Some(ConfigLengthBounds {
+                min_pixels: 0.0,
+                max_pixels: MAX_OFFSET,
+                min_percent: 0.0,
+                max_percent: 100.0,
+            })
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -192,50 +246,32 @@ impl Config {
             validate_length(
                 "popup.width",
                 self.popup.width,
-                1.0,
-                MAX_LOGICAL_DIMENSION,
-                0.1,
-                100.0,
+                config_length_bounds("popup.width").expect("known length field"),
             ),
             validate_length(
                 "popup.height",
                 self.popup.height,
-                1.0,
-                MAX_LOGICAL_DIMENSION,
-                0.1,
-                100.0,
+                config_length_bounds("popup.height").expect("known length field"),
             ),
             validate_length(
                 "popup.canvas_width",
                 self.popup.canvas_width,
-                1.0,
-                MAX_LOGICAL_DIMENSION,
-                0.1,
-                100.0,
+                config_length_bounds("popup.canvas_width").expect("known length field"),
             ),
             validate_length(
                 "popup.canvas_height",
                 self.popup.canvas_height,
-                1.0,
-                MAX_LOGICAL_DIMENSION,
-                0.1,
-                100.0,
+                config_length_bounds("popup.canvas_height").expect("known length field"),
             ),
             validate_length(
                 "popup.fixed_x",
                 self.popup.fixed_x,
-                -MAX_OFFSET,
-                MAX_OFFSET,
-                -100.0,
-                100.0,
+                config_length_bounds("popup.fixed_x").expect("known length field"),
             ),
             validate_length(
                 "popup.fixed_y",
                 self.popup.fixed_y,
-                -MAX_OFFSET,
-                MAX_OFFSET,
-                -100.0,
-                100.0,
+                config_length_bounds("popup.fixed_y").expect("known length field"),
             ),
             validate_u64_range(
                 "popup.follow_delay_ms",
@@ -267,10 +303,8 @@ impl Config {
                 validate_length(
                     &format!("popup.placements[{index}].margin"),
                     placement.margin,
-                    0.0,
-                    MAX_OFFSET,
-                    0.0,
-                    100.0,
+                    config_length_bounds(&format!("popup.placements[{index}].margin"))
+                        .expect("known length field"),
                 ),
             );
         }
@@ -445,17 +479,14 @@ fn validate_output_name(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_length(
-    field: &str,
-    value: ConfigLength,
-    min_pixels: f32,
-    max_pixels: f32,
-    min_percent: f32,
-    max_percent: f32,
-) -> Result<()> {
+fn validate_length(field: &str, value: ConfigLength, bounds: ConfigLengthBounds) -> Result<()> {
     match value {
-        ConfigLength::Pixels(value) => validate_f32_range(field, value, min_pixels, max_pixels),
-        ConfigLength::Percent(value) => validate_f32_range(field, value, min_percent, max_percent),
+        ConfigLength::Pixels(value) => {
+            validate_f32_range(field, value, bounds.min_pixels, bounds.max_pixels)
+        }
+        ConfigLength::Percent(value) => {
+            validate_f32_range(field, value, bounds.min_percent, bounds.max_percent)
+        }
     }
 }
 
@@ -1182,9 +1213,7 @@ pub(crate) fn parse_navi_action(value: &str) -> Result<NaviAction> {
         "pointer.left" => NaviAction::Pointer(PointerButton::Left),
         "pointer.right" => NaviAction::Pointer(PointerButton::Right),
         "pointer.middle" => NaviAction::Pointer(PointerButton::Middle),
-        "pointer.back" | "pointer.side" | "pointer.m4" => {
-            NaviAction::Pointer(PointerButton::Side)
-        }
+        "pointer.back" | "pointer.side" | "pointer.m4" => NaviAction::Pointer(PointerButton::Side),
         "pointer.forward" | "pointer.extra" | "pointer.m5" => {
             NaviAction::Pointer(PointerButton::Extra)
         }
@@ -1860,6 +1889,25 @@ pub(crate) fn gamepad_button_code(name: &str) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_length_bounds_cover_all_editor_units() {
+        let width = config_length_bounds("popup.width").unwrap();
+        assert_eq!((width.min_pixels, width.max_pixels), (1.0, 8192.0));
+        assert_eq!((width.min_percent, width.max_percent), (0.1, 100.0));
+        let margin = config_length_bounds("bars.0.margin").unwrap();
+        assert_eq!((margin.min_pixels, margin.max_pixels), (0.0, 8192.0));
+        assert_eq!((margin.min_percent, margin.max_percent), (0.0, 100.0));
+        assert_eq!(
+            config_length_bounds("popup.placements.0.margin"),
+            Some(margin)
+        );
+        assert_eq!(
+            config_length_bounds("popup.placements[0].margin"),
+            Some(margin)
+        );
+        assert!(config_length_bounds("animation.panel_ms").is_none());
+    }
 
     fn load_source(config_source: &str, theme_source: Option<&str>) -> Result<Config> {
         static TEMP_DIR_COUNTER: std::sync::atomic::AtomicU64 =
