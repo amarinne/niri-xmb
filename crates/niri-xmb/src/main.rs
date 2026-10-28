@@ -2077,6 +2077,7 @@ fn handle_gamepad_event(
                     Ok(false)
                 }
                 NaviAction::Pointer(_) => Ok(false),
+                NaviAction::Move(..) => Ok(false),
                 NaviAction::Key(_) => Ok(false),
             }
         }

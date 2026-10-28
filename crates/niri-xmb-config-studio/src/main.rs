@@ -62,6 +62,12 @@ const ACTIONS: &[&str] = &[
     "pointer.left",
     "pointer.right",
     "pointer.middle",
+    "pointer.back",
+    "pointer.forward",
+    "pointer.move-up",
+    "pointer.move-down",
+    "pointer.move-left",
+    "pointer.move-right",
     "pointer.scroll-up",
     "pointer.scroll-down",
     "xmb.open",
@@ -734,6 +740,54 @@ impl Section {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum ControllerTab {
+    #[default]
+    Bindings,
+    Curves,
+    Diagnostics,
+    Device,
+}
+
+impl ControllerTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bindings => "Bindings & Layers",
+            Self::Curves => "Analog & Curves",
+            Self::Diagnostics => "Diagnostics",
+            Self::Device => "Device Settings",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Bindings => "⌨",
+            Self::Curves => "∿",
+            Self::Diagnostics => "⏱",
+            Self::Device => "⚙",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ControlSource {
+    LeftStick,
+    RightStick,
+    Dpad,
+    Other,
+}
+
+impl ControlSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LeftStick => "Left Stick",
+            Self::RightStick => "Right Stick",
+            Self::Dpad => "D-pad",
+            Self::Other => "Other",
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct LiveState {
     status: Value,
@@ -1008,11 +1062,15 @@ struct StudioApp {
     template: Template,
     selected: &'static str,
     context: String,
+    controller_tab: ControllerTab,
+    pointer_source: Option<ControlSource>,
+    scroll_source: Option<ControlSource>,
     error: String,
     candidate: String,
     hot_save: bool,
     /// The live telemetry disclosure is user-controlled and must not change
     /// when pushed controller frames or window resizing cause a redraw.
+    #[allow(dead_code)]
     controller_telemetry_expanded: bool,
     /// Pointer and trigger tuning disclosures, user-owned like telemetry so
     /// redraws never collapse or expand them behind the user's back.
@@ -1386,14 +1444,17 @@ impl StudioApp {
             template: Template::Xbox,
             selected: Template::Xbox.default_control(),
             context: "base".to_string(),
+            controller_tab: ControllerTab::Bindings,
+            pointer_source: None,
+            scroll_source: None,
             error: String::new(),
             candidate: String::new(),
             hot_save: false,
             // Keep the high-volume diagnostic readout out of the way until
             // the user explicitly opens it from the chevron header.
             controller_telemetry_expanded: false,
-            controller_pointer_expanded: false,
-            controller_trigger_expanded: false,
+            controller_pointer_expanded: true,
+            controller_trigger_expanded: true,
             display_pointer_multiplier: 1.0,
             display_scroll_multiplier: 1.0,
             display_multiplier_at: Instant::now(),
@@ -2028,66 +2089,102 @@ impl StudioApp {
 
     fn controller_section(&mut self, ui: &mut Ui) {
         self.section_header(ui);
-        self.controller_unified_card(ui);
-        section_card(ui, "Device", |ui| self.device_fields(ui));
-    }
 
-    /// Keep live diagnostics in their own disclosure card so the mapping
-    /// controls remain compact and stable while telemetry updates arrive.
-    fn controller_unified_card(&mut self, ui: &mut Ui) {
         let live = self
             .live
             .lock()
             .map(|live| live.clone())
             .unwrap_or_default();
         let view = GamepadLiveView::from_status(&live.status);
-        card(ui, |ui| {
-            self.controller_telemetry_header(ui, &live, &view);
-            if self.controller_telemetry_expanded {
+
+        let width = ui.available_width();
+        if width >= 960.0 {
+            let stage_width = (width * 0.44).clamp(420.0, 560.0);
+            let mut hotspot = None;
+            let mut row = None;
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(stage_width);
+                    card(ui, |ui| {
+                        hotspot = self.controller_stage(ui, &live, &view);
+                    });
+                });
                 ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-                self.gamepad_diagnostics_body(ui, &live, &view);
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    card(ui, |ui| {
+                        row = self.controller_tabs_panel(ui, &live, &view);
+                    });
+                });
+            });
+            if let (Some(from), Some(to)) = (hotspot, row)
+                && self.controller_tab == ControllerTab::Bindings
+            {
+                paint_binding_link(ui, from, to);
             }
-        });
-        card(ui, |ui| {
-            self.controller_mapping_body(ui, &view);
-        });
+        } else {
+            let mut hotspot = None;
+            let mut row = None;
+            card(ui, |ui| {
+                hotspot = self.controller_stage(ui, &live, &view);
+            });
+            ui.add_space(4.0);
+            card(ui, |ui| {
+                row = self.controller_tabs_panel(ui, &live, &view);
+            });
+            if let (Some(from), Some(to)) = (hotspot, row)
+                && self.controller_tab == ControllerTab::Bindings
+            {
+                paint_binding_link(ui, from, to);
+            }
+        }
     }
 
-    /// Stable disclosure row for live telemetry. Its open state is owned by
-    /// the app, so pushed frames and ordinary redraws never toggle or resize
-    /// the section without an explicit click on the chevron.
-    fn controller_telemetry_header(
+    /// Persistent controller visualizer stage: device identity, template switch,
+    /// interactive SVG artwork with live stick deflections and trigger meters,
+    /// paddle strip, and immediate inspector/quick-mapper for selected controls.
+    fn controller_stage(
+        &mut self,
+        ui: &mut Ui,
+        live: &LiveState,
+        view: &GamepadLiveView,
+    ) -> Option<Rect> {
+        self.controller_stage_header(ui, live, view);
+        ui.add_space(8.0);
+        let hotspot = self.controller_map_body(ui, view);
+        ui.add_space(6.0);
+        self.controller_paddles_strip(ui, view);
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        self.inspector_body(ui);
+        hotspot
+    }
+
+    /// Header on the persistent controller stage: connection indicator, device name,
+    /// vendor/product IDs, template toggle (Xbox/DS4), and live stream telemetry rate.
+    fn controller_stage_header(
         &mut self,
         ui: &mut Ui,
         live: &LiveState,
         view: &GamepadLiveView,
     ) {
-        let expanded = self.controller_telemetry_expanded;
-        let mut toggle = false;
+        let is_connected = view.connected > 0;
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Live controller telemetry")
-                    .size(12.5)
-                    .strong()
-                    .color(TEXT),
-            );
-            ui.add_space(8.0);
             ui.label(
                 RichText::new(if view.device_name.is_empty() {
                     "No controller"
                 } else {
                     &view.device_name
                 })
-                .size(14.0)
+                .size(13.0)
                 .strong(),
             );
-            let dot = if view.connected > 0 { OK } else { WARN };
+            let dot = if is_connected { OK } else { WARN };
             let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
             ui.painter().circle_filled(dot_rect.center(), 3.0, dot);
             ui.label(
-                RichText::new(if view.connected > 0 {
+                RichText::new(if is_connected {
                     "connected"
                 } else {
                     "not detected"
@@ -2095,52 +2192,769 @@ impl StudioApp {
                 .size(10.0)
                 .color(dot),
             );
+            if is_connected && (view.vendor != 0 || view.product != 0) {
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(format!("[{:04x}:{:04x}]", view.vendor, view.product))
+                        .monospace()
+                        .size(9.5)
+                        .color(TEXT_DIM),
+                );
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                for template in [Template::Ds4, Template::Xbox] {
+                    if ui
+                        .selectable_label(self.template == template, template.label())
+                        .clicked()
+                    {
+                        self.switch_template(template);
+                    }
+                }
+            });
+        });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            let rate = if live.gamepad_hz > 0.5 {
+                format!("{:.0} Hz", live.gamepad_hz)
+            } else {
+                "idle".to_string()
+            };
+            let count = self.connected_count();
+            let count_str = if count > 1 {
+                format!("{count} devices · ")
+            } else {
+                String::new()
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{count_str}{} · {}",
+                    rate,
+                    self.gamepad_mode_name()
+                ))
+                .monospace()
+                .size(9.5)
+                .color(TEXT_DIM),
+            );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(error) = live.status["error"].as_str() {
                     ui.label(RichText::new(error).size(9.5).color(ERROR));
                 } else if !live.error.is_empty() {
                     ui.label(RichText::new(&live.error).size(9.5).color(ERROR));
-                }
-                let (chevron_rect, response) =
-                    ui.allocate_exact_size(Vec2::new(28.0, 24.0), Sense::click());
-                let center = chevron_rect.center();
-                let points = if expanded {
-                    [
-                        Pos2::new(center.x - 5.0, center.y - 2.0),
-                        Pos2::new(center.x, center.y + 3.0),
-                        Pos2::new(center.x + 5.0, center.y - 2.0),
-                    ]
                 } else {
-                    [
-                        Pos2::new(center.x - 2.0, center.y - 5.0),
-                        Pos2::new(center.x + 3.0, center.y),
-                        Pos2::new(center.x - 2.0, center.y + 5.0),
-                    ]
-                };
-                let stroke = Stroke::new(
-                    1.8_f32,
-                    if response.hovered() {
-                        ACCENT
-                    } else {
-                        TEXT_MUTED
-                    },
-                );
-                ui.painter().line_segment([points[0], points[1]], stroke);
-                ui.painter().line_segment([points[1], points[2]], stroke);
-                if response
-                    .on_hover_text(if expanded {
-                        "Collapse live controller telemetry"
-                    } else {
-                        "Expand live controller telemetry"
-                    })
-                    .clicked()
-                {
-                    toggle = true;
+                    ui.label(
+                        RichText::new("click button to inspect & map")
+                            .size(9.0)
+                            .color(TEXT_DIM),
+                    );
                 }
             });
         });
-        if toggle {
-            self.controller_telemetry_expanded = !expanded;
+    }
+
+    /// Segmented tabs panel: tab bar organizing Bindings & Layers, Analog & Curves,
+    /// Live Diagnostics, and Device Hardware settings.
+    fn controller_tabs_panel(
+        &mut self,
+        ui: &mut Ui,
+        live: &LiveState,
+        view: &GamepadLiveView,
+    ) -> Option<Rect> {
+        let mut row = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for tab in [
+                ControllerTab::Bindings,
+                ControllerTab::Curves,
+                ControllerTab::Diagnostics,
+                ControllerTab::Device,
+            ] {
+                self.controller_tab_button(ui, tab);
+            }
+        });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        match self.controller_tab {
+            ControllerTab::Bindings => {
+                let nav_rect = self.pointer_scroll_navigation_pods(ui);
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+                let bindings_rect = self.merged_bindings(ui);
+                row = nav_rect.or(bindings_rect);
+            }
+            ControllerTab::Curves => {
+                self.controller_curves_body(ui);
+            }
+            ControllerTab::Diagnostics => {
+                self.gamepad_diagnostics_body(ui, live, view);
+            }
+            ControllerTab::Device => {
+                self.device_fields(ui);
+            }
+        }
+        row
+    }
+
+    fn is_left_stick_selected(&self) -> bool {
+        is_left_stick(self.selected)
+    }
+
+    fn is_right_stick_selected(&self) -> bool {
+        is_right_stick(self.selected)
+    }
+
+    fn select_stick(&mut self, stick: &str) {
+        self.selected = stick_control_for_template(self.template, stick);
+    }
+
+    fn buttons_for_action(&self, context: &str, action: &str) -> Vec<String> {
+        let path = if context == "xmb" {
+            "gamepad.navi.bindings".to_string()
+        } else {
+            binding_path(context)
+        };
+        get_path(&self.model, &path)
+            .and_then(Value::as_object)
+            .map(|map| {
+                map.iter()
+                    .filter(|(_, act)| act.as_str() == Some(action))
+                    .map(|(code, _)| code.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn control_name_for_code(&self, code: &str) -> &'static str {
+        control_name_for_code_and_template(self.template, code)
+    }
+
+    /// Two side-by-side cards at the top of the Bindings tab:
+    /// Left: Pointer (Cursor), Right: Scroll Wheel.
+    /// Returns the target Rect when the selected controller element (stick or button)
+    /// maps to pointer or scroll, enabling bezier line connection.
+    fn pointer_scroll_navigation_pods(&mut self, ui: &mut Ui) -> Option<Rect> {
+        let width = ui.available_width();
+        let mut target_rect = None;
+        if width >= 480.0 {
+            ui.columns(2, |cols| {
+                let p_rect = self.pointer_pod_ui(&mut cols[0]);
+                let s_rect = self.scroll_pod_ui(&mut cols[1]);
+                target_rect = p_rect.or(s_rect);
+            });
+        } else {
+            let p_rect = self.pointer_pod_ui(ui);
+            ui.add_space(6.0);
+            let s_rect = self.scroll_pod_ui(ui);
+            target_rect = p_rect.or(s_rect);
+        }
+        target_rect
+    }
+
+    fn pointer_control_source(&self) -> ControlSource {
+        if let Some(src) = self.pointer_source {
+            return src;
+        }
+        let map_path = binding_path(&self.context);
+        let bindings = get_path(&self.model, &map_path).and_then(Value::as_object);
+        let has_dpad_move = bindings.is_some_and(|map| {
+            map.get("BTN_DPAD_UP").and_then(Value::as_str) == Some("pointer.move-up")
+        });
+        if has_dpad_move {
+            return ControlSource::Dpad;
+        }
+        let has_other_move = bindings.is_some_and(|map| {
+            map.values().any(|v| {
+                v.as_str().is_some_and(|s| {
+                    matches!(
+                        s,
+                        "pointer.move-up"
+                            | "pointer.move-down"
+                            | "pointer.move-left"
+                            | "pointer.move-right"
+                    )
+                })
+            })
+        });
+        if has_other_move {
+            return ControlSource::Other;
+        }
+        let stick = get_path(&self.model, "gamepad.navi.pointer.stick")
+            .and_then(Value::as_str)
+            .unwrap_or("left");
+        if stick == "right" {
+            ControlSource::RightStick
+        } else {
+            ControlSource::LeftStick
+        }
+    }
+
+    fn set_pointer_control_source(&mut self, src: ControlSource) {
+        self.pointer_source = Some(src);
+        match src {
+            ControlSource::LeftStick => {
+                set_json_path(
+                    &mut self.model,
+                    "gamepad.navi.pointer.stick",
+                    Value::String("left".to_string()),
+                );
+                self.select_stick("left");
+            }
+            ControlSource::RightStick => {
+                set_json_path(
+                    &mut self.model,
+                    "gamepad.navi.pointer.stick",
+                    Value::String("right".to_string()),
+                );
+                self.select_stick("right");
+            }
+            ControlSource::Dpad => {
+                let map_path = if self.context == "xmb" {
+                    "gamepad.navi.bindings".to_string()
+                } else {
+                    binding_path(&self.context)
+                };
+                set_map_value(&mut self.model, &map_path, "BTN_DPAD_UP", "pointer.move-up");
+                set_map_value(&mut self.model, &map_path, "BTN_DPAD_DOWN", "pointer.move-down");
+                set_map_value(&mut self.model, &map_path, "BTN_DPAD_LEFT", "pointer.move-left");
+                set_map_value(&mut self.model, &map_path, "BTN_DPAD_RIGHT", "pointer.move-right");
+                self.selected = "D-pad up";
+            }
+            ControlSource::Other => {}
+        }
+    }
+
+    fn scroll_control_source(&self) -> ControlSource {
+        if let Some(src) = self.scroll_source {
+            return src;
+        }
+        let map_path = binding_path(&self.context);
+        let bindings = get_path(&self.model, &map_path).and_then(Value::as_object);
+        let has_dpad_scroll = bindings.is_some_and(|map| {
+            map.get("BTN_DPAD_UP").and_then(Value::as_str) == Some("pointer.scroll-up")
+        });
+        if has_dpad_scroll {
+            return ControlSource::Dpad;
+        }
+        let has_other_scroll = bindings.is_some_and(|map| {
+            map.values().any(|v| {
+                v.as_str().is_some_and(|s| {
+                    matches!(s, "pointer.scroll-up" | "pointer.scroll-down")
+                })
+            })
+        });
+        if has_other_scroll {
+            return ControlSource::Other;
+        }
+        let stick = get_path(&self.model, "gamepad.navi.pointer.scroll_stick")
+            .and_then(Value::as_str)
+            .unwrap_or("right");
+        if stick == "left" {
+            ControlSource::LeftStick
+        } else {
+            ControlSource::RightStick
+        }
+    }
+
+    fn set_scroll_control_source(&mut self, src: ControlSource) {
+        self.scroll_source = Some(src);
+        match src {
+            ControlSource::LeftStick => {
+                set_json_path(
+                    &mut self.model,
+                    "gamepad.navi.pointer.scroll_stick",
+                    Value::String("left".to_string()),
+                );
+                self.select_stick("left");
+            }
+            ControlSource::RightStick => {
+                set_json_path(
+                    &mut self.model,
+                    "gamepad.navi.pointer.scroll_stick",
+                    Value::String("right".to_string()),
+                );
+                self.select_stick("right");
+            }
+            ControlSource::Dpad => {
+                let map_path = if self.context == "xmb" {
+                    "gamepad.navi.bindings".to_string()
+                } else {
+                    binding_path(&self.context)
+                };
+                set_map_value(&mut self.model, &map_path, "BTN_DPAD_UP", "pointer.scroll-up");
+                set_map_value(&mut self.model, &map_path, "BTN_DPAD_DOWN", "pointer.scroll-down");
+                self.selected = "D-pad up";
+            }
+            ControlSource::Other => {}
+        }
+    }
+
+    fn pointer_pod_ui(&mut self, ui: &mut Ui) -> Option<Rect> {
+        let current_source = self.pointer_control_source();
+        let stick_selected = match current_source {
+            ControlSource::LeftStick => self.is_left_stick_selected(),
+            ControlSource::RightStick => self.is_right_stick_selected(),
+            _ => false,
+        };
+
+        let selected_code = self.selected_code().map(str::to_string);
+        let mut target_rect = None;
+
+        let selected_action = selected_code.as_deref().and_then(|code| {
+            let map_path = binding_path(&self.context);
+            get_path(&self.model, &map_path)
+                .and_then(Value::as_object)
+                .and_then(|map| map.get(code))
+                .and_then(Value::as_str)
+        });
+        let click_matches = matches!(
+            selected_action,
+            Some("pointer.left" | "pointer.right" | "pointer.middle" | "pointer.back" | "pointer.forward")
+        );
+        let motion_matches = (current_source == ControlSource::Dpad || current_source == ControlSource::Other)
+            && matches!(
+                selected_action,
+                Some("pointer.move-up" | "pointer.move-down" | "pointer.move-left" | "pointer.move-right")
+            );
+        let is_active = stick_selected || click_matches || motion_matches;
+
+        let frame = egui::Frame::new()
+            .fill(FIELD_BG)
+            .stroke(Stroke::new(
+                if is_active { 1.5_f32 } else { 1.0_f32 },
+                if is_active { ACCENT } else { BORDER },
+            ))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::same(8));
+
+        frame.show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Header: Cursor icon, title, Enabled checkbox, Curves jump
+            ui.horizontal(|ui| {
+                let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(18.0, 18.0), Sense::hover());
+                draw_cursor_icon(ui.painter(), icon_rect, if is_active { ACCENT } else { TEXT });
+                ui.add_space(2.0);
+                ui.label(RichText::new("Pointer").size(12.5).strong());
+
+                let mut enabled = get_path(&self.model, "gamepad.navi.pointer.enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                if ui
+                    .checkbox(&mut enabled, "")
+                    .on_hover_text("Enable analog stick or digital mouse cursor")
+                    .changed()
+                {
+                    set_json_path(&mut self.model, "gamepad.navi.pointer.enabled", Value::Bool(enabled));
+                }
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .small_button("∿ Curves")
+                        .on_hover_text("Open analog response curves & deadzones")
+                        .clicked()
+                    {
+                        self.controller_tab = ControllerTab::Curves;
+                    }
+                });
+            });
+
+            ui.add_space(4.0);
+
+            // Source dropdown & Invert Y
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Source:").size(10.5).color(TEXT_MUTED));
+                let mut chosen_source = current_source;
+                let combo = ComboBox::from_id_salt("pointer-source-dropdown")
+                    .width(105.0)
+                    .selected_text(current_source.label())
+                    .show_ui(ui, |ui| {
+                        for src in [
+                            ControlSource::LeftStick,
+                            ControlSource::RightStick,
+                            ControlSource::Dpad,
+                            ControlSource::Other,
+                        ] {
+                            if ui.selectable_value(&mut chosen_source, src, src.label()).clicked() {
+                                self.set_pointer_control_source(src);
+                            }
+                        }
+                    });
+                if stick_selected {
+                    target_rect = Some(combo.response.rect);
+                }
+
+                ui.add_space(6.0);
+                let mut invert_y = get_path(&self.model, "gamepad.navi.pointer.invert_y")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if ui
+                    .checkbox(&mut invert_y, "Invert Y")
+                    .on_hover_text("Invert pointer vertical axis")
+                    .changed()
+                {
+                    set_json_path(&mut self.model, "gamepad.navi.pointer.invert_y", Value::Bool(invert_y));
+                }
+            });
+
+            // Motion row if D-pad or Other
+            if current_source == ControlSource::Dpad || current_source == ControlSource::Other {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Motion:").size(10.5).color(TEXT_MUTED));
+                    for (act, act_label) in [
+                        ("pointer.move-up", "Up"),
+                        ("pointer.move-down", "Down"),
+                        ("pointer.move-left", "Left"),
+                        ("pointer.move-right", "Right"),
+                    ] {
+                        let bound = self.buttons_for_action(&self.context, act);
+                        if bound.is_empty() {
+                            let text = RichText::new(format!("+ {act_label}")).size(9.5).color(TEXT_DIM);
+                            let btn = egui::Button::new(text)
+                                .fill(CARD)
+                                .stroke(Stroke::new(1.0_f32, BORDER))
+                                .corner_radius(3.0);
+                            let mut pill_resp = ui.add(btn);
+                            if let Some(code) = &selected_code {
+                                pill_resp = pill_resp.on_hover_text(format!("Bind {code} to {act_label}"));
+                            }
+                            if pill_resp.clicked()
+                                && let Some(code) = self.selected_code()
+                            {
+                                let map_path = if self.context == "xmb" {
+                                    "gamepad.navi.bindings".to_string()
+                                } else {
+                                    binding_path(&self.context)
+                                };
+                                set_map_value(&mut self.model, &map_path, code, act);
+                            }
+                        } else {
+                            for code in &bound {
+                                let ctrl = self.control_name_for_code(code);
+                                let is_sel = self.selected == ctrl || selected_code.as_deref() == Some(code.as_str());
+                                let text = RichText::new(format!("{act_label}: {ctrl}"))
+                                    .size(9.5)
+                                    .color(if is_sel { Color32::WHITE } else { TEXT_MUTED });
+                                let btn = egui::Button::new(text)
+                                    .fill(if is_sel {
+                                        Color32::from_rgba_unmultiplied(116, 162, 255, 50)
+                                    } else {
+                                        CARD
+                                    })
+                                    .stroke(if is_sel {
+                                        Stroke::new(1.5_f32, ACCENT)
+                                    } else {
+                                        Stroke::new(1.0_f32, BORDER)
+                                    })
+                                    .corner_radius(3.0);
+                                let pill_resp = ui.add(btn);
+                                if is_sel {
+                                    target_rect = Some(pill_resp.rect);
+                                }
+                                if pill_resp.clicked() {
+                                    self.selected = ctrl;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            ui.add_space(4.0);
+
+            // Clicks row (Occupying buttons)
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Clicks:").size(10.5).color(TEXT_MUTED));
+                for (act, act_label) in [
+                    ("pointer.left", "L-Click"),
+                    ("pointer.right", "R-Click"),
+                    ("pointer.middle", "M-Click"),
+                    ("pointer.back", "M4"),
+                    ("pointer.forward", "M5"),
+                ] {
+                    let bound = self.buttons_for_action(&self.context, act);
+                    if bound.is_empty() {
+                        let text = RichText::new(format!("+ {act_label}")).size(9.5).color(TEXT_DIM);
+                        let btn = egui::Button::new(text)
+                            .fill(CARD)
+                            .stroke(Stroke::new(1.0_f32, BORDER))
+                            .corner_radius(3.0);
+                        let mut pill_resp = ui.add(btn);
+                        if let Some(code) = &selected_code {
+                            pill_resp = pill_resp.on_hover_text(format!("Bind {code} to {act_label}"));
+                        }
+                        if pill_resp.clicked()
+                            && let Some(code) = self.selected_code()
+                        {
+                            let map_path = if self.context == "xmb" {
+                                "gamepad.navi.bindings".to_string()
+                            } else {
+                                binding_path(&self.context)
+                            };
+                            set_map_value(&mut self.model, &map_path, code, act);
+                        }
+                    } else {
+                        for code in &bound {
+                            let ctrl = self.control_name_for_code(code);
+                            let is_sel = self.selected == ctrl || selected_code.as_deref() == Some(code.as_str());
+                            let text = RichText::new(format!("{act_label}: {ctrl}"))
+                                .size(9.5)
+                                .color(if is_sel { Color32::WHITE } else { TEXT_MUTED });
+                            let btn = egui::Button::new(text)
+                                .fill(if is_sel {
+                                    Color32::from_rgba_unmultiplied(116, 162, 255, 50)
+                                } else {
+                                    CARD
+                                })
+                                .stroke(if is_sel {
+                                    Stroke::new(1.5_f32, ACCENT)
+                                } else {
+                                    Stroke::new(1.0_f32, BORDER)
+                                })
+                                .corner_radius(3.0);
+                            let pill_resp = ui.add(btn);
+                            if is_sel {
+                                target_rect = Some(pill_resp.rect);
+                            }
+                            if pill_resp.clicked() {
+                                self.selected = ctrl;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+
+        target_rect
+    }
+
+    fn scroll_pod_ui(&mut self, ui: &mut Ui) -> Option<Rect> {
+        let current_source = self.scroll_control_source();
+        let stick_selected = match current_source {
+            ControlSource::LeftStick => self.is_left_stick_selected(),
+            ControlSource::RightStick => self.is_right_stick_selected(),
+            _ => false,
+        };
+
+        let selected_code = self.selected_code().map(str::to_string);
+        let mut target_rect = None;
+
+        let selected_action = selected_code.as_deref().and_then(|code| {
+            let map_path = binding_path(&self.context);
+            get_path(&self.model, &map_path)
+                .and_then(Value::as_object)
+                .and_then(|map| map.get(code))
+                .and_then(Value::as_str)
+        });
+        let button_matches = matches!(
+            selected_action,
+            Some("pointer.scroll-up" | "pointer.scroll-down")
+        );
+        let is_active = stick_selected || button_matches;
+
+        let frame = egui::Frame::new()
+            .fill(FIELD_BG)
+            .stroke(Stroke::new(
+                if is_active { 1.5_f32 } else { 1.0_f32 },
+                if is_active { ACCENT } else { BORDER },
+            ))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::same(8));
+
+        frame.show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Header: Scroll wheel icon, title, Enabled checkbox, Curves jump
+            ui.horizontal(|ui| {
+                let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(18.0, 18.0), Sense::hover());
+                draw_scroll_wheel_icon(ui.painter(), icon_rect, if is_active { ACCENT } else { TEXT });
+                ui.add_space(2.0);
+                ui.label(RichText::new("Scroll Wheel").size(12.5).strong());
+
+                let mut enabled = get_path(&self.model, "gamepad.navi.pointer.scroll_enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                if ui
+                    .checkbox(&mut enabled, "")
+                    .on_hover_text("Enable scroll wheel")
+                    .changed()
+                {
+                    set_json_path(&mut self.model, "gamepad.navi.pointer.scroll_enabled", Value::Bool(enabled));
+                }
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .small_button("∿ Curves")
+                        .on_hover_text("Open analog response curves & deadzones")
+                        .clicked()
+                    {
+                        self.controller_tab = ControllerTab::Curves;
+                    }
+                });
+            });
+
+            ui.add_space(4.0);
+
+            // Source dropdown & Invert Y
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Source:").size(10.5).color(TEXT_MUTED));
+                let mut chosen_source = current_source;
+                let combo = ComboBox::from_id_salt("scroll-source-dropdown")
+                    .width(105.0)
+                    .selected_text(current_source.label())
+                    .show_ui(ui, |ui| {
+                        for src in [
+                            ControlSource::RightStick,
+                            ControlSource::LeftStick,
+                            ControlSource::Dpad,
+                            ControlSource::Other,
+                        ] {
+                            if ui.selectable_value(&mut chosen_source, src, src.label()).clicked() {
+                                self.set_scroll_control_source(src);
+                            }
+                        }
+                    });
+                if stick_selected {
+                    target_rect = Some(combo.response.rect);
+                }
+
+                ui.add_space(6.0);
+                let mut scroll_invert_y = get_path(&self.model, "gamepad.navi.pointer.scroll_invert_y")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if ui
+                    .checkbox(&mut scroll_invert_y, "Invert Y")
+                    .on_hover_text("Invert scroll wheel direction")
+                    .changed()
+                {
+                    set_json_path(&mut self.model, "gamepad.navi.pointer.scroll_invert_y", Value::Bool(scroll_invert_y));
+                }
+            });
+
+            ui.add_space(4.0);
+
+            // Ticks row (Occupying buttons)
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Ticks:").size(10.5).color(TEXT_MUTED));
+                for (act, act_label) in [
+                    ("pointer.scroll-up", "Scroll ▲"),
+                    ("pointer.scroll-down", "Scroll ▼"),
+                ] {
+                    let bound = self.buttons_for_action(&self.context, act);
+                    if bound.is_empty() {
+                        let text = RichText::new(format!("+ {act_label}")).size(9.5).color(TEXT_DIM);
+                        let btn = egui::Button::new(text)
+                            .fill(CARD)
+                            .stroke(Stroke::new(1.0_f32, BORDER))
+                            .corner_radius(3.0);
+                        let mut pill_resp = ui.add(btn);
+                        if let Some(code) = &selected_code {
+                            pill_resp = pill_resp.on_hover_text(format!("Bind {code} to {act_label}"));
+                        }
+                        if pill_resp.clicked()
+                            && let Some(code) = self.selected_code()
+                        {
+                            let map_path = if self.context == "xmb" {
+                                "gamepad.navi.bindings".to_string()
+                            } else {
+                                binding_path(&self.context)
+                            };
+                            set_map_value(&mut self.model, &map_path, code, act);
+                        }
+                    } else {
+                        for code in &bound {
+                            let ctrl = self.control_name_for_code(code);
+                            let is_sel = self.selected == ctrl || selected_code.as_deref() == Some(code.as_str());
+                            let text = RichText::new(format!("{act_label}: {ctrl}"))
+                                .size(9.5)
+                                .color(if is_sel { Color32::WHITE } else { TEXT_MUTED });
+                            let btn = egui::Button::new(text)
+                                .fill(if is_sel {
+                                    Color32::from_rgba_unmultiplied(116, 162, 255, 50)
+                                } else {
+                                    CARD
+                                })
+                                .stroke(if is_sel {
+                                    Stroke::new(1.5_f32, ACCENT)
+                                } else {
+                                    Stroke::new(1.0_f32, BORDER)
+                                })
+                                .corner_radius(3.0);
+                            let pill_resp = ui.add(btn);
+                            if is_sel {
+                                target_rect = Some(pill_resp.rect);
+                            }
+                            if pill_resp.clicked() {
+                                self.selected = ctrl;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+
+        target_rect
+    }
+
+    fn controller_tab_button(&mut self, ui: &mut Ui, tab: ControllerTab) {
+        let is_selected = self.controller_tab == tab;
+        let text = RichText::new(format!("{} {}", tab.icon(), tab.label()))
+            .size(11.5)
+            .color(if is_selected {
+                Color32::WHITE
+            } else {
+                TEXT_MUTED
+            });
+        let stroke = if is_selected {
+            Stroke::new(1.2_f32, ACCENT)
+        } else {
+            Stroke::new(1.0_f32, BORDER)
+        };
+        let fill = if is_selected {
+            Color32::from_rgba_unmultiplied(116, 162, 255, 30)
+        } else {
+            FIELD_BG
+        };
+        let button = egui::Button::new(text)
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(4.0)
+            .min_size(Vec2::new(0.0, 24.0));
+        if ui.add(button).clicked() {
+            self.controller_tab = tab;
+        }
+    }
+
+    fn controller_curves_body(&mut self, ui: &mut Ui) {
+        ui.label(
+            RichText::new("Analog sticks motion, scrolling, and trigger response curves.")
+                .size(11.0)
+                .color(TEXT_DIM),
+        );
+        ui.add_space(6.0);
+        if collapsible_heading(
+            ui,
+            "Pointer from analog sticks",
+            self.controller_pointer_expanded,
+        ) {
+            self.controller_pointer_expanded = !self.controller_pointer_expanded;
+        }
+        if self.controller_pointer_expanded {
+            self.pointer_fields(ui);
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(4.0);
+        }
+        if collapsible_heading(
+            ui,
+            "Trigger speed: brake / gas",
+            self.controller_trigger_expanded,
+        ) {
+            self.controller_trigger_expanded = !self.controller_trigger_expanded;
+        }
+        if self.controller_trigger_expanded {
+            self.trigger_response(ui);
+            self.accel_fields(ui);
         }
     }
 
@@ -2149,6 +2963,7 @@ impl StudioApp {
     /// Fed by pushed gamepad frames; renders identically at any width by
     /// wrapping button cells and stacking the stick row when narrow.
     fn gamepad_diagnostics_body(&self, ui: &mut Ui, live: &LiveState, view: &GamepadLiveView) {
+        diagnostics_label(ui, "Raw I/O & Axis Trace");
         let is_connected = view.connected > 0;
         if is_connected && (view.vendor != 0 || view.product != 0) {
             ui.label(
@@ -2232,105 +3047,68 @@ impl StudioApp {
         }
     }
 
-    fn controller_mapping_body(&mut self, ui: &mut Ui, live: &GamepadLiveView) {
+    fn controller_paddles_strip(&mut self, ui: &mut Ui, live: &GamepadLiveView) {
+        let btn_width = 68.0_f32;
+        let btn_height = 22.0_f32;
+        let spacing = 8.0_f32;
+        let total_width = 4.0 * btn_width + 3.0 * spacing;
+        let pad = ((ui.available_width() - total_width) * 0.5).max(0.0);
+
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Mapping").size(12.0).strong());
-            ui.add_space(6.0);
-            for template in [Template::Xbox, Template::Ds4] {
-                if ui
-                    .selectable_label(self.template == template, template.label())
-                    .clicked()
-                {
-                    self.switch_template(template);
+            ui.spacing_mut().item_spacing.x = spacing;
+            if pad > 0.0 {
+                ui.add_space(pad);
+            }
+            for (name, code) in [
+                ("Paddle 1", "BTN_TRIGGER_HAPPY1"),
+                ("Paddle 2", "BTN_TRIGGER_HAPPY2"),
+                ("Paddle 3", "BTN_TRIGGER_HAPPY3"),
+                ("Paddle 4", "BTN_TRIGGER_HAPPY4"),
+            ] {
+                let is_pressed = live.button(code);
+                let is_selected = self.selected == name;
+                let (rect, resp) =
+                    ui.allocate_exact_size(Vec2::new(btn_width, btn_height), Sense::click());
+                let fill = if is_pressed {
+                    Color32::from_rgba_unmultiplied(116, 162, 255, 120)
+                } else if is_selected {
+                    Color32::from_rgba_unmultiplied(116, 162, 255, 45)
+                } else if resp.hovered() {
+                    Color32::from_rgba_unmultiplied(116, 162, 255, 20)
+                } else {
+                    FIELD_BG
+                };
+                let stroke = if is_pressed {
+                    Stroke::new(1.8_f32, Color32::WHITE)
+                } else if is_selected {
+                    Stroke::new(1.5_f32, ACCENT)
+                } else if resp.hovered() {
+                    Stroke::new(1.0_f32, Color32::from_rgb(220, 230, 245))
+                } else {
+                    Stroke::new(1.0_f32, BORDER)
+                };
+                ui.painter().rect_filled(rect, 4.0, fill);
+                ui.painter()
+                    .rect_stroke(rect, 4.0, stroke, StrokeKind::Inside);
+                let text_color = if is_pressed {
+                    Color32::WHITE
+                } else if is_selected {
+                    ACCENT
+                } else {
+                    TEXT_MUTED
+                };
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    name,
+                    FontId::proportional(9.5),
+                    text_color,
+                );
+                if resp.clicked() {
+                    self.selected = name;
                 }
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{} connected · {}",
-                        self.connected_count(),
-                        self.gamepad_mode_name()
-                    ))
-                    .monospace()
-                    .size(9.5)
-                    .color(TEXT_DIM),
-                );
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new("live presses highlight · bindings follow selection")
-                        .size(9.5)
-                        .color(TEXT_DIM),
-                );
-            });
         });
-        ui.add_space(5.0);
-        ui.add_space(2.0);
-        let width = ui.available_width();
-        if width >= 900.0 {
-            let map_width = (width * 0.46).clamp(400.0, 560.0);
-            let mut hotspot = None;
-            let mut row = None;
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_width(map_width);
-                    hotspot = self.controller_map_body(ui, live);
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-                    self.inspector_body(ui);
-                });
-                ui.add_space(12.0);
-                ui.vertical(|ui| {
-                    ui.set_width(ui.available_width());
-                    row = self.merged_bindings(ui);
-                });
-            });
-            if let (Some(from), Some(to)) = (hotspot, row) {
-                paint_binding_link(ui, from, to);
-            }
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(4.0);
-            self.controller_tuning_disclosures(ui);
-        } else {
-            self.controller_map_body(ui, live);
-            ui.separator();
-            self.inspector_body(ui);
-            ui.separator();
-            self.merged_bindings(ui);
-            ui.separator();
-            self.controller_tuning_disclosures(ui);
-        }
-    }
-
-    /// Pointer and trigger tuning as user-owned disclosures inside the mapping
-    /// card, so every controller setting lives in one card instead of a flat
-    /// run of separators.
-    fn controller_tuning_disclosures(&mut self, ui: &mut Ui) {
-        if collapsible_heading(
-            ui,
-            "Pointer from analog sticks",
-            self.controller_pointer_expanded,
-        ) {
-            self.controller_pointer_expanded = !self.controller_pointer_expanded;
-        }
-        if self.controller_pointer_expanded {
-            self.pointer_fields(ui);
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(4.0);
-        }
-        if collapsible_heading(
-            ui,
-            "Trigger speed: brake / gas",
-            self.controller_trigger_expanded,
-        ) {
-            self.controller_trigger_expanded = !self.controller_trigger_expanded;
-        }
-        if self.controller_trigger_expanded {
-            self.trigger_response(ui);
-            self.accel_fields(ui);
-        }
     }
 
     fn dpad_polygon(template: Template, rect: Rect, shape: HotspotShape) -> Option<Vec<Pos2>> {
@@ -2433,13 +3211,129 @@ impl StudioApp {
                         ui.painter().circle_filled(center, r, shape_fill);
                     }
                     ui.painter().circle_stroke(center, r, shape_stroke);
+                    let is_stick = matches!(hotspot.control, "L STICK" | "R STICK" | "L3" | "R3");
+                    if is_stick {
+                        let cross_stroke = Stroke::new(
+                            1.0_f32,
+                            Color32::from_rgba_unmultiplied(116, 162, 255, 45),
+                        );
+                        ui.painter().line_segment(
+                            [
+                                Pos2::new(center.x - r * 0.75, center.y),
+                                Pos2::new(center.x + r * 0.75, center.y),
+                            ],
+                            cross_stroke,
+                        );
+                        ui.painter().line_segment(
+                            [
+                                Pos2::new(center.x, center.y - r * 0.75),
+                                Pos2::new(center.x, center.y + r * 0.75),
+                            ],
+                            cross_stroke,
+                        );
+                        let is_left = matches!(hotspot.control, "L STICK" | "L3");
+                        let (sx, sy) = live.stick(is_left);
+                        let puck_radius = (r * 0.32).clamp(3.5, 7.0);
+                        let max_travel = (r - puck_radius - 1.0).max(1.0);
+                        let puck_pos = Pos2::new(
+                            center.x + sx.clamp(-1.0, 1.0) * max_travel,
+                            center.y + sy.clamp(-1.0, 1.0) * max_travel,
+                        );
+                        let puck_color = if is_pressed {
+                            Color32::WHITE
+                        } else if sx.abs() > 0.05 || sy.abs() > 0.05 {
+                            ACCENT
+                        } else {
+                            Color32::from_rgba_unmultiplied(116, 162, 255, 140)
+                        };
+                        ui.painter().circle_filled(puck_pos, puck_radius, puck_color);
+                        ui.painter().circle_stroke(
+                            puck_pos,
+                            puck_radius,
+                            Stroke::new(1.0_f32, Color32::WHITE),
+                        );
+                    }
                 }
                 HotspotShape::Rect { corner_radius } => {
+                    let is_trigger = matches!(hotspot.control, "LT" | "RT" | "L2" | "R2");
+                    let trigger_val = if is_trigger {
+                        match hotspot.control {
+                            "LT" | "L2" => live.trigger("ABS_Z", "BTN_TL2"),
+                            "RT" | "R2" => live.trigger("ABS_RZ", "BTN_TR2"),
+                            _ => 0.0,
+                        }
+                    } else {
+                        0.0
+                    };
+                    let rect_radius: egui::CornerRadius = if is_trigger {
+                        let top_r = (hit.width() * 0.5).round().clamp(6.0, 16.0) as u8;
+                        let bot_r = (hit.width() * 0.26).round().clamp(4.0, 10.0) as u8;
+                        egui::CornerRadius {
+                            nw: top_r,
+                            ne: top_r,
+                            sw: bot_r,
+                            se: bot_r,
+                        }
+                    } else {
+                        (corner_radius as u8).into()
+                    };
                     if shape_fill != Color32::TRANSPARENT {
-                        ui.painter().rect_filled(hit, corner_radius, shape_fill);
+                        ui.painter().rect_filled(hit, rect_radius, shape_fill);
+                    }
+                    if is_trigger && trigger_val > 0.01 {
+                        let fill_h = hit.height() * trigger_val.clamp(0.0, 1.0);
+                        let fill_rect = Rect::from_min_max(
+                            Pos2::new(hit.min.x, hit.max.y - fill_h),
+                            hit.max,
+                        );
+                        let fill_radius = if trigger_val >= 0.88 {
+                            rect_radius
+                        } else {
+                            let bot_r = (hit.width() * 0.26).round().clamp(4.0, 10.0) as u8;
+                            egui::CornerRadius {
+                                nw: 0,
+                                ne: 0,
+                                sw: bot_r,
+                                se: bot_r,
+                            }
+                        };
+                        ui.painter().rect_filled(
+                            fill_rect,
+                            fill_radius,
+                            Color32::from_rgba_unmultiplied(116, 162, 255, 160),
+                        );
                     }
                     ui.painter()
-                        .rect_stroke(hit, corner_radius, shape_stroke, StrokeKind::Inside);
+                        .rect_stroke(hit, rect_radius, shape_stroke, StrokeKind::Inside);
+                    if is_trigger && trigger_val > 0.01 {
+                        let pct_str = format!("{:.0}%", trigger_val * 100.0);
+                        let font_id = FontId::monospace((hit.height() * 0.26).clamp(9.0, 11.0));
+                        let galley = ui.painter().layout_no_wrap(pct_str, font_id, Color32::WHITE);
+                        let pill_rect = Rect::from_min_size(
+                            Pos2::new(hit.max.x + 5.0, hit.center().y - galley.size().y * 0.5),
+                            galley.size(),
+                        )
+                        .expand2(Vec2::new(3.0, 1.5));
+                        ui.painter().rect_filled(
+                            pill_rect,
+                            3.0,
+                            Color32::from_rgba_unmultiplied(16, 20, 26, 210),
+                        );
+                        ui.painter().rect_stroke(
+                            pill_rect,
+                            3.0,
+                            Stroke::new(
+                                1.0_f32,
+                                Color32::from_rgba_unmultiplied(116, 162, 255, 120),
+                            ),
+                            StrokeKind::Inside,
+                        );
+                        ui.painter().galley(
+                            Pos2::new(hit.max.x + 5.0, hit.center().y - galley.size().y * 0.5),
+                            galley,
+                            Color32::WHITE,
+                        );
+                    }
                 }
                 HotspotShape::DpadUp
                 | HotspotShape::DpadDown
@@ -2536,6 +3430,10 @@ impl StudioApp {
         if template == self.template {
             return;
         }
+        if self.selected.starts_with("Paddle") {
+            self.template = template;
+            return;
+        }
         let code = self
             .template
             .hotspots()
@@ -2562,6 +3460,13 @@ impl StudioApp {
             .iter()
             .find(|hotspot| hotspot.control == self.selected)
             .and_then(|hotspot| hotspot.code)
+            .or(match self.selected {
+                "Paddle 1" => Some("BTN_TRIGGER_HAPPY1"),
+                "Paddle 2" => Some("BTN_TRIGGER_HAPPY2"),
+                "Paddle 3" => Some("BTN_TRIGGER_HAPPY3"),
+                "Paddle 4" => Some("BTN_TRIGGER_HAPPY4"),
+                _ => None,
+            })
     }
 
     fn inspector_body(&mut self, ui: &mut Ui) {
@@ -2655,6 +3560,45 @@ impl StudioApp {
                     }
                 });
         });
+        if self.context != "xmb" {
+            ui.add_space(3.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Quick map:").size(9.5).color(TEXT_DIM));
+                for (label, act) in [
+                    ("Mouse L", "pointer.left"),
+                    ("Mouse R", "pointer.right"),
+                    ("Mouse M", "pointer.middle"),
+                    ("M4", "pointer.back"),
+                    ("M5", "pointer.forward"),
+                    ("Scroll ▲", "pointer.scroll-up"),
+                    ("Scroll ▼", "pointer.scroll-down"),
+                ] {
+                    let is_current = current == act;
+                    let text = RichText::new(label)
+                        .size(9.5)
+                        .color(if is_current { Color32::WHITE } else { TEXT_MUTED });
+                    let btn = egui::Button::new(text)
+                        .fill(if is_current {
+                            Color32::from_rgba_unmultiplied(116, 162, 255, 60)
+                        } else {
+                            FIELD_BG
+                        })
+                        .stroke(if is_current {
+                            Stroke::new(1.0_f32, ACCENT)
+                        } else {
+                            Stroke::new(1.0_f32, BORDER)
+                        })
+                        .corner_radius(3.0);
+                    if ui.add(btn).clicked() {
+                        if is_current {
+                            next = String::new();
+                        } else {
+                            next = act.to_string();
+                        }
+                    }
+                }
+            });
+        }
         if next != current {
             if next.is_empty() {
                 remove_map_key(&mut self.model, &map_path, code);
@@ -6865,29 +7809,152 @@ fn default_action_for_code<'a>(path: &str, actions: &[&'a str], code: &str) -> &
     }
 }
 
+fn is_left_stick(control: &str) -> bool {
+    matches!(control, "L STICK" | "L3")
+}
+
+fn is_right_stick(control: &str) -> bool {
+    matches!(control, "R STICK" | "R3")
+}
+
+fn stick_control_for_template(template: Template, stick: &str) -> &'static str {
+    match (stick, template) {
+        ("left", Template::Ds4) => "L3",
+        ("left", Template::Xbox) => "L STICK",
+        ("right", Template::Ds4) => "R3",
+        ("right", Template::Xbox) => "R STICK",
+        _ => "L STICK",
+    }
+}
+
+fn control_name_for_code_and_template(template: Template, code: &str) -> &'static str {
+    if let Some(control) = template
+        .hotspots()
+        .iter()
+        .find(|h| h.code == Some(code))
+        .map(|h| h.control)
+    {
+        return control;
+    }
+    match code {
+        "BTN_TRIGGER_HAPPY1" => "Paddle 1",
+        "BTN_TRIGGER_HAPPY2" => "Paddle 2",
+        "BTN_TRIGGER_HAPPY3" => "Paddle 3",
+        "BTN_TRIGGER_HAPPY4" => "Paddle 4",
+        "BTN_DPAD_UP" => "D-pad up",
+        "BTN_DPAD_DOWN" => "D-pad down",
+        "BTN_DPAD_LEFT" => "D-pad left",
+        "BTN_DPAD_RIGHT" => "D-pad right",
+        "BTN_SOUTH" => if template == Template::Ds4 { "Cross" } else { "A" },
+        "BTN_EAST" => if template == Template::Ds4 { "Circle" } else { "B" },
+        "BTN_WEST" => if template == Template::Ds4 { "Square" } else { "X" },
+        "BTN_NORTH" => if template == Template::Ds4 { "Triangle" } else { "Y" },
+        "BTN_TL" => if template == Template::Ds4 { "L1" } else { "LB" },
+        "BTN_TR" => if template == Template::Ds4 { "R1" } else { "RB" },
+        "BTN_TL2" => if template == Template::Ds4 { "L2" } else { "LT" },
+        "BTN_TR2" => if template == Template::Ds4 { "R2" } else { "RT" },
+        "BTN_THUMBL" => if template == Template::Ds4 { "L3" } else { "L STICK" },
+        "BTN_THUMBR" => if template == Template::Ds4 { "R3" } else { "R STICK" },
+        _ => "Button",
+    }
+}
+
 fn paint_binding_link(ui: &Ui, from: Rect, to: Rect) {
     let clip = ui.clip_rect();
-    if !clip.contains(from.center()) || !clip.contains(to.center()) || to.left() <= from.right() {
+    if !clip.intersects(from) || !clip.intersects(to) {
         return;
     }
-    let start = Pos2::new(from.right() + 4.0, from.center().y);
-    let end = Pos2::new(to.left() - 6.0, to.center().y);
-    let reach = ((end.x - start.x) * 0.45).clamp(20.0, 90.0);
-    let color = Color32::from_rgba_unmultiplied(116, 162, 255, 150);
     let painter = ui.painter();
-    painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
-        [
-            start,
-            Pos2::new(start.x + reach, start.y),
-            Pos2::new(end.x - reach, end.y),
-            end,
-        ],
-        false,
-        Color32::TRANSPARENT,
-        Stroke::new(1.5_f32, color),
+    let color = Color32::from_rgba_unmultiplied(116, 162, 255, 180);
+
+    if to.left() >= from.center().x {
+        // Horizontal connection (side-by-side wide layout)
+        let start = Pos2::new(from.right() + 4.0, from.center().y);
+        let end = Pos2::new(to.left() - 6.0, to.center().y);
+        let reach = ((end.x - start.x) * 0.45).clamp(20.0, 90.0);
+        painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+            [
+                start,
+                Pos2::new(start.x + reach, start.y),
+                Pos2::new(end.x - reach, end.y),
+                end,
+            ],
+            false,
+            Color32::TRANSPARENT,
+            Stroke::new(1.5_f32, color),
+        ));
+        painter.circle_filled(start, 2.5, color);
+        painter.circle_filled(end, 3.0, color);
+    } else if to.top() > from.bottom() {
+        // Vertical connection (stacked narrow layout)
+        let start = Pos2::new(from.center().x, from.bottom() + 4.0);
+        let end = Pos2::new(to.center().x, to.top() - 6.0);
+        let reach = ((end.y - start.y) * 0.45).clamp(15.0, 60.0);
+        painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+            [
+                start,
+                Pos2::new(start.x, start.y + reach),
+                Pos2::new(end.x, end.y - reach),
+                end,
+            ],
+            false,
+            Color32::TRANSPARENT,
+            Stroke::new(1.5_f32, color),
+        ));
+        painter.circle_filled(start, 2.5, color);
+        painter.circle_filled(end, 3.0, color);
+    }
+}
+
+fn draw_cursor_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let size = rect.width().min(rect.height()).clamp(14.0, 20.0);
+    let origin = rect.center() - Vec2::new(size * 0.45, size * 0.50);
+    let pts = [
+        origin + Vec2::new(0.0, 0.0),
+        origin + Vec2::new(size * 0.82, size * 0.60),
+        origin + Vec2::new(size * 0.48, size * 0.60),
+        origin + Vec2::new(size * 0.70, size * 1.02),
+        origin + Vec2::new(size * 0.52, size * 1.08),
+        origin + Vec2::new(size * 0.32, size * 0.68),
+        origin + Vec2::new(0.0, size * 0.85),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        pts.to_vec(),
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 45),
+        Stroke::new(1.4_f32, color),
     ));
-    painter.circle_filled(start, 2.5, color);
-    painter.circle_filled(end, 3.0, color);
+}
+
+fn draw_scroll_wheel_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let center = rect.center();
+    let w = 12.0_f32;
+    let h = 18.0_f32;
+    let body_rect = Rect::from_center_size(center, Vec2::new(w, h));
+    painter.rect_filled(
+        body_rect,
+        5.0,
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 30),
+    );
+    painter.rect_stroke(
+        body_rect,
+        5.0,
+        Stroke::new(1.3_f32, color),
+        StrokeKind::Inside,
+    );
+    // Upper center wheel capsule
+    let wheel_rect = Rect::from_center_size(
+        Pos2::new(center.x, center.y - 3.2),
+        Vec2::new(3.0, 6.0),
+    );
+    painter.rect_filled(wheel_rect, 1.5, color);
+    // Subtle tick line below wheel
+    painter.line_segment(
+        [
+            Pos2::new(center.x, center.y + 2.5),
+            Pos2::new(center.x, center.y + 5.5),
+        ],
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 120)),
+    );
 }
 
 fn mini_heading(ui: &mut Ui, text: &str) {
@@ -8891,5 +9958,80 @@ unknown_gamepad_field = 7
         // Context "base" or layers must use ACTIONS
         assert!(ACTIONS.contains(&"pointer.left"));
         assert!(!ACTIONS.contains(&"confirm"));
+    }
+
+    #[test]
+    fn controller_tab_navigation_and_quick_map_actions() {
+        assert_eq!(ControllerTab::default(), ControllerTab::Bindings);
+        assert_eq!(ControllerTab::Bindings.label(), "Bindings & Layers");
+        assert_eq!(ControllerTab::Curves.label(), "Analog & Curves");
+        assert_eq!(ControllerTab::Diagnostics.label(), "Diagnostics");
+        assert_eq!(ControllerTab::Device.label(), "Device Settings");
+
+        // Discrete mouse and scroll actions must all be valid in ACTIONS
+        for mouse_action in [
+            "pointer.left",
+            "pointer.right",
+            "pointer.middle",
+            "pointer.back",
+            "pointer.forward",
+            "pointer.move-up",
+            "pointer.move-down",
+            "pointer.move-left",
+            "pointer.move-right",
+            "pointer.scroll-up",
+            "pointer.scroll-down",
+        ] {
+            assert!(
+                ACTIONS.contains(&mouse_action),
+                "action {mouse_action} must be selectable for any button"
+            );
+        }
+
+        // Verify that D-pad and face buttons are recognized buttons
+        let button_codes: Vec<&str> = BUTTONS.iter().map(|(code, _)| *code).collect();
+        assert!(button_codes.contains(&"BTN_DPAD_UP"));
+        assert!(button_codes.contains(&"BTN_DPAD_DOWN"));
+        assert!(button_codes.contains(&"BTN_DPAD_LEFT"));
+        assert!(button_codes.contains(&"BTN_DPAD_RIGHT"));
+        assert!(button_codes.contains(&"BTN_SOUTH"));
+        assert!(button_codes.contains(&"BTN_EAST"));
+        assert!(button_codes.contains(&"BTN_TRIGGER_HAPPY1"));
+    }
+
+    #[test]
+    fn pointer_and_scroll_navigation_pods_and_stick_controls() {
+        // Stick detection on Xbox
+        assert!(is_left_stick("L STICK"));
+        assert!(!is_right_stick("L STICK"));
+
+        assert!(!is_left_stick("R STICK"));
+        assert!(is_right_stick("R STICK"));
+
+        // Stick detection on DS4
+        assert!(is_left_stick("L3"));
+        assert!(!is_right_stick("L3"));
+
+        assert!(!is_left_stick("R3"));
+        assert!(is_right_stick("R3"));
+
+        // Stick template mapping
+        assert_eq!(stick_control_for_template(Template::Ds4, "left"), "L3");
+        assert_eq!(stick_control_for_template(Template::Ds4, "right"), "R3");
+        assert_eq!(stick_control_for_template(Template::Xbox, "left"), "L STICK");
+        assert_eq!(stick_control_for_template(Template::Xbox, "right"), "R STICK");
+
+        // Control source labels
+        assert_eq!(ControlSource::LeftStick.label(), "Left Stick");
+        assert_eq!(ControlSource::RightStick.label(), "Right Stick");
+        assert_eq!(ControlSource::Dpad.label(), "D-pad");
+        assert_eq!(ControlSource::Other.label(), "Other");
+
+        // Control name for code
+        assert_eq!(control_name_for_code_and_template(Template::Xbox, "BTN_SOUTH"), "A");
+        assert_eq!(control_name_for_code_and_template(Template::Xbox, "BTN_DPAD_UP"), "D-pad up");
+        assert_eq!(control_name_for_code_and_template(Template::Xbox, "BTN_TRIGGER_HAPPY1"), "Paddle 1");
+        assert_eq!(control_name_for_code_and_template(Template::Ds4, "BTN_SOUTH"), "Cross");
+        assert_eq!(control_name_for_code_and_template(Template::Ds4, "BTN_TL"), "L1");
     }
 }

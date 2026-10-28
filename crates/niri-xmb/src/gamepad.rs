@@ -104,6 +104,7 @@ impl AccelRuntime {
 #[derive(Debug, Clone)]
 struct PointerRuntime {
     enabled: bool,
+    scroll_enabled: bool,
     stick_left: bool,
     deadzone: f32,
     curve: f32,
@@ -113,6 +114,7 @@ struct PointerRuntime {
     scroll_left: bool,
     scroll_deadzone: f32,
     scroll_speed: f32,
+    scroll_invert_y: bool,
     trigger_deadzone: f32,
     trigger_curve: f32,
     trigger_points: Vec<GamepadTriggerPoint>,
@@ -150,6 +152,7 @@ impl NaviRuntime {
             reset_on_disconnect: config.mode.reset_on_disconnect,
             pointer: PointerRuntime {
                 enabled: pointer.enabled,
+                scroll_enabled: pointer.scroll_enabled,
                 stick_left: pointer.stick == GamepadPointerStick::Left,
                 deadzone: pointer.deadzone,
                 curve: pointer.curve,
@@ -159,6 +162,7 @@ impl NaviRuntime {
                 scroll_left: pointer.scroll_stick == GamepadPointerStick::Left,
                 scroll_deadzone: pointer.scroll_deadzone,
                 scroll_speed: pointer.scroll_speed,
+                scroll_invert_y: pointer.scroll_invert_y,
                 trigger_deadzone: pointer.trigger_deadzone,
                 trigger_curve: pointer.trigger_curve,
                 trigger_points: pointer.trigger_points.clone(),
@@ -1547,6 +1551,10 @@ impl NaviTracker {
                 NaviAction::Scroll(direction) => Some(GamepadEvent::PointerScroll {
                     steps: direction as f32,
                 }),
+                NaviAction::Move(dx, dy) => Some(GamepadEvent::PointerMotion {
+                    dx: (dx as f32) * 24.0,
+                    dy: (dy as f32) * 24.0,
+                }),
                 NaviAction::Niri(action) => Some(GamepadEvent::Navi(NaviAction::Niri(action))),
                 NaviAction::XmbOpen => Some(GamepadEvent::Navi(NaviAction::XmbOpen)),
                 NaviAction::Key(key_code) => {
@@ -1588,6 +1596,10 @@ impl NaviTracker {
             }
             NaviAction::Scroll(direction) => Some(GamepadEvent::PointerScroll {
                 steps: direction as f32,
+            }),
+            NaviAction::Move(dx, dy) => Some(GamepadEvent::PointerMotion {
+                dx: (dx as f32) * 24.0,
+                dy: (dy as f32) * 24.0,
             }),
             NaviAction::Niri(action) => Some(GamepadEvent::Navi(NaviAction::Niri(action))),
             NaviAction::XmbOpen => Some(GamepadEvent::Navi(NaviAction::XmbOpen)),
@@ -1724,21 +1736,26 @@ impl NaviTracker {
             events.push(GamepadEvent::PointerMotion { dx, dy });
         }
 
-        let (_scroll_x, scroll_y) = if self.navi.pointer.scroll_left {
-            self.stick(AbsoluteAxisCode::ABS_X, AbsoluteAxisCode::ABS_Y)
-        } else {
-            self.stick(AbsoluteAxisCode::ABS_RX, AbsoluteAxisCode::ABS_RY)
-        };
-        let scroll = apply_deadzone(scroll_y, self.navi.pointer.scroll_deadzone);
-        let scroll_multiplier = self
-            .scroll_accel
-            .step(lt, rt, trigger_deadzone, trigger_curve, dt);
-        self.scroll_remainder += scroll * self.navi.pointer.scroll_speed * scroll_multiplier * dt;
-        if self.scroll_remainder.abs() >= 0.01 {
-            events.push(GamepadEvent::PointerScroll {
-                steps: self.scroll_remainder,
-            });
-            self.scroll_remainder = 0.0;
+        if self.navi.pointer.scroll_enabled {
+            let (_scroll_x, mut scroll_y) = if self.navi.pointer.scroll_left {
+                self.stick(AbsoluteAxisCode::ABS_X, AbsoluteAxisCode::ABS_Y)
+            } else {
+                self.stick(AbsoluteAxisCode::ABS_RX, AbsoluteAxisCode::ABS_RY)
+            };
+            if self.navi.pointer.scroll_invert_y {
+                scroll_y = -scroll_y;
+            }
+            let scroll = apply_deadzone(scroll_y, self.navi.pointer.scroll_deadzone);
+            let scroll_multiplier = self
+                .scroll_accel
+                .step(lt, rt, trigger_deadzone, trigger_curve, dt);
+            self.scroll_remainder += scroll * self.navi.pointer.scroll_speed * scroll_multiplier * dt;
+            if self.scroll_remainder.abs() >= 0.01 {
+                events.push(GamepadEvent::PointerScroll {
+                    steps: self.scroll_remainder,
+                });
+                self.scroll_remainder = 0.0;
+            }
         }
         events
     }

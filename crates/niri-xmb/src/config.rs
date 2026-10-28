@@ -1119,6 +1119,8 @@ pub enum PointerButton {
     Left,
     Right,
     Middle,
+    Side,
+    Extra,
 }
 
 impl PointerButton {
@@ -1128,6 +1130,8 @@ impl PointerButton {
             Self::Left => KeyCode::BTN_LEFT.0,
             Self::Right => KeyCode::BTN_RIGHT.0,
             Self::Middle => KeyCode::BTN_MIDDLE.0,
+            Self::Side => KeyCode::BTN_SIDE.0,
+            Self::Extra => KeyCode::BTN_EXTRA.0,
         }
     }
 }
@@ -1156,6 +1160,7 @@ pub enum NaviNiriAction {
 pub enum NaviAction {
     Pointer(PointerButton),
     Scroll(i8),
+    Move(i16, i16),
     Niri(NaviNiriAction),
     XmbOpen,
     /// Emit a Linux input key through the daemon's virtual keyboard device.
@@ -1175,6 +1180,16 @@ pub(crate) fn parse_navi_action(value: &str) -> Result<NaviAction> {
         "pointer.left" => NaviAction::Pointer(PointerButton::Left),
         "pointer.right" => NaviAction::Pointer(PointerButton::Right),
         "pointer.middle" => NaviAction::Pointer(PointerButton::Middle),
+        "pointer.back" | "pointer.side" | "pointer.m4" => {
+            NaviAction::Pointer(PointerButton::Side)
+        }
+        "pointer.forward" | "pointer.extra" | "pointer.m5" => {
+            NaviAction::Pointer(PointerButton::Extra)
+        }
+        "pointer.move-up" | "pointer.up" => NaviAction::Move(0, -1),
+        "pointer.move-down" | "pointer.down" => NaviAction::Move(0, 1),
+        "pointer.move-left" | "pointer.left-move" => NaviAction::Move(-1, 0),
+        "pointer.move-right" | "pointer.right-move" => NaviAction::Move(1, 0),
         "pointer.scroll-up" => NaviAction::Scroll(-1),
         "pointer.scroll-down" => NaviAction::Scroll(1),
         "xmb.open" => NaviAction::XmbOpen,
@@ -1381,10 +1396,16 @@ pub enum SpeedSocd {
     PrioAccel,
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GamepadPointerConfig {
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub scroll_enabled: bool,
     pub stick: GamepadPointerStick,
     pub deadzone: f32,
     /// Response exponent; 1.0 is linear.
@@ -1398,6 +1419,7 @@ pub struct GamepadPointerConfig {
     pub scroll_deadzone: f32,
     /// Wheel steps per second at full deflection.
     pub scroll_speed: f32,
+    pub scroll_invert_y: bool,
     /// Analog trigger threshold used by hold_axes layers.
     pub trigger_threshold: f32,
     /// Deadzone for analog trigger speed modulation.
@@ -1420,6 +1442,7 @@ impl Default for GamepadPointerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            scroll_enabled: true,
             stick: GamepadPointerStick::Left,
             deadzone: 0.15,
             curve: 1.6,
@@ -1429,6 +1452,7 @@ impl Default for GamepadPointerConfig {
             scroll_stick: GamepadPointerStick::Right,
             scroll_deadzone: 0.20,
             scroll_speed: 6.0,
+            scroll_invert_y: false,
             trigger_threshold: 0.35,
             trigger_deadzone: 0.08,
             trigger_curve: 1.35,

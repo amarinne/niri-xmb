@@ -127,6 +127,16 @@ pub static CATALOG: &[Entry] = &[
     ),
     // -- Controller: pointer (scroll) ---------------------------------------
     e!(
+        "gamepad.navi.pointer.scroll_enabled",
+        "Scroll enabled",
+        "Enable scrolling via the analog scroll stick or scroll buttons in navi mode."
+    ),
+    e!(
+        "gamepad.navi.pointer.scroll_invert_y",
+        "Invert Y",
+        "Invert scroll direction: push the stick up to scroll down, and vice versa."
+    ),
+    e!(
         "gamepad.navi.pointer.scroll_stick",
         "Scroll stick",
         "Which analog stick scrolls, left or right. Pick the stick not used for pointer motion."

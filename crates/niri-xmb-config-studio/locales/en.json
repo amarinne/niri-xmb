@@ -234,6 +234,14 @@
       "description": "Stick tilt below this fraction (0–1) is ignored for scrolling, so a resting stick does not scroll. Higher needs a bigger push to start.",
       "label": "Scroll deadzone"
     },
+    "gamepad.navi.pointer.scroll_enabled": {
+      "description": "Enable scrolling via the analog scroll stick or scroll buttons in navi mode.",
+      "label": "Scroll enabled"
+    },
+    "gamepad.navi.pointer.scroll_invert_y": {
+      "description": "Invert scroll direction: push the stick up to scroll down, and vice versa.",
+      "label": "Invert Y"
+    },
     "gamepad.navi.pointer.scroll_speed": {
       "description": "Scroll rate in wheel steps per second at full stick deflection.",
       "label": "Full-stick speed"

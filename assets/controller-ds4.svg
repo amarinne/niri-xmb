@@ -13,6 +13,7 @@
       .label { fill: #c1d7ee; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 11px; font-weight: bold; text-anchor: middle; dominant-baseline: central; }
       .label-sm { fill: #c1d7ee; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 9px; font-weight: bold; text-anchor: middle; dominant-baseline: central; }
       .arrow { fill: #c1d7ee; }
+      .icon { stroke: #c1d7ee; stroke-width: 2; fill: none; stroke-linecap: round; stroke-linejoin: round; }
     </style>
   </defs>
 
@@ -82,16 +83,16 @@
   <!-- Face Buttons Well & 4 Buttons (Top-Right: cx=329, cy=160) -->
   <circle id="FaceButtonsWell" class="well" cx="329" cy="160" r="37.5"/>
   <circle id="Triangle" class="button" cx="329" cy="138" r="11"/>
-  <text x="329" y="138" class="label">&#x25B3;</text>
+  <polygon class="icon" points="329,133 334,142 324,142"/>
 
   <circle id="Circle" class="button" cx="351" cy="160" r="11"/>
-  <text x="351" y="160" class="label">&#x25CB;</text>
+  <circle class="icon" cx="351" cy="160" r="5.2"/>
 
   <circle id="Cross" class="button" cx="329" cy="182" r="11"/>
-  <text x="329" y="182" class="label">&#x2715;</text>
+  <path class="icon" d="M325 178 L333 186 M333 178 L325 186"/>
 
   <circle id="Square" class="button" cx="307" cy="160" r="11"/>
-  <text x="307" y="160" class="label">&#x25A1;</text>
+  <rect class="icon" x="302.25" y="155.25" width="9.5" height="9.5" rx="1.5"/>
 
   <!-- PS Button (Center Bottom) -->
   <circle id="PS" class="meta" cx="220.5" cy="238" r="13" stroke-width="2.5"/>
