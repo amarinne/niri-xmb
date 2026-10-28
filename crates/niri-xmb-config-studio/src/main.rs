@@ -1199,8 +1199,11 @@ struct StudioApp {
     preview_hover: Option<PreviewTarget>,
     preview_selection: Option<PreviewSelection>,
     preview_selection_at: Instant,
-    /// Pinned previews render in a fixed top panel that never scrolls away.
-    preview_pinned: bool,
+    /// Local-only urgent styling simulation for the live preview.
+    preview_urgent: bool,
+    /// Text buffers keep typed precision and invalid input visible between
+    /// frames while the JSON model stores validated numeric values.
+    numeric_text: HashMap<String, String>,
     keymap: keymap::NiriKeymap,
     keymap_at: Instant,
     keymap_search: String,
@@ -1576,7 +1579,8 @@ impl StudioApp {
             preview_hover: None,
             preview_selection: None,
             preview_selection_at: Instant::now(),
-            preview_pinned: false,
+            preview_urgent: false,
+            numeric_text: HashMap::new(),
             keymap: keymap::NiriKeymap::load_default(),
             keymap_at: Instant::now(),
             keymap_search: String::new(),
@@ -1877,16 +1881,10 @@ impl StudioApp {
                         if tt(ui.button("Load"), "ui.action.load").clicked() {
                             self.load();
                         }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            self.daemon_chip(ui);
-                        });
                     });
                 } else {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("niri-xmb").size(15.0).strong());
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            self.daemon_chip(ui);
-                        });
                     });
                     ui.horizontal(|ui| {
                         let path_width = (ui.available_width() - 58.0).max(80.0);
@@ -1900,45 +1898,6 @@ impl StudioApp {
                         }
                     });
                 }
-            });
-    }
-
-    fn daemon_chip(&self, ui: &mut Ui) {
-        let live = self
-            .live
-            .lock()
-            .map(|live| live.clone())
-            .unwrap_or_default();
-        let gamepad = &live.status["gamepad"];
-        let devices = gamepad["devices"].as_u64().unwrap_or(0);
-        let (dot, text) = if live.status.is_null() && !live.stream_alive {
-            (TEXT_DIM, "daemon offline".to_string())
-        } else if !live.stream_alive {
-            (WARN, format!("reconnecting · attempt {}", live.reconnects))
-        } else if devices == 0 {
-            (WARN, "no controller".to_string())
-        } else {
-            (
-                OK,
-                format!(
-                    "{} · {} · {}",
-                    gamepad["mode"].as_str().unwrap_or("-"),
-                    gamepad["preset"].as_str().unwrap_or("-"),
-                    devices
-                ),
-            )
-        };
-        egui::Frame::new()
-            .fill(CARD)
-            .stroke(Stroke::new(1.0_f32, BORDER))
-            .corner_radius(999.0)
-            .inner_margin(egui::Margin::symmetric(9, 4))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
-                    ui.painter().circle_filled(rect.center(), 3.5, dot);
-                    ui.label(RichText::new(text).monospace().size(10.0).color(TEXT_MUTED));
-                });
             });
     }
 
@@ -5041,8 +5000,20 @@ impl StudioApp {
 
     fn popup_panel_fields(&mut self, ui: &mut Ui) {
         self.show_exact_field_error(ui, "popup");
+        ui.label(
+            RichText::new(
+                "Panel size controls the popup card. Canvas size is used only when Outputs is Combined.",
+            )
+            .size(10.5)
+            .color(TEXT_MUTED),
+        );
+        ui.add_space(4.0);
+        let combined = self.model["popup"]["outputs"]
+            .as_str()
+            .is_some_and(|outputs| outputs == "combined");
         if ui.available_width() >= 480.0 {
             ui.columns(2, |cols| {
+                mini_heading(&mut cols[0], "Panel surface");
                 self.segmented_field(
                     &mut cols[0],
                     "popup.outputs",
@@ -5072,8 +5043,18 @@ impl StudioApp {
                     10,
                     " ms",
                 );
+                mini_heading(&mut cols[1], "Placement and canvas");
                 self.length_field(&mut cols[1], "popup.fixed_x", "Fixed X");
                 self.length_field(&mut cols[1], "popup.fixed_y", "Fixed Y");
+                cols[1].label(
+                    RichText::new(if combined {
+                        "Combined canvas dimensions"
+                    } else {
+                        "Canvas dimensions are inactive for this output mode"
+                    })
+                    .size(10.0)
+                    .color(TEXT_DIM),
+                );
                 self.length_field(&mut cols[1], "popup.canvas_width", "Canvas width");
                 self.length_field(&mut cols[1], "popup.canvas_height", "Canvas height");
                 self.bool_field(&mut cols[1], "popup.show_labels", "Labels");
@@ -5102,6 +5083,15 @@ impl StudioApp {
             self.length_field(ui, "popup.height", "Height");
             self.length_field(ui, "popup.fixed_x", "Fixed X");
             self.length_field(ui, "popup.fixed_y", "Fixed Y");
+            ui.label(
+                RichText::new(if combined {
+                    "Combined canvas dimensions"
+                } else {
+                    "Canvas dimensions are inactive for this output mode"
+                })
+                .size(10.0)
+                .color(TEXT_DIM),
+            );
             self.length_field(ui, "popup.canvas_width", "Canvas width");
             self.length_field(ui, "popup.canvas_height", "Canvas height");
             self.slider_u64_field(
@@ -5244,66 +5234,27 @@ impl StudioApp {
         }
     }
 
-    /// Fixed top panel for a pinned preview. It is a real panel, not prose:
-    /// it renders the same live preview above the scrolling editor so the
-    /// panel stays visible while the user edits and scrolls.
-    fn pinned_preview_panel(&mut self, ctx: &egui::Context) {
-        if !(self.section == Section::Popup && self.preview_pinned) {
-            return;
-        }
-        egui::TopBottomPanel::top("pinned-preview")
-            .frame(
-                egui::Frame::new()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(12, 8))
-                    .stroke(Stroke::new(1.0_f32, BORDER)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Live preview — pinned").size(12.5).strong());
-                    ui.label(
-                        RichText::new("stays on top while you scroll")
-                            .size(10.5)
-                            .color(TEXT_DIM),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if tt(ui.button("Unpin"), "ui.action.pin_preview").clicked() {
-                            self.preview_pinned = false;
-                        }
-                    });
-                });
-                ui.add_space(4.0);
-                let width = ui.available_width().max(220.0);
-                self.live_xmb_preview(ui, Vec2::new(width, 300.0));
-            });
-    }
-
     fn popup_preview_card(&mut self, ui: &mut Ui) {
         section_card(ui, "Live preview", |ui| {
             ui.horizontal(|ui| {
-                let label = if self.preview_pinned { "Unpin" } else { "Pin" };
-                if tt(ui.small_button(label), "ui.action.pin_preview").clicked() {
-                    self.preview_pinned = !self.preview_pinned;
-                }
                 ui.label(
-                    RichText::new(if self.preview_pinned {
-                        "Pinned — the preview stays on top while you scroll"
-                    } else {
-                        "Pin to keep the preview on top while you scroll"
-                    })
-                    .size(10.0)
-                    .color(TEXT_MUTED),
+                    RichText::new("Rendered from the daemon's popup renderer; edits update live.")
+                        .size(10.0)
+                        .color(TEXT_MUTED),
                 );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let label = if self.preview_urgent {
+                        "Clear urgent simulation"
+                    } else {
+                        "Send urgent notice"
+                    };
+                    if ui.small_button(label).clicked() {
+                        self.preview_urgent = !self.preview_urgent;
+                        self.preview_key.clear();
+                    }
+                });
             });
             ui.add_space(6.0);
-            if self.preview_pinned {
-                ui.label(
-                    RichText::new("Preview is pinned above.")
-                        .size(10.5)
-                        .color(TEXT_DIM),
-                );
-                return;
-            }
             let available = ui.available_size();
             let wide = available.x >= 760.0;
             let preview_height = available.y.min(if wide { 360.0 } else { 300.0 }).max(220.0);
@@ -5381,6 +5332,13 @@ impl StudioApp {
                     .size(10.0)
                     .color(TEXT_MUTED),
             );
+            if self.preview_urgent {
+                ui.label(
+                    RichText::new("Urgent notice is simulated locally in this preview.")
+                        .size(10.0)
+                        .color(WARN),
+                );
+            }
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 metric_chip(ui, "bars", array_len(&self.model["bars"]));
@@ -5787,14 +5745,21 @@ impl StudioApp {
     }
 
     fn f32_field(&mut self, ui: &mut Ui, path: &str, label: &str, min: f64, max: f64, speed: f64) {
-        let mut value = get_path(&self.model, path)
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
+        let initial = get_path(&self.model, path).map_or_else(
+            || "0".to_string(),
+            |value| match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                _ => "0".to_string(),
+            },
+        );
+        let mut text = self.numeric_text.get(path).cloned().unwrap_or(initial);
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            numeric_slider_f32(ui, &mut value, min, max, speed, "")
+            numeric_editor_f64(ui, &mut text, min, max, speed, "")
         });
         if changed {
-            set_json_path(&mut self.model, path, json!(value));
+            self.numeric_text.insert(path.to_string(), text.clone());
+            set_json_path(&mut self.model, path, parse_number_value(&text));
         }
         self.show_field_error(ui, path);
     }
@@ -5810,27 +5775,41 @@ impl StudioApp {
         step: f64,
         suffix: &str,
     ) {
-        let mut value = get_path(&self.model, path)
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
+        let initial = get_path(&self.model, path).map_or_else(
+            || "0".to_string(),
+            |value| match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                _ => "0".to_string(),
+            },
+        );
+        let mut text = self.numeric_text.get(path).cloned().unwrap_or(initial);
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            numeric_slider_f32(ui, &mut value, min, max, step, suffix)
+            numeric_editor_f64(ui, &mut text, min, max, step, suffix)
         });
         if changed {
-            set_json_path(&mut self.model, path, json!(value));
+            self.numeric_text.insert(path.to_string(), text.clone());
+            set_json_path(&mut self.model, path, parse_number_value(&text));
         }
         self.show_field_error(ui, path);
     }
 
     fn u64_field(&mut self, ui: &mut Ui, path: &str, label: &str, min: u64, max: u64) {
-        let mut value = get_path(&self.model, path)
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let initial = get_path(&self.model, path).map_or_else(
+            || "0".to_string(),
+            |value| match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                _ => "0".to_string(),
+            },
+        );
+        let mut text = self.numeric_text.get(path).cloned().unwrap_or(initial);
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            numeric_slider_u64(ui, &mut value, min, max, 1.0, "")
+            numeric_editor_u64(ui, &mut text, min, max, 1.0, "")
         });
         if changed {
-            set_json_path(&mut self.model, path, json!(value));
+            self.numeric_text.insert(path.to_string(), text.clone());
+            set_json_path(&mut self.model, path, parse_unsigned_value(&text));
         }
         self.show_field_error(ui, path);
     }
@@ -5846,27 +5825,41 @@ impl StudioApp {
         step: u64,
         suffix: &str,
     ) {
-        let mut value = get_path(&self.model, path)
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let initial = get_path(&self.model, path).map_or_else(
+            || "0".to_string(),
+            |value| match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                _ => "0".to_string(),
+            },
+        );
+        let mut text = self.numeric_text.get(path).cloned().unwrap_or(initial);
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            numeric_slider_u64(ui, &mut value, min, max, step as f64, suffix)
+            numeric_editor_u64(ui, &mut text, min, max, step as f64, suffix)
         });
         if changed {
-            set_json_path(&mut self.model, path, json!(value));
+            self.numeric_text.insert(path.to_string(), text.clone());
+            set_json_path(&mut self.model, path, parse_unsigned_value(&text));
         }
         self.show_field_error(ui, path);
     }
 
     fn i64_field(&mut self, ui: &mut Ui, path: &str, label: &str, min: i64, max: i64) {
-        let mut value = get_path(&self.model, path)
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
+        let initial = get_path(&self.model, path).map_or_else(
+            || "0".to_string(),
+            |value| match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                _ => "0".to_string(),
+            },
+        );
+        let mut text = self.numeric_text.get(path).cloned().unwrap_or(initial);
         let changed = field_row_path(ui, Some(path), label, |ui| {
-            numeric_slider_i64(ui, &mut value, min, max, 1.0, "")
+            numeric_editor_i64(ui, &mut text, min, max, 1.0, "")
         });
         if changed {
-            set_json_path(&mut self.model, path, json!(value));
+            self.numeric_text.insert(path.to_string(), text.clone());
+            set_json_path(&mut self.model, path, parse_signed_value(&text));
         }
         self.show_field_error(ui, path);
     }
@@ -6010,18 +6003,15 @@ impl StudioApp {
     fn length_field(&mut self, ui: &mut Ui, path: &str, label: &str) {
         let bounds = config_length_bounds(path).expect("length editor path has daemon bounds");
         let source = get_path(&self.model, path).unwrap_or(&Value::Null);
-        let (mut unit, mut text, parsed) = parse_length_value(source);
-        let mut number = parsed.unwrap_or(0.0);
+        let (mut unit, initial_text, _parsed) = parse_length_value(source);
+        let mut text = self.numeric_text.get(path).cloned().unwrap_or(initial_text);
         let reference_extent = self.length_reference_extent(path);
         let changed = field_row_path(ui, Some(path), label, |ui| {
             ui.horizontal(|ui| {
                 let mut changed;
-                if parsed.is_some() {
+                if text.trim().parse::<f64>().is_ok() {
                     let (min, max) = length_slider_bounds(bounds, unit);
-                    changed = numeric_slider_f32(ui, &mut number, min, max, 1.0, "");
-                    if changed {
-                        text = number.to_string();
-                    }
+                    changed = numeric_editor_f64(ui, &mut text, min, max, 1.0, "");
                 } else {
                     changed = ui
                         .add(egui::TextEdit::singleline(&mut text).desired_width(120.0))
@@ -6036,10 +6026,11 @@ impl StudioApp {
                     .on_hover_text(format!("Switch to {}", next.label()))
                     .clicked()
                 {
-                    if parsed.is_some() {
-                        (unit, number) =
+                    if let Ok(number) = text.trim().parse::<f64>() {
+                        let (next_unit, converted) =
                             toggle_length_value(unit, number, reference_extent, bounds);
-                        text = number.to_string();
+                        unit = next_unit;
+                        text = converted.to_string();
                     } else {
                         unit = next;
                     }
@@ -6050,6 +6041,7 @@ impl StudioApp {
             .inner
         });
         if changed {
+            self.numeric_text.insert(path.to_string(), text.clone());
             set_json_path(&mut self.model, path, format_length_value(unit, &text));
         }
         self.show_field_error(ui, path);
@@ -6636,8 +6628,8 @@ impl StudioApp {
         let mode = live.status["mode"].as_str().unwrap_or("hidden");
         let input_active = matches!(mode, "manual" | "peek_armed");
         let key = format!(
-            "{}\n{}\n{:?}\n{}\n{input_active}",
-            self.model, live.snapshot, selection, mode
+            "{}\n{}\n{:?}\n{}\n{input_active}\nurgent={}",
+            self.model, live.snapshot, selection, mode, self.preview_urgent
         );
         if self.preview.is_none() {
             self.preview = Some(PopupPreview::new());
@@ -6645,9 +6637,16 @@ impl StudioApp {
         if let Some(preview) = self.preview.as_mut() {
             preview.set_input_active(input_active);
         }
+        let render_snapshot = if self.preview_urgent {
+            let mut snapshot = snapshot.clone();
+            Self::mark_preview_urgent(&mut snapshot, selection.as_ref());
+            snapshot
+        } else {
+            snapshot.clone()
+        };
         if key != self.preview_key || self.preview_texture.is_none() {
             self.preview_key = key;
-            self.render_live_preview(ui.ctx(), &config, &snapshot, selection.as_ref());
+            self.render_live_preview(ui.ctx(), &config, &render_snapshot, selection.as_ref());
         }
         let Some(frame) = self.preview_frame.as_ref() else {
             ui.label(
@@ -6684,7 +6683,7 @@ impl StudioApp {
                 .as_mut()
                 .is_some_and(|preview| preview.set_pointer(pointer));
             if changed {
-                self.render_live_preview(ui.ctx(), &config, &snapshot, selection.as_ref());
+                self.render_live_preview(ui.ctx(), &config, &render_snapshot, selection.as_ref());
             }
         }
         if matches!(
@@ -6785,6 +6784,46 @@ impl StudioApp {
                 }
             }
             PreviewTarget::Panel | PreviewTarget::Canvas { .. } => {}
+        }
+    }
+
+    /// Mark the currently selected window urgent in a private snapshot copy. This
+    /// drives the real renderer's urgent ring/glow without sending an urgent hint
+    /// to Niri or changing any persisted configuration.
+    fn mark_preview_urgent(
+        snapshot: &mut niri_xmb::model::Snapshot,
+        selection: Option<&PreviewSelection>,
+    ) {
+        let window_id = selection
+            .and_then(|selection| selection.window_id)
+            .or(snapshot.focused_window)
+            .or_else(|| {
+                snapshot
+                    .outputs
+                    .values()
+                    .flat_map(|output| output.workspaces.iter())
+                    .find_map(|workspace| workspace.active_window)
+            });
+        let Some(window_id) = window_id else {
+            return;
+        };
+        for output in snapshot.outputs.values_mut() {
+            for workspace in &mut output.workspaces {
+                for window in workspace
+                    .columns
+                    .values_mut()
+                    .flat_map(|column| column.values_mut())
+                {
+                    if window.id == window_id {
+                        window.urgent = true;
+                    }
+                }
+                for window in &mut workspace.floating {
+                    if window.id == window_id {
+                        window.urgent = true;
+                    }
+                }
+            }
         }
     }
 
@@ -7726,7 +7765,6 @@ impl eframe::App for StudioApp {
         } else {
             self.nav_strip(ctx);
         }
-        self.pinned_preview_panel(ctx);
         self.content(ctx);
         self.sync_history();
         // Live frames wake egui from the stream thread as they arrive.
@@ -7845,65 +7883,119 @@ fn field_row_path(
 /// A compact slider paired with an unrestricted numeric editor. The slider
 /// covers the useful everyday range; typing remains available for larger or
 /// more precise values accepted by the daemon validator.
-fn numeric_slider_f32(
+fn numeric_editor_f64(
     ui: &mut Ui,
-    value: &mut f64,
+    text: &mut String,
     min: f64,
     max: f64,
     step: f64,
     suffix: &str,
 ) -> bool {
-    let before = *value;
+    let before = text.clone();
+    let parsed = text.trim().parse::<f64>().ok();
     ui.horizontal(|ui| {
         let width = numeric_slider_width(ui, suffix);
+        let mut slider_value = parsed.unwrap_or(min).clamp(min, max);
+        let slider = egui::Slider::new(&mut slider_value, min..=max)
+            .step_by(step)
+            .show_value(false);
+        let slider_changed = ui
+            .add_enabled_ui(parsed.is_some(), |ui| ui.add_sized([width, 20.0], slider))
+            .inner
+            .changed();
+        if slider_changed {
+            *text = slider_value.to_string();
+        }
         ui.add_sized(
-            [width, 20.0],
-            egui::Slider::new(value, min..=max)
-                .step_by(step)
-                .show_value(false),
-        );
-        ui.add(
-            egui::DragValue::new(value)
-                .speed(step)
-                .clamp_existing_to_range(false),
+            [64.0, 20.0],
+            egui::TextEdit::singleline(text).horizontal_align(egui::Align::RIGHT),
         );
         static_unit_label(ui, suffix);
     });
-    *value != before
+    *text != before
 }
 
-fn numeric_slider_u64(
+fn parse_number_value(text: &str) -> Value {
+    text.trim()
+        .parse::<f64>()
+        .map_or_else(|_| Value::String(text.to_string()), |value| json!(value))
+}
+
+fn numeric_editor_u64(
     ui: &mut Ui,
-    value: &mut u64,
+    text: &mut String,
     min: u64,
     max: u64,
     step: f64,
     suffix: &str,
 ) -> bool {
-    let before = *value;
+    let before = text.clone();
+    let parsed = text.trim().parse::<u64>().ok();
     ui.horizontal(|ui| {
         let width = numeric_slider_width(ui, suffix);
-        ui.add_sized(
-            [width, 20.0],
-            egui::Slider::new(value, min..=max)
-                .step_by(step)
-                .show_value(false),
-        );
-        ui.add(
-            egui::DragValue::new(value)
-                .speed(step)
-                .clamp_existing_to_range(false),
-        );
+        let mut slider_value = parsed.unwrap_or(min).clamp(min, max);
+        let slider = egui::Slider::new(&mut slider_value, min..=max)
+            .step_by(step)
+            .show_value(false);
+        let changed = ui
+            .add_enabled_ui(parsed.is_some(), |ui| ui.add_sized([width, 20.0], slider))
+            .inner
+            .changed();
+        if changed {
+            *text = slider_value.to_string();
+        }
+        ui.add_sized([64.0, 20.0], egui::TextEdit::singleline(text));
         static_unit_label(ui, suffix);
     });
-    *value != before
+    *text != before
 }
 
-fn numeric_slider_i64(
+fn numeric_editor_i64(
     ui: &mut Ui,
-    value: &mut i64,
+    text: &mut String,
     min: i64,
     max: i64,
+    step: f64,
+    suffix: &str,
+) -> bool {
+    let before = text.clone();
+    let parsed = text.trim().parse::<i64>().ok();
+    ui.horizontal(|ui| {
+        let width = numeric_slider_width(ui, suffix);
+        let mut slider_value = parsed.unwrap_or(min).clamp(min, max);
+        let slider = egui::Slider::new(&mut slider_value, min..=max)
+            .step_by(step)
+            .show_value(false);
+        let changed = ui
+            .add_enabled_ui(parsed.is_some(), |ui| ui.add_sized([width, 20.0], slider))
+            .inner
+            .changed();
+        if changed {
+            *text = slider_value.to_string();
+        }
+        ui.add_sized([64.0, 20.0], egui::TextEdit::singleline(text));
+        static_unit_label(ui, suffix);
+    });
+    *text != before
+}
+
+fn parse_unsigned_value(text: &str) -> Value {
+    text.trim()
+        .parse::<u64>()
+        .map_or_else(|_| Value::String(text.to_string()), |value| json!(value))
+}
+
+fn parse_signed_value(text: &str) -> Value {
+    text.trim()
+        .parse::<i64>()
+        .map_or_else(|_| Value::String(text.to_string()), |value| json!(value))
+}
+
+fn numeric_slider_f32(
+    ui: &mut Ui,
+    value: &mut f64,
+    min: f64,
+    max: f64,
     step: f64,
     suffix: &str,
 ) -> bool {
@@ -9541,6 +9633,45 @@ mod tests {
         let (unit, value) = toggle_length_value(LengthUnit::Pixels, 320.0, None, bounds);
         assert_eq!(unit, LengthUnit::Percent);
         assert_eq!(value, 320.0);
+    }
+
+    #[test]
+    fn urgent_preview_marks_only_the_selected_window_in_a_copy() {
+        let mut snapshot = snapshot_from_json(&json!({
+            "outputs": [{
+                "name": "DP-1",
+                "width": 1920,
+                "height": 1080,
+                "workspaces": [{
+                    "id": 7,
+                    "index": 1,
+                    "focused": true,
+                    "windows": [
+                        {"id": 11, "workspace_id": 7, "app_id": "one", "title": "One", "column": 0, "row": 0},
+                        {"id": 12, "workspace_id": 7, "app_id": "two", "title": "Two", "column": 1, "row": 0}
+                    ]
+                }]
+            }],
+            "focused_window": 11
+        }))
+        .expect("snapshot parses");
+        let selection = PreviewSelection {
+            output: "DP-1".to_string(),
+            workspace_id: 7,
+            window_id: Some(12),
+        };
+        StudioApp::mark_preview_urgent(&mut snapshot, Some(&selection));
+        assert!(!snapshot.window(11).expect("window 11").urgent);
+        assert!(snapshot.window(12).expect("window 12").urgent);
+    }
+
+    #[test]
+    fn numeric_editor_values_keep_precision_and_invalid_text() {
+        assert_eq!(parse_number_value("0.0"), json!(0.0));
+        assert_eq!(parse_number_value("0.125"), json!(0.125));
+        assert_eq!(parse_number_value("not-a-number"), json!("not-a-number"));
+        assert_eq!(parse_unsigned_value("-1"), json!("-1"));
+        assert_eq!(parse_signed_value("-1"), json!(-1));
     }
 
     #[test]

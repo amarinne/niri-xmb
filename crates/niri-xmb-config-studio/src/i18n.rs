@@ -943,11 +943,6 @@ pub static CATALOG: &[Entry] = &[
         "Add a built-in workspace bar."
     ),
     e!(
-        "ui.action.pin_preview",
-        "Pin",
-        "Pin the live preview above the editor so it stays visible while scrolling. Unpin returns it to the page."
-    ),
-    e!(
         "ui.action.new_theme",
         "+ New theme",
         "Create a new valid theme file beside the config with seeded defaults and select it."

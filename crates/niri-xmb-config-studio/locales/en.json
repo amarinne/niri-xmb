@@ -586,10 +586,6 @@
       "description": "Create a new valid theme file beside the config with seeded defaults and select it.",
       "label": "+ New theme"
     },
-    "ui.action.pin_preview": {
-      "description": "Pin the live preview above the editor so it stays visible while scrolling. Unpin returns it to the page.",
-      "label": "Pin"
-    },
     "ui.action.preview": {
       "description": "Go to the Preview section with the live popup render.",
       "label": "Preview"
