@@ -769,6 +769,42 @@ impl ControllerTab {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum PopupTab {
+    #[default]
+    Panel,
+    Placements,
+    Behavior,
+    Peek,
+    Animation,
+    Theme,
+    Bars,
+}
+
+impl PopupTab {
+    const ALL: [Self; 7] = [
+        Self::Panel,
+        Self::Placements,
+        Self::Behavior,
+        Self::Peek,
+        Self::Animation,
+        Self::Theme,
+        Self::Bars,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Panel => "Panel",
+            Self::Placements => "Placements",
+            Self::Behavior => "Behavior",
+            Self::Peek => "Peek",
+            Self::Animation => "Animation",
+            Self::Theme => "Theme & Colors",
+            Self::Bars => "Bars",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ControlSource {
     LeftStick,
@@ -1063,6 +1099,7 @@ struct StudioApp {
     selected: &'static str,
     context: String,
     controller_tab: ControllerTab,
+    popup_tab: PopupTab,
     pointer_source: Option<ControlSource>,
     scroll_source: Option<ControlSource>,
     error: String,
@@ -1445,6 +1482,7 @@ impl StudioApp {
             selected: Template::Xbox.default_control(),
             context: "base".to_string(),
             controller_tab: ControllerTab::Bindings,
+            popup_tab: PopupTab::Panel,
             pointer_source: None,
             scroll_source: None,
             error: String::new(),
@@ -4770,7 +4808,7 @@ impl StudioApp {
 
     fn behavior_input(&mut self, ui: &mut Ui) {
         mini_heading(ui, "Input");
-        self.combo_field(
+        self.segmented_field(
             ui,
             "behavior.navigation",
             "Navigation",
@@ -4824,154 +4862,263 @@ impl StudioApp {
 
     fn popup_section(&mut self, ui: &mut Ui) {
         self.section_header(ui);
-        self.popup_preview_card(ui);
-        section_card(ui, "Panel", |ui| {
-            if ui.available_width() >= 480.0 {
-                ui.columns(2, |cols| {
-                    self.combo_field(
-                        &mut cols[0],
-                        "popup.outputs",
-                        "Outputs",
-                        &["focused", "all", "combined"],
-                    );
-                    self.combo_field(
-                        &mut cols[0],
-                        "popup.surface_mode",
-                        "Surface",
-                        &["fixed", "follow_active", "mirror"],
-                    );
-                    self.combo_field(
-                        &mut cols[0],
-                        "popup.position",
-                        "Position",
-                        &["cursor", "fixed", "center", "anchored"],
-                    );
-                    self.length_field(&mut cols[0], "popup.width", "Width");
-                    self.length_field(&mut cols[0], "popup.height", "Height");
-                    self.u64_field(
-                        &mut cols[0],
-                        "popup.follow_delay_ms",
-                        "Follow delay ms",
-                        0,
-                        60_000,
-                    );
-
-                    self.length_field(&mut cols[1], "popup.fixed_x", "Fixed X");
-                    self.length_field(&mut cols[1], "popup.fixed_y", "Fixed Y");
-                    self.length_field(&mut cols[1], "popup.canvas_width", "Canvas width");
-                    self.length_field(&mut cols[1], "popup.canvas_height", "Canvas height");
-                    self.bool_field(&mut cols[1], "popup.show_labels", "Labels");
-                    self.bool_field(&mut cols[1], "popup.show_titles", "Titles");
+        let width = ui.available_width();
+        if width >= 960.0 {
+            let preview_width = (width * 0.44).clamp(420.0, 680.0);
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(preview_width);
+                    self.popup_preview_card(ui);
                 });
-            } else {
-                self.combo_field(
-                    ui,
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    card(ui, |ui| self.popup_tabs_panel(ui));
+                });
+            });
+        } else {
+            self.popup_preview_card(ui);
+            ui.add_space(8.0);
+            card(ui, |ui| self.popup_tabs_panel(ui));
+        }
+    }
+
+    fn popup_tabs_panel(&mut self, ui: &mut Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+            for tab in PopupTab::ALL {
+                let selected = self.popup_tab == tab;
+                let response = ui.selectable_label(selected, tab.label());
+                if response.clicked() {
+                    self.popup_tab = tab;
+                }
+            }
+        });
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+        match self.popup_tab {
+            PopupTab::Panel => self.popup_panel_fields(ui),
+            PopupTab::Placements => self.placements_ui(ui),
+            PopupTab::Behavior => self.behavior_fields(ui),
+            PopupTab::Peek => self.popup_peek_fields(ui),
+            PopupTab::Animation => self.popup_animation_fields(ui),
+            PopupTab::Theme => self.style_fields(ui),
+            PopupTab::Bars => self.bars_fields(ui),
+        }
+    }
+
+    fn popup_panel_fields(&mut self, ui: &mut Ui) {
+        self.show_exact_field_error(ui, "popup");
+        if ui.available_width() >= 480.0 {
+            ui.columns(2, |cols| {
+                self.segmented_field(
+                    &mut cols[0],
                     "popup.outputs",
                     "Outputs",
                     &["focused", "all", "combined"],
                 );
-                self.combo_field(
-                    ui,
+                self.segmented_field(
+                    &mut cols[0],
                     "popup.surface_mode",
                     "Surface",
                     &["fixed", "follow_active", "mirror"],
                 );
-                self.combo_field(
-                    ui,
+                self.segmented_field(
+                    &mut cols[0],
                     "popup.position",
                     "Position",
                     &["cursor", "fixed", "center", "anchored"],
                 );
-                self.length_field(ui, "popup.width", "Width");
-                self.length_field(ui, "popup.height", "Height");
-                self.length_field(ui, "popup.fixed_x", "Fixed X");
-                self.length_field(ui, "popup.fixed_y", "Fixed Y");
-                self.length_field(ui, "popup.canvas_width", "Canvas width");
-                self.length_field(ui, "popup.canvas_height", "Canvas height");
-                self.u64_field(ui, "popup.follow_delay_ms", "Follow delay ms", 0, 60_000);
-                self.bool_field(ui, "popup.show_labels", "Labels");
-                self.bool_field(ui, "popup.show_titles", "Titles");
-            }
-        });
-        section_card(ui, "Placements", |ui| {
-            self.placements_ui(ui);
-        });
-        section_card(ui, "Behavior", |ui| self.behavior_fields(ui));
-        section_card(ui, "Peek", |ui| {
-            if ui.available_width() >= 480.0 {
-                ui.columns(2, |cols| {
-                    self.bool_field(&mut cols[0], "peek.enabled", "Enabled");
-                    self.u64_field(&mut cols[0], "peek.duration_ms", "Duration ms", 0, 60_000);
-                    self.bool_field(&mut cols[0], "peek.pointer_promote", "Pointer promote");
-                    self.bool_field(&mut cols[1], "peek.move_popup", "Border move");
-                    self.u64_field(&mut cols[1], "peek.arm_grace_ms", "Arm grace ms", 0, 60_000);
-                    self.u64_field(&mut cols[1], "peek.demote_ms", "Demote ms", 0, 60_000);
-                });
-            } else {
-                self.bool_field(ui, "peek.enabled", "Enabled");
-                self.u64_field(ui, "peek.duration_ms", "Duration ms", 0, 60_000);
-                self.bool_field(ui, "peek.pointer_promote", "Pointer promote");
-                self.bool_field(ui, "peek.move_popup", "Border move");
-                self.u64_field(ui, "peek.arm_grace_ms", "Arm grace ms", 0, 60_000);
-                self.u64_field(ui, "peek.demote_ms", "Demote ms", 0, 60_000);
-            }
-        });
-        section_card(ui, "Animation", |ui| {
-            if ui.available_width() >= 480.0 {
-                ui.columns(2, |cols| {
-                    self.bool_field(&mut cols[0], "animation.enabled", "Enabled");
-                    self.f32_field(
-                        &mut cols[0],
-                        "animation.panel_ms",
-                        "Panel ms",
-                        0.0,
-                        60_000.0,
-                        1.0,
-                    );
-                    self.f32_field(
-                        &mut cols[0],
-                        "animation.emphasis_ms",
-                        "Emphasis ms",
-                        0.0,
-                        60_000.0,
-                        1.0,
-                    );
-                    self.f32_field(
-                        &mut cols[1],
-                        "animation.scroll_ms",
-                        "Scroll ms",
-                        0.0,
-                        60_000.0,
-                        1.0,
-                    );
-                    self.f32_field(
-                        &mut cols[1],
-                        "animation.open_scale",
-                        "Open scale",
-                        0.1,
-                        2.0,
-                        0.01,
-                    );
-                });
-            } else {
-                self.bool_field(ui, "animation.enabled", "Enabled");
-                self.f32_field(ui, "animation.panel_ms", "Panel ms", 0.0, 60_000.0, 1.0);
-                self.f32_field(
-                    ui,
+                self.length_field(&mut cols[0], "popup.width", "Width");
+                self.length_field(&mut cols[0], "popup.height", "Height");
+                self.slider_u64_field(
+                    &mut cols[0],
+                    "popup.follow_delay_ms",
+                    "Follow delay ms",
+                    0,
+                    60_000,
+                    10,
+                    " ms",
+                );
+                self.length_field(&mut cols[1], "popup.fixed_x", "Fixed X");
+                self.length_field(&mut cols[1], "popup.fixed_y", "Fixed Y");
+                self.length_field(&mut cols[1], "popup.canvas_width", "Canvas width");
+                self.length_field(&mut cols[1], "popup.canvas_height", "Canvas height");
+                self.bool_field(&mut cols[1], "popup.show_labels", "Labels");
+                self.bool_field(&mut cols[1], "popup.show_titles", "Titles");
+            });
+        } else {
+            self.segmented_field(
+                ui,
+                "popup.outputs",
+                "Outputs",
+                &["focused", "all", "combined"],
+            );
+            self.segmented_field(
+                ui,
+                "popup.surface_mode",
+                "Surface",
+                &["fixed", "follow_active", "mirror"],
+            );
+            self.segmented_field(
+                ui,
+                "popup.position",
+                "Position",
+                &["cursor", "fixed", "center", "anchored"],
+            );
+            self.length_field(ui, "popup.width", "Width");
+            self.length_field(ui, "popup.height", "Height");
+            self.length_field(ui, "popup.fixed_x", "Fixed X");
+            self.length_field(ui, "popup.fixed_y", "Fixed Y");
+            self.length_field(ui, "popup.canvas_width", "Canvas width");
+            self.length_field(ui, "popup.canvas_height", "Canvas height");
+            self.slider_u64_field(
+                ui,
+                "popup.follow_delay_ms",
+                "Follow delay ms",
+                0,
+                60_000,
+                10,
+                " ms",
+            );
+            self.bool_field(ui, "popup.show_labels", "Labels");
+            self.bool_field(ui, "popup.show_titles", "Titles");
+        }
+    }
+
+    fn popup_peek_fields(&mut self, ui: &mut Ui) {
+        if ui.available_width() >= 480.0 {
+            ui.columns(2, |cols| {
+                self.bool_field(&mut cols[0], "peek.enabled", "Enabled");
+                self.slider_u64_field(
+                    &mut cols[0],
+                    "peek.duration_ms",
+                    "Duration ms",
+                    0,
+                    60_000,
+                    10,
+                    " ms",
+                );
+                self.bool_field(&mut cols[0], "peek.pointer_promote", "Pointer promote");
+                self.bool_field(&mut cols[1], "peek.move_popup", "Border move");
+                self.slider_u64_field(
+                    &mut cols[1],
+                    "peek.arm_grace_ms",
+                    "Arm grace ms",
+                    0,
+                    60_000,
+                    10,
+                    " ms",
+                );
+                self.slider_u64_field(
+                    &mut cols[1],
+                    "peek.demote_ms",
+                    "Demote ms",
+                    0,
+                    60_000,
+                    10,
+                    " ms",
+                );
+            });
+        } else {
+            self.bool_field(ui, "peek.enabled", "Enabled");
+            self.slider_u64_field(ui, "peek.duration_ms", "Duration ms", 0, 60_000, 10, " ms");
+            self.bool_field(ui, "peek.pointer_promote", "Pointer promote");
+            self.bool_field(ui, "peek.move_popup", "Border move");
+            self.slider_u64_field(
+                ui,
+                "peek.arm_grace_ms",
+                "Arm grace ms",
+                0,
+                60_000,
+                10,
+                " ms",
+            );
+            self.slider_u64_field(ui, "peek.demote_ms", "Demote ms", 0, 60_000, 10, " ms");
+        }
+    }
+
+    fn popup_animation_fields(&mut self, ui: &mut Ui) {
+        if ui.available_width() >= 480.0 {
+            ui.columns(2, |cols| {
+                self.bool_field(&mut cols[0], "animation.enabled", "Enabled");
+                self.slider_f32_field(
+                    &mut cols[0],
+                    "animation.panel_ms",
+                    "Panel ms",
+                    0.0,
+                    60_000.0,
+                    1.0,
+                    " ms",
+                );
+                self.slider_f32_field(
+                    &mut cols[0],
                     "animation.emphasis_ms",
                     "Emphasis ms",
                     0.0,
                     60_000.0,
                     1.0,
+                    " ms",
                 );
-                self.f32_field(ui, "animation.scroll_ms", "Scroll ms", 0.0, 60_000.0, 1.0);
-                self.f32_field(ui, "animation.open_scale", "Open scale", 0.1, 2.0, 0.01);
-            }
-        });
-        // Former Appearance page: theme, colors, geometry, and bars live
-        // here now so every popup control stays on one page.
-        self.style_fields(ui);
-        self.bars_fields(ui);
+                self.slider_f32_field(
+                    &mut cols[1],
+                    "animation.scroll_ms",
+                    "Scroll ms",
+                    0.0,
+                    60_000.0,
+                    1.0,
+                    " ms",
+                );
+                self.slider_f32_field(
+                    &mut cols[1],
+                    "animation.open_scale",
+                    "Open scale",
+                    0.1,
+                    2.0,
+                    0.01,
+                    "×",
+                );
+            });
+        } else {
+            self.bool_field(ui, "animation.enabled", "Enabled");
+            self.slider_f32_field(
+                ui,
+                "animation.panel_ms",
+                "Panel ms",
+                0.0,
+                60_000.0,
+                1.0,
+                " ms",
+            );
+            self.slider_f32_field(
+                ui,
+                "animation.emphasis_ms",
+                "Emphasis ms",
+                0.0,
+                60_000.0,
+                1.0,
+                " ms",
+            );
+            self.slider_f32_field(
+                ui,
+                "animation.scroll_ms",
+                "Scroll ms",
+                0.0,
+                60_000.0,
+                1.0,
+                " ms",
+            );
+            self.slider_f32_field(
+                ui,
+                "animation.open_scale",
+                "Open scale",
+                0.1,
+                2.0,
+                0.01,
+                "×",
+            );
+        }
     }
 
     /// Fixed top panel for a pinned preview. It is a real panel, not prose:
@@ -5161,7 +5308,7 @@ impl StudioApp {
                     self.color_field(ui, path, label);
                 }
             }
-            self.combo_field(
+            self.segmented_field(
                 ui,
                 "style.urgent_indicator",
                 "Urgent indicator",
@@ -5176,12 +5323,28 @@ impl StudioApp {
                         GEOMETRY_FIELDS.iter().copied().enumerate()
                     {
                         let column = if index < left { 0 } else { 1 };
-                        self.f32_field(&mut cols[column], path, label, min, max, step);
+                        if matches!(path, "style.dim_alpha" | "style.urgent_glow_alpha") {
+                            self.slider_f32_field(
+                                &mut cols[column],
+                                path,
+                                label,
+                                min,
+                                max,
+                                step,
+                                "",
+                            );
+                        } else {
+                            self.f32_field(&mut cols[column], path, label, min, max, step);
+                        }
                     }
                 });
             } else {
                 for (path, label, min, max, step) in GEOMETRY_FIELDS.iter().copied() {
-                    self.f32_field(ui, path, label, min, max, step);
+                    if matches!(path, "style.dim_alpha" | "style.urgent_glow_alpha") {
+                        self.slider_f32_field(ui, path, label, min, max, step, "");
+                    } else {
+                        self.f32_field(ui, path, label, min, max, step);
+                    }
                 }
             }
             self.u64_field(ui, "style.icon_size", "Icon size", 1, 1024);
@@ -5506,6 +5669,34 @@ impl StudioApp {
         self.show_field_error(ui, path);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn slider_f32_field(
+        &mut self,
+        ui: &mut Ui,
+        path: &str,
+        label: &str,
+        min: f64,
+        max: f64,
+        step: f64,
+        suffix: &str,
+    ) {
+        let mut value = get_path(&self.model, path)
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let changed = field_row_path(ui, Some(path), label, |ui| {
+            ui.add(
+                egui::Slider::new(&mut value, min..=max)
+                    .step_by(step)
+                    .suffix(suffix),
+            )
+            .changed()
+        });
+        if changed {
+            set_json_path(&mut self.model, path, json!(value));
+        }
+        self.show_field_error(ui, path);
+    }
+
     fn u64_field(&mut self, ui: &mut Ui, path: &str, label: &str, min: u64, max: u64) {
         let mut value = get_path(&self.model, path)
             .and_then(Value::as_u64)
@@ -5513,6 +5704,34 @@ impl StudioApp {
         let changed = field_row_path(ui, Some(path), label, |ui| {
             ui.add(egui::DragValue::new(&mut value).speed(1.0).range(min..=max))
                 .changed()
+        });
+        if changed {
+            set_json_path(&mut self.model, path, json!(value));
+        }
+        self.show_field_error(ui, path);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn slider_u64_field(
+        &mut self,
+        ui: &mut Ui,
+        path: &str,
+        label: &str,
+        min: u64,
+        max: u64,
+        step: u64,
+        suffix: &str,
+    ) {
+        let mut value = get_path(&self.model, path)
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let changed = field_row_path(ui, Some(path), label, |ui| {
+            ui.add(
+                egui::Slider::new(&mut value, min..=max)
+                    .step_by(step as f64)
+                    .suffix(suffix),
+            )
+            .changed()
         });
         if changed {
             set_json_path(&mut self.model, path, json!(value));
@@ -5552,6 +5771,33 @@ impl StudioApp {
                             .changed();
                     }
                 });
+            changed
+        });
+        if changed || value != old {
+            set_json_path(&mut self.model, path, Value::String(value));
+        }
+        self.show_field_error(ui, path);
+    }
+
+    fn segmented_field(&mut self, ui: &mut Ui, path: &str, label: &str, options: &[&str]) {
+        let mut value = get_path(&self.model, path)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let old = value.clone();
+        let changed = field_row_path(ui, Some(path), label, |ui| {
+            let mut changed = false;
+            ui.horizontal_wrapped(|ui| {
+                for option in options {
+                    changed |= ui
+                        .selectable_value(
+                            &mut value,
+                            (*option).to_string(),
+                            segmented_option_label(option),
+                        )
+                        .changed();
+                }
+            });
             changed
         });
         if changed || value != old {
@@ -6164,13 +6410,13 @@ impl StudioApp {
             if ui.available_width() >= 480.0 {
                 ui.columns(2, |cols| {
                     self.text_field(&mut cols[0], &format!("{base}.output"), "Output");
-                    self.combo_field(
+                    self.segmented_field(
                         &mut cols[0],
                         &format!("{base}.x"),
                         "X",
                         &["left", "center", "right"],
                     );
-                    self.combo_field(
+                    self.segmented_field(
                         &mut cols[0],
                         &format!("{base}.y"),
                         "Y",
@@ -6180,8 +6426,8 @@ impl StudioApp {
                 });
             } else {
                 self.text_field(ui, &format!("{base}.output"), "Output");
-                self.combo_field(ui, &format!("{base}.x"), "X", &["left", "center", "right"]);
-                self.combo_field(ui, &format!("{base}.y"), "Y", &["top", "center", "bottom"]);
+                self.segmented_field(ui, &format!("{base}.x"), "X", &["left", "center", "right"]);
+                self.segmented_field(ui, &format!("{base}.y"), "Y", &["top", "center", "bottom"]);
                 self.length_field(ui, &format!("{base}.margin"), "Margin");
             }
         }
@@ -7531,6 +7777,20 @@ fn input_width(ui: &Ui) -> f32 {
     (ui.available_width() - 2.0).clamp(64.0, 360.0)
 }
 
+fn segmented_option_label(value: &str) -> String {
+    value
+        .split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Fixed form label width. Proportional label widths drift apart when the
 /// window is resized or the UI is zoomed because each column measures a
 /// different available width; one constant keeps every input in a column
@@ -8861,6 +9121,25 @@ fn array_of_tables(value: &Value) -> Result<toml_edit::Item> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_tabs_keep_the_popup_sections_in_order() {
+        assert_eq!(PopupTab::ALL.len(), 7);
+        assert_eq!(
+            PopupTab::ALL.map(PopupTab::label),
+            [
+                "Panel",
+                "Placements",
+                "Behavior",
+                "Peek",
+                "Animation",
+                "Theme & Colors",
+                "Bars",
+            ]
+        );
+        assert_eq!(segmented_option_label("follow_active"), "Follow Active");
+        assert_eq!(segmented_option_label("center"), "Center");
+    }
 
     #[test]
     fn live_gamepad_view_aggregates_devices_and_dpad_hats() {
