@@ -1008,7 +1008,6 @@ struct StudioApp {
     template: Template,
     selected: &'static str,
     context: String,
-    status: String,
     error: String,
     candidate: String,
     hot_save: bool,
@@ -1387,7 +1386,6 @@ impl StudioApp {
             template: Template::Xbox,
             selected: Template::Xbox.default_control(),
             context: "base".to_string(),
-            status: String::new(),
             error: String::new(),
             candidate: String::new(),
             hot_save: false,
@@ -1451,7 +1449,6 @@ impl StudioApp {
                 .as_str()
                 .unwrap_or("load failed")
                 .to_string();
-            self.status = String::new();
             self.show_changes = false;
             self.show_candidate = false;
             return;
@@ -1468,7 +1465,6 @@ impl StudioApp {
             .to_string();
         self.error.clear();
         self.candidate.clear();
-        self.status = "Loaded".to_string();
         self.show_changes = false;
         self.show_candidate = false;
     }
@@ -1586,7 +1582,6 @@ impl StudioApp {
             self.model = previous;
             self.history_cursor = self.model.clone();
             self.candidate.clear();
-            self.status = "Undid change".to_string();
         }
     }
 
@@ -1596,7 +1591,6 @@ impl StudioApp {
             self.model = next;
             self.history_cursor = self.model.clone();
             self.candidate.clear();
-            self.status = "Redid change".to_string();
         }
     }
 
@@ -1610,19 +1604,16 @@ impl StudioApp {
         }
         if let Some(error) = self.inline_error() {
             self.error = error;
-            self.status = "Invalid".to_string();
             return;
         }
         if let Some(error) = self.trigger_points_error() {
             self.error = error;
-            self.status = "Invalid".to_string();
             return;
         }
         let patch = self.patch();
         if patch.is_empty() {
             self.error.clear();
             self.candidate.clear();
-            self.status = "No changes".to_string();
             return;
         }
         let result = validate_patch(
@@ -1637,14 +1628,12 @@ impl StudioApp {
         if result["ok"] == true {
             self.error.clear();
             self.candidate = result["candidate"].as_str().unwrap_or("").to_string();
-            self.status = "Valid".to_string();
         } else {
             self.error = result["error"]
                 .as_str()
                 .unwrap_or("validation failed")
                 .to_string();
             self.candidate = result["candidate"].as_str().unwrap_or("").to_string();
-            self.status = "Invalid".to_string();
         }
     }
 
@@ -1654,17 +1643,14 @@ impl StudioApp {
         }
         if let Some(error) = self.inline_error() {
             self.error = error;
-            self.status = "Invalid".to_string();
             return;
         }
         if let Some(error) = self.trigger_points_error() {
             self.error = error;
-            self.status = "Invalid".to_string();
             return;
         }
         let patch = self.patch();
         if patch.is_empty() {
-            self.status = "No changes".to_string();
             return;
         }
         let result = validate_patch(
@@ -1682,26 +1668,21 @@ impl StudioApp {
                 .unwrap_or("save failed")
                 .to_string();
             self.candidate = result["candidate"].as_str().unwrap_or("").to_string();
-            self.status = "Not saved".to_string();
             return;
         }
         self.loaded = self.model.clone();
         self.sha256 = result["sha256"].as_str().unwrap_or("").to_string();
         self.candidate = result["candidate"].as_str().unwrap_or("").to_string();
         self.error.clear();
-        self.status = "Saved".to_string();
         self.show_changes = false;
         self.show_candidate = false;
         if restart_after {
             let result = restart(&self.niri_xmb, &json!({"path": self.config_path}));
-            if result["ok"] == true {
-                self.status = "Saved and restarted".to_string();
-            } else {
+            if result["ok"] != true {
                 self.error = result["error"]
                     .as_str()
                     .unwrap_or("restart failed")
                     .to_string();
-                self.status = "Saved; restart failed".to_string();
             }
         }
     }
@@ -1824,28 +1805,15 @@ impl StudioApp {
     }
 
     fn action_status(&self, ui: &mut Ui) {
-        let patch = self.patch();
         let dot = if !self.error.is_empty() || !self.field_errors.is_empty() {
             ERROR
-        } else if !patch.is_empty() {
+        } else if !self.patch().is_empty() {
             WARN
         } else {
             OK
         };
-        let (rect, response) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
         ui.painter().circle_filled(rect.center(), 3.5, dot);
-        let tooltip = if !self.error.is_empty() {
-            self.error.clone()
-        } else if let Some(error) = self.field_errors.first() {
-            error.message.clone()
-        } else if !self.status.is_empty() {
-            self.status.clone()
-        } else if patch.is_empty() {
-            "No changes".to_string()
-        } else {
-            format!("{} pending change(s)", patch.set.len() + patch.remove.len())
-        };
-        response.on_hover_text(tooltip);
     }
 
     fn action_buttons(&mut self, ui: &mut Ui) {
@@ -4530,7 +4498,6 @@ impl StudioApp {
                 match create_theme_file(&self.config_path, &self.model) {
                     Some(path) => {
                         set_json_path(&mut self.model, "theme", Value::String(path));
-                        self.status = "Created theme".to_string();
                     }
                     None => {
                         self.error = "Could not create a theme file beside the config".to_string();
@@ -4778,29 +4745,90 @@ impl StudioApp {
         self.show_field_error(ui, path);
     }
 
-    /// XMB and Navi lists, with the row for the selected control highlighted.
-    /// Returns that row's rect so the card can link it to the controller.
+    /// Context tabs (XMB, Navi base and every hold layer) plus the bindings
+    /// list for the active context. Layer tabs also expose the hold buttons and
+    /// axes that define the layer, so all controller mapping lives in one card
+    /// without a separate layers block. Returns the bound row's rect so the
+    /// card can link it to the controller.
     fn merged_bindings(&mut self, ui: &mut Ui) -> Option<Rect> {
         let target = self.selected_code();
         let mut rect = None;
-        match self.context.as_str() {
-            "xmb" => {
-                rect = self.bindings_ui(ui, "gamepad.buttons", XMB_ACTIONS, "XMB buttons", target);
-                ui.add_space(12.0);
-                self.bindings_ui(ui, "gamepad.navi.bindings", ACTIONS, "Navi base", None);
+
+        let layers: Vec<String> = self.model["gamepad"]["navi"]["layers"]
+            .as_object()
+            .map(|layers| layers.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if self.context != "base"
+            && self.context != "xmb"
+            && !layers.iter().any(|name| name == &self.context)
+        {
+            self.context = "base".to_string();
+        }
+
+        ui.horizontal(|ui| {
+            if ui.selectable_label(self.context == "xmb", "XMB").clicked() {
+                self.context = "xmb".to_string();
             }
-            "base" => {
-                self.bindings_ui(ui, "gamepad.buttons", XMB_ACTIONS, "XMB buttons", None);
-                ui.add_space(12.0);
-                rect = self.bindings_ui(ui, "gamepad.navi.bindings", ACTIONS, "Navi base", target);
+            if ui
+                .selectable_label(self.context == "base", "Navi base")
+                .clicked()
+            {
+                self.context = "base".to_string();
             }
-            _ => {
-                self.bindings_ui(ui, "gamepad.buttons", XMB_ACTIONS, "XMB buttons", None);
-                ui.add_space(12.0);
-                self.bindings_ui(ui, "gamepad.navi.bindings", ACTIONS, "Navi base", None);
+            for name in &layers {
+                if ui.selectable_label(self.context == *name, name).clicked() {
+                    self.context = name.clone();
+                }
             }
+            if let Some(name) = self.add_layer_button(ui) {
+                self.context = name;
+            }
+        });
+        ui.add_space(4.0);
+        if self.context == "xmb" {
+            rect = self.bindings_ui(ui, "gamepad.buttons", XMB_ACTIONS, "XMB buttons", target);
+        } else if self.context == "base" {
+            rect = self.bindings_ui(ui, "gamepad.navi.bindings", ACTIONS, "Navi base", target);
+        } else {
+            let name = self.context.clone();
+            self.layer_editor(ui, &name, target);
         }
         rect
+    }
+
+    /// Seed a fresh layer object with an unused name; returns the name so the
+    /// caller can jump to its tab.
+    fn add_layer_object(&mut self, chord: bool) -> Option<String> {
+        let layers = ensure_object_path(&mut self.model, "gamepad.navi.layers");
+        let seed: fn() -> Value = if chord {
+            validation::default_chord_layer
+        } else {
+            validation::default_layer
+        };
+        let prefix = if chord { "chord" } else { "layer" };
+        let mut name = prefix.to_string();
+        let mut suffix = 1;
+        while layers.contains_key(&name) {
+            name = format!("{prefix}{suffix}");
+            suffix += 1;
+        }
+        layers.insert(name.clone(), seed());
+        Some(name)
+    }
+
+    fn add_layer_button(&mut self, ui: &mut Ui) -> Option<String> {
+        let mut added = None;
+        if tt(ui.add(egui::Button::new("+ Layer")), "ui.action.add_layer").clicked() {
+            added = self.add_layer_object(false);
+        }
+        if ui
+            .button("+ Chord")
+            .on_hover_text("Create a valid layer holding Start, then bind another button")
+            .clicked()
+        {
+            added = self.add_layer_object(true);
+        }
+        added
     }
 
     fn next_binding_entry<'a>(
@@ -5055,159 +5083,103 @@ impl StudioApp {
         selected.then_some(frame.response.rect)
     }
 
-    fn layers_ui(&mut self, ui: &mut Ui) {
-        let names = self.model["gamepad"]["navi"]["layers"]
-            .as_object()
-            .map(|layers| layers.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        if names.is_empty() {
-            ui.label(RichText::new("No layers").size(11.0).color(TEXT_MUTED));
-        }
+    /// A single hold layer: identity + delete, hold buttons and axes, and its
+    /// bindings. Shown under the layer's tab in `merged_bindings`.
+    fn layer_editor(&mut self, ui: &mut Ui, name: &str, target: Option<&str>) {
         let mut remove_layer = None;
-        let mut first = true;
-        for name in names {
-            let path = format!("gamepad.navi.layers.{name}");
-            if !first {
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(6.0);
-            }
-            first = false;
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&name).monospace().size(11.5).strong());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("Delete").clicked() {
-                        remove_layer = Some(name.clone());
-                    }
-                });
-            });
-            ui.add_space(4.0);
-            self.button_list_field(ui, &format!("{path}.hold"), "Hold buttons");
-            let axes_count = self.model["gamepad"]["navi"]["layers"][&name]["hold_axes"]
-                .as_array()
-                .map_or(0, Vec::len);
-            let mut remove_axis = None;
-            for index in 0..axes_count {
-                let axis_path = format!("{path}.hold_axes.{index}");
-                ui.horizontal(|ui| {
-                    let mut axis = get_path(&self.model, &format!("{axis_path}.axis"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut axis)
-                                .desired_width(90.0)
-                                .font(egui::TextStyle::Monospace),
-                        )
-                        .changed()
-                    {
-                        set_json_path(
-                            &mut self.model,
-                            &format!("{axis_path}.axis"),
-                            Value::String(axis),
-                        );
-                    }
-                    let mut threshold = get_path(&self.model, &format!("{axis_path}.threshold"))
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut threshold)
-                                .speed(0.001)
-                                .range(0.0..=1.0),
-                        )
-                        .changed()
-                    {
-                        set_json_path(
-                            &mut self.model,
-                            &format!("{axis_path}.threshold"),
-                            json!(threshold),
-                        );
-                    }
-                    if ui.small_button("x").clicked() {
-                        remove_axis = Some(index);
-                    }
-                });
-                self.show_field_error(ui, &axis_path);
-            }
-            if let Some(index) = remove_axis
-                && let Some(axes) =
-                    self.model["gamepad"]["navi"]["layers"][&name]["hold_axes"].as_array_mut()
-            {
-                axes.remove(index);
-            }
-            if tt(ui.button("Add hold axis"), "ui.action.add_hold_axis").clicked() {
-                let used_axes = self.model["gamepad"]["navi"]["layers"][&name]["hold_axes"]
-                    .as_array()
-                    .map(|axes| {
-                        axes.iter()
-                            .filter_map(|axis| axis.get("axis").and_then(Value::as_str))
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let axis = ["ABS_Z", "ABS_RZ", "ABS_X", "ABS_Y", "ABS_RX", "ABS_RY"]
-                    .into_iter()
-                    .find(|candidate| !used_axes.iter().any(|used| used == candidate))
-                    .unwrap_or("ABS_Z");
-                if let Some(axes) =
-                    self.model["gamepad"]["navi"]["layers"][&name]["hold_axes"].as_array_mut()
-                {
-                    axes.push(json!({"axis": axis, "threshold": 0.35}));
+        let path = format!("gamepad.navi.layers.{name}");
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(name).monospace().size(11.5).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("Delete").clicked() {
+                    remove_layer = Some(name.to_string());
+                    self.context = "base".to_string();
                 }
-            }
-            self.show_exact_field_error(ui, &path);
-            let layer_target = if self.context == name {
-                self.selected_code()
-            } else {
-                None
-            };
-            self.bindings_ui(
-                ui,
-                &format!("{path}.bindings"),
-                ACTIONS,
-                "Bindings",
-                layer_target,
-            );
+            });
+        });
+        ui.add_space(4.0);
+        self.button_list_field(ui, &format!("{path}.hold"), "Hold buttons");
+        let axes_count = self.model["gamepad"]["navi"]["layers"][&name]["hold_axes"]
+            .as_array()
+            .map_or(0, Vec::len);
+        let mut remove_axis = None;
+        for index in 0..axes_count {
+            let axis_path = format!("{path}.hold_axes.{index}");
+            ui.horizontal(|ui| {
+                let mut axis = get_path(&self.model, &format!("{axis_path}.axis"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut axis)
+                            .desired_width(90.0)
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .changed()
+                {
+                    set_json_path(
+                        &mut self.model,
+                        &format!("{axis_path}.axis"),
+                        Value::String(axis),
+                    );
+                }
+                let mut threshold = get_path(&self.model, &format!("{axis_path}.threshold"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut threshold)
+                            .speed(0.001)
+                            .range(0.0..=1.0),
+                    )
+                    .changed()
+                {
+                    set_json_path(
+                        &mut self.model,
+                        &format!("{axis_path}.threshold"),
+                        json!(threshold),
+                    );
+                }
+                if ui.small_button("x").clicked() {
+                    remove_axis = Some(index);
+                }
+            });
+            self.show_field_error(ui, &axis_path);
         }
+        if let Some(index) = remove_axis
+            && let Some(axes) =
+                self.model["gamepad"]["navi"]["layers"][&name]["hold_axes"].as_array_mut()
+        {
+            axes.remove(index);
+        }
+        if tt(ui.button("Add hold axis"), "ui.action.add_hold_axis").clicked() {
+            let used_axes = self.model["gamepad"]["navi"]["layers"][&name]["hold_axes"]
+                .as_array()
+                .map(|axes| {
+                    axes.iter()
+                        .filter_map(|axis| axis.get("axis").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let axis = ["ABS_Z", "ABS_RZ", "ABS_X", "ABS_Y", "ABS_RX", "ABS_RY"]
+                .into_iter()
+                .find(|candidate| !used_axes.iter().any(|used| used == candidate))
+                .unwrap_or("ABS_Z");
+            if let Some(axes) =
+                self.model["gamepad"]["navi"]["layers"][&name]["hold_axes"].as_array_mut()
+            {
+                axes.push(json!({"axis": axis, "threshold": 0.35}));
+            }
+        }
+        self.show_exact_field_error(ui, &path);
+        self.bindings_ui(ui, &format!("{path}.bindings"), ACTIONS, "Bindings", target);
         if let Some(name) = remove_layer
             && let Some(layers) = self.model["gamepad"]["navi"]["layers"].as_object_mut()
         {
             layers.remove(&name);
         }
-        ui.horizontal(|ui| {
-            if tt(ui.button("Add layer"), "ui.action.add_layer").clicked() {
-                let mut name = "layer".to_string();
-                let mut suffix = 1;
-                while self.model["gamepad"]["navi"]["layers"]
-                    .as_object()
-                    .is_some_and(|layers| layers.contains_key(&name))
-                {
-                    name = format!("layer{suffix}");
-                    suffix += 1;
-                }
-                let layers = ensure_object_path(&mut self.model, "gamepad.navi.layers");
-                layers.insert(name, validation::default_layer());
-            }
-            if ui
-                .button("Add chord (Start + …)")
-                .on_hover_text("Create a valid layer holding Start, then bind another button")
-                .clicked()
-            {
-                let mut name = "chord".to_string();
-                let mut suffix = 1;
-                while self.model["gamepad"]["navi"]["layers"]
-                    .as_object()
-                    .is_some_and(|layers| layers.contains_key(&name))
-                {
-                    name = format!("chord{suffix}");
-                    suffix += 1;
-                }
-                let layers = ensure_object_path(&mut self.model, "gamepad.navi.layers");
-                layers.insert(name, validation::default_chord_layer());
-            }
-        });
     }
 
     fn placements_ui(&mut self, ui: &mut Ui) {
@@ -6927,6 +6899,49 @@ fn mini_heading(ui: &mut Ui, text: &str) {
         response.on_hover_text(hover);
     }
     ui.add_space(2.0);
+}
+
+/// Clickable disclosure heading with the same vector chevron the telemetry
+/// header uses. Returns true exactly once per click so the caller can flip its
+/// own state field.
+fn collapsible_heading(ui: &mut Ui, text: &str, expanded: bool) -> bool {
+    let mut toggle = false;
+    ui.horizontal(|ui| {
+        let (chevron_rect, chevron) = ui.allocate_exact_size(Vec2::new(24.0, 22.0), Sense::click());
+        let center = chevron_rect.center();
+        let (p, a, b) = if expanded {
+            (
+                center,
+                Pos2::new(center.x - 5.0, center.y - 2.0),
+                Pos2::new(center.x + 5.0, center.y - 2.0),
+            )
+        } else {
+            (
+                Pos2::new(center.x + 1.5, center.y),
+                Pos2::new(center.x - 3.5, center.y - 5.0),
+                Pos2::new(center.x - 3.5, center.y + 5.0),
+            )
+        };
+        let stroke = Stroke::new(
+            1.8_f32,
+            if chevron.hovered() {
+                ACCENT
+            } else {
+                TEXT_MUTED
+            },
+        );
+        ui.painter().line_segment([a, p], stroke);
+        ui.painter().line_segment([p, b], stroke);
+        let label =
+            ui.add(egui::Label::new(RichText::new(text).size(12.0).strong()).sense(Sense::click()));
+        let label = if let Some(hover) = i18n::hover_for(None, text) {
+            label.on_hover_text(hover)
+        } else {
+            label
+        };
+        toggle = chevron.clicked() || label.clicked();
+    });
+    toggle
 }
 
 fn paint_handle(painter: &egui::Painter, center: Pos2, color: Color32, active: bool) {
